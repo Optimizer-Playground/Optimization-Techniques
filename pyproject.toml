@@ -1,0 +1,21 @@
+[project]
+name = "optimization-techniques"
+version = "0.1.0-dev"
+description = """
+A curated collection of interesting and novel ideas in query optimization for relational database systems, implemented using the PostBOUND framework.
+"""
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "lazy-loader>=0.4",
+    "networkx>=3.6.1",
+    "pandas>=2.3.3",
+    "postbound==0.20.2",
+    "tqdm>=4.67.3",
+]
+
+[dependency-groups]
+dev = [
+    "ipython>=9.10.0",
+    "pytest>=9.0.2",
+]
