@@ -280,8 +280,14 @@ class CardinalitySampler:
 
     def shutdown(self) -> None:
         self._done.set()
-        self._connection_pool.shutdown(force=True)
+        # For shutdown, we need to close the worker pool before shutting down the connections.
+        # The reason is that the worker pool first tries to acquire() a connection from the pool
+        # If the connection pool is already shut down, acquire() hangs indefinitely because no
+        # more connections are available. By shutting down the worker pool first, active workers
+        # might run slightly longer until the connection is closed and execution fails. For now,
+        # this is acceptable.
         self._worker_pool.shutdown(wait=False, cancel_futures=True)
+        self._connection_pool.shutdown(force=True)
 
     def _worker_callback(self, future: futures.Future) -> None:
         if future.cancelled():
