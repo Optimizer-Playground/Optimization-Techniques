@@ -1,6 +1,5 @@
 import argparse
 import atexit
-import functools
 import signal
 from pathlib import Path
 
@@ -21,10 +20,6 @@ Results are streamed to a CSV file.
 
 Currently, the sampler is only implemented for PostgreSQL.
 """
-
-
-def signal_handler(signum, frame, *, sampling_ctl: sampler.CardinalitySampler):
-    sampling_ctl.shutdown()
 
 
 def main() -> None:
@@ -138,9 +133,7 @@ def main() -> None:
         df = pd.DataFrame([], columns=sampler.CardinalitySample.csv_cols())  # type: ignore[call-arg]
         df.to_csv(out_file, mode="w", index=False, header=True)
 
-    ctl_c_handler = functools.partial(signal_handler, sampling_ctl=sampler_ctl)
-    signal.signal(signal.SIGINT, ctl_c_handler)
-    signal.signal(signal.SIGKILL, ctl_c_handler)
+    signal.signal(signal.SIGINT, lambda *_: sampler_ctl.shutdown())
     atexit.register(sampler_ctl.shutdown)
 
     if args.infinite:
