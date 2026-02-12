@@ -9,8 +9,13 @@ requires-python = ">=3.12"
 dependencies = [
     "lazy-loader>=0.4",
     "networkx>=3.6.1",
+    "numpy>=2.4.2",
     "pandas>=2.3.3",
     "postbound==0.20.2",
+    "scikit-learn>=1.8.0",
+    "scipy>=1.17.0",
+    "tables",
+    "torch>=2.10.0",
     "tqdm>=4.67.3",
 ]
 
@@ -19,3 +24,6 @@ dev = [
     "ipython>=9.10.0",
     "pytest>=9.0.2",
 ]
+
+[tool.uv.sources]
+tables = { git = "https://github.com/PyTables/PyTables.git" }
