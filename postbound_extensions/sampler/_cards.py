@@ -57,7 +57,7 @@ class ParallelLog:
         prefix = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         thread = threading.current_thread()
         with self._critical_guard:
-            self._logger(f"[{prefix}] [{thread.name}]")
+            self._logger(f"[{prefix}] [{thread.name}]", *args)
 
 
 @dataclass
@@ -334,5 +334,6 @@ class CardinalitySampler:
         if self._out_file is None:
             return
 
-        df = pd.DataFrame([pb.util.to_json(sample)])
+        serialized = {key: pb.util.to_json(val) for key, val in asdict(sample).items()}
+        df = pd.DataFrame([serialized])
         df.to_csv(self._out_file, mode="a", index=False, header=False)
