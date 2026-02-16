@@ -65,10 +65,11 @@ class CardinalitySample:
     query: pb.SqlQuery
     plan: pb.QueryPlan
     cardinality: pb.Cardinality
+    runtime_ms: float
 
     @staticmethod
     def csv_cols() -> Sequence[str]:
-        return ["query", "plan", "cardinality"]
+        return ["query", "plan", "cardinality", "runtime_ms"]
 
     def __json__(self) -> pb.util.jsondict:
         return asdict(self)
@@ -210,7 +211,8 @@ def execute_query(
             raw_plan = cursor.fetchone()[0]  # type: ignore[index] - if this errors we end up in the except block
             parsed = pb.postgres.PostgresExplainPlan(raw_plan).as_qep()
             cardinality = parsed.actual_cardinality
-            sample = CardinalitySample(query, parsed, cardinality)
+            runtime_ms = parsed.execution_time * 1000
+            sample = CardinalitySample(query, parsed, cardinality, runtime_ms)
             connection_pool.release(handle)
             return "ok", sample
         except psycopg.errors.QueryCanceled:
