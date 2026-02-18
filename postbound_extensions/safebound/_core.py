@@ -50,7 +50,11 @@ class DegreeSequence:
         return int(np.sum(self._degrees))
 
     def join_bound(self, other: DegreeSequence) -> int:
-        return int(np.sum(self._degrees * other._degrees))
+        if len(self._degrees) != len(other._degrees):
+            raise ValueError(
+                "Degree sequences must have the same length for join bound calculation"
+            )
+        return int(self._degrees @ other._degrees)
 
     def as_cdf(self) -> CumulativeDegreeSequence:
         return CumulativeDegreeSequence(self._degrees)
