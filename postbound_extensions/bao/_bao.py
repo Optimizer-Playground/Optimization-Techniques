@@ -1,19 +1,20 @@
 from __future__ import annotations
 
 import functools
+import json
 from collections.abc import Iterable
 from pathlib import Path
 from typing import Optional, TypedDict
 
+import numpy as np
 import postbound as pb
 import torch
 from tqdm import tqdm
 
 from ..util import wrap_logger
 from ._experience import BaoExperience
-from ._featurizer import BaoFeaturizer, BinarizedQep, binarize_qep
+from ._featurizer import BaoFeaturizer
 from ._model import BaoModel
-from ._util import prepare_trees
 
 
 class HintSetSpec(TypedDict):
@@ -36,6 +37,20 @@ def _as_hint_set(options: HintSetSpec) -> pb.PhysicalOperatorAssignment:
     hint_set.set(pb.ScanOperator.IndexOnlyScan, options.get("idx_o", True))
 
     return hint_set
+
+
+def _stringify_hint_set(hint_set: pb.PhysicalOperatorAssignment) -> str:
+    disabled_components: list[pb.PhysicalOperator] = []
+    for operator, enabled in hint_set.global_settings.items():
+        if enabled:
+            continue
+        disabled_components.append(operator)
+
+    if not disabled_components:
+        return "<default>"
+
+    disabled_txt = ", ".join(hint.name for hint in disabled_components)
+    return f"no {disabled_txt}"
 
 
 def default_hint_sets() -> list[pb.PhysicalOperatorAssignment]:
@@ -409,23 +424,109 @@ def default_hint_sets() -> list[pb.PhysicalOperatorAssignment]:
 
 
 class BaoOptimizer(pb.CompleteOptimizationAlgorithm):
+    @staticmethod
+    def pre_trained(
+        archive: Path | str,
+        *,
+        database: pb.Database,
+        verbose: bool | pb.util.Logger = False,
+    ) -> BaoOptimizer:
+        archive = Path(archive)
+        if archive.is_dir():
+            archive = archive / "catalog.json"
+
+        with open(archive, "r") as f:
+            catalog = json.load(f)
+
+        featurizer = BaoFeaturizer.pre_built(catalog["featurizer"])
+        experience = BaoExperience.load(
+            catalog["experience"]["catalog"], featurizer=featurizer
+        )
+
+        weights = torch.load(catalog["tcnn_model"])
+        model = BaoModel(featurizer.out_shape)
+        model.load_state_dict(weights)
+
+        hint_sets = [
+            pb.opt.read_operator_assignment_json(hints)
+            for hints in catalog["hint_sets"]
+        ]
+
+        bao = BaoOptimizer(
+            database,
+            hint_sets=hint_sets,
+            tcnn=model,
+            featurizer=featurizer,
+            experience=experience,
+            training_epochs=catalog["training"]["epochs"],
+            retrain=False,
+            verbose=verbose,
+        )
+        return bao
+
+    @staticmethod
+    def load_or_build(
+        archive: Path | str,
+        *,
+        database: pb.Database,
+        calibration_queries: pb.Workload,
+        retrain: bool = False,
+        training_epochs: int = 100,
+        experience_window: int = 2000,
+        retraining_frequency: int = 100,
+        verbose: bool | pb.util.Logger = False,
+    ) -> BaoOptimizer:
+        log = wrap_logger(verbose)
+        archive = Path(archive)
+        if archive.is_dir():
+            archive = archive / "catalog.json"
+
+        if archive.is_file():
+            log(f"Detected existing BAO model at {archive}. Re-loading.")
+            return BaoOptimizer.pre_trained(archive, database=database, verbose=verbose)
+
+        log(f"No BAO model found at {archive}. Creating a new one.")
+        bao = BaoOptimizer(
+            database,
+            training_epochs=training_epochs,
+            retrain=retrain,
+            experience_window=experience_window,
+            retraining_frequency=retraining_frequency,
+            verbose=verbose,
+        )
+
+        log("Calibrating new BAO model")
+        bao.calibrate(calibration_queries)
+
+        log("Storing model")
+        bao.store(archive)
+        return bao
+
     def __init__(
         self,
         target_db: pb.Database,
         *,
         hint_sets: Optional[Iterable[pb.PhysicalOperatorAssignment]] = None,
-        tcnn: Optional[BaoModel] = None,
+        tcnn: Optional[BaoModel | torch.fx.GraphModule] = None,
         featurizer: Optional[BaoFeaturizer] = None,
         experience: Optional[BaoExperience] = None,
-        training_epochs: int = 100,
         retrain: bool = True,
+        training_epochs: int = 100,
+        experience_window: int = 2000,
+        retraining_frequency: int = 100,
         verbose: bool | pb.util.Logger = False,
     ) -> None:
         super().__init__()
         self._db = target_db
-        self._hint_sets = hint_sets or default_hint_sets()
+        self._hint_sets = (
+            list(hint_sets) if hint_sets is not None else default_hint_sets()
+        )
         self._featurizer = featurizer or BaoFeaturizer.online(self._db)
-        self._experience = experience or BaoExperience(self._featurizer)
+        self._experience = experience or BaoExperience(
+            self._featurizer,
+            sample_window=experience_window,
+            retraining_frequency=retraining_frequency,
+        )
         self._tcnn = tcnn or BaoModel(self._featurizer.out_shape)
         self._retrain = retrain
         self._epochs = training_epochs
@@ -444,16 +545,15 @@ class BaoOptimizer(pb.CompleteOptimizationAlgorithm):
         plans: list[pb.QueryPlan] = [
             self._generate_plan(query, hint_set) for hint_set in self._hint_sets
         ]
-        binarized = [binarize_qep(plan, database=self._db) for plan in plans]
-        featurized = prepare_trees(
-            binarized,
-            self._featurizer.encode,
-            BinarizedQep.outer,
-            BinarizedQep.inner,
-        )
+        featurized = [
+            self._featurizer.encode_plan(plan, database=self._db) for plan in plans
+        ]
 
         predictions = self._tcnn(featurized)
         idxmin = int(torch.argmin(predictions).item())
+
+        hint_set = _stringify_hint_set(self._hint_sets[idxmin])
+        self._log(f"Selected arm {idxmin} ({hint_set}) for query {query}")
         return plans[idxmin]
 
     def add_experience(self, plan: pb.QueryPlan, runtime_ms: float) -> None:
@@ -464,7 +564,9 @@ class BaoOptimizer(pb.CompleteOptimizationAlgorithm):
         self._log("Updating model")
         self._log("Preparing experience")
         dataset = self._experience.samples()
-        loader = torch.utils.data.DataLoader(dataset, batch_size=16, shuffle=True)
+        loader = torch.utils.data.DataLoader(
+            dataset, batch_size=16, shuffle=True, collate_fn=lambda xs: xs
+        )  # default collation messes up the data types due to namedtuple - use our own dummy
 
         self._log("Obtaining new model")
         self._tcnn = BaoModel(self._featurizer.out_shape)
@@ -473,6 +575,7 @@ class BaoOptimizer(pb.CompleteOptimizationAlgorithm):
     def calibrate(
         self, workload: pb.Workload, *, timeout_ms: Optional[float] = None
     ) -> None:
+        self._log("Gathering query plans for calibration queries")
         query_iter = (
             tqdm(workload.queries(), desc="Training query", unit="q")
             if self._verbose
@@ -501,38 +604,45 @@ class BaoOptimizer(pb.CompleteOptimizationAlgorithm):
             self._experience.add(plan, runtime * 1000)
 
         dataset = self._experience.samples()
-        loader = torch.utils.data.DataLoader(dataset, batch_size=16, shuffle=True)
+        loader = torch.utils.data.DataLoader(
+            dataset, batch_size=16, shuffle=True, collate_fn=lambda xs: xs
+        )  # default collation messes up the data types due to namedtuple - use our own dummy
         self._train(loader)
 
     def store(self, archive_dir: Path | str) -> None:
-        if (sample := self._experience.sample()) is None:
-            raise ValueError("Cannot export model without any prior experience")
-
         archive_dir = Path(archive_dir)
         archive_dir.mkdir(parents=True, exist_ok=True)
 
-        self._log("Exporting featurizer")
-        self._featurizer.store(archive_dir / "featurizer.json")
+        featurizer_catalog = archive_dir / "featurizer.json"
+        self._log("Exporting featurizer to", featurizer_catalog)
+        self._featurizer.store(featurizer_catalog)
 
-        self._log("Exporting experience")
+        experience_catalog = archive_dir / "experience-catalog.json"
+        experience_store = archive_dir / "experience-store.parquet"
+        self._log("Exporting experience to", experience_catalog)
         self._experience.store(
-            archive_dir / "experience-catalog.json",
-            experience_path=archive_dir / "experience-store.parquet",
+            experience_catalog,
+            experience_path=experience_store,
         )
+
+        model_path = archive_dir / "tcnn.pt"
+        self._log("Storing TCNN model to", model_path)
+        weights = self._tcnn.state_dict()
+        torch.save(weights, model_path)
 
         serialized = {
             "hint_sets": self._hint_sets,
             "training": {"epochs": self._epochs},
+            "featurizer": featurizer_catalog,
+            "experience": {
+                "catalog": experience_catalog,
+                "store": experience_store,
+            },
+            "tcnn_model": model_path,
         }
         self._log("Creating catalog")
         with open(archive_dir / "catalog.json", "w") as f:
             pb.util.to_json_dump(serialized, f)
-
-        self._log("Creating exportable program for TCNN model")
-        program = torch.export.export(self._tcnn, (sample,))
-
-        self._log("Storing TCNN model")
-        torch.export.save(program, archive_dir / "tcnn.pt2")
 
     def describe(self) -> pb.util.jsondict:
         return {
@@ -559,8 +669,8 @@ class BaoOptimizer(pb.CompleteOptimizationAlgorithm):
             loss_total = 0.0
 
             for batch in samples:
-                xs = batch[:-1]
-                y = batch[-1]
+                xs, y = list(zip(*batch))
+                y = torch.Tensor(np.array(y)).reshape(-1, 1)
                 optimizer.zero_grad()
                 prediction = self._tcnn.forward(xs)
                 loss = mse_loss(prediction, y)

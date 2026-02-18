@@ -29,8 +29,8 @@ import torch
 
 from ..util import PandasDataset, wrap_logger
 from ._featurizer import MscnFeaturizer
+from ._misc import expand_dims, normalize_labels, qerror_loss, unnormalize_labels
 from ._model import SetConv
-from ._util import expand_dims, normalize_labels, qerror_loss, unnormalize_labels
 
 
 class MscnEstimator(pb.CardinalityEstimator):

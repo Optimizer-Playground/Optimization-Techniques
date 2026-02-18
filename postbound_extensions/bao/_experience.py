@@ -5,14 +5,14 @@ import json
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Literal, Optional, overload
 
 import pandas as pd
 import postbound as pb
 import torch
 from torch.utils.data import Dataset
 
-from ._featurizer import BaoFeaturizer
+from ._featurizer import BaoFeaturizer, FeaturizedNode
 
 
 @dataclass
@@ -73,11 +73,14 @@ class BaoExperience(Dataset[tuple[torch.Tensor, torch.Tensor, float]]):
         if existing_samples is not None:
             self._storage.extend(existing_samples)
 
+        self._new_samples = 0
+
     def add(
         self, plan: pb.QueryPlan | BaoSample, runtime_ms: Optional[float] = None
     ) -> None:
         if isinstance(plan, BaoSample):
             self._storage.append(plan)
+            self._new_samples += 1
             return
 
         if runtime_ms is None:
@@ -89,14 +92,25 @@ class BaoExperience(Dataset[tuple[torch.Tensor, torch.Tensor, float]]):
 
         sample = BaoSample(plan, runtime_ms)
         self._storage.append(sample)
+        self._new_samples += 1
 
     def should_retrain(self) -> bool:
-        return len(self._storage) >= self._retrain_freq
+        return self._new_samples >= self._retrain_freq
 
     def samples(self) -> Dataset[tuple[torch.Tensor, torch.Tensor, float]]:
+        self._new_samples = 0
         return self
 
-    def sample(self) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
+    @overload
+    def sample(self, *, primitive: Literal[True]) -> Optional[tuple]: ...
+
+    @overload
+    def sample(self, *, primitive: Literal[False]) -> Optional[FeaturizedNode]: ...
+
+    @overload
+    def sample(self) -> Optional[FeaturizedNode]: ...
+
+    def sample(self) -> Optional[FeaturizedNode]:
         if not self._storage:
             return None
 
@@ -134,6 +148,5 @@ class BaoExperience(Dataset[tuple[torch.Tensor, torch.Tensor, float]]):
     def __getitem__(self, index):
         sample = self._storage[index]
         featurized = self._featurizer.encode_plan(sample.plan)
-        flattened, idxs = featurized
         scaled_runtime = self._featurizer.transform_runtime([(sample.runtime_ms,)])
-        return (flattened, idxs, scaled_runtime)
+        return (featurized, scaled_runtime)

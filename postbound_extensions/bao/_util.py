@@ -84,13 +84,13 @@ def _flatten[NodeT](
     recurse(root)
 
     try:
-        accum = [np.zeros(accum[0].shape)] + accum
+        accum = [np.zeros_like(accum[0])] + accum
     except Exception:
         raise TreeConvolutionError(
             "Output of transformer must have a .shape (e.g., numpy array)"
         )
 
-    return np.array(accum)
+    return np.stack(accum)
 
 
 def _preorder_indexes[NodeT](
@@ -185,7 +185,7 @@ def _pad_and_combine(xs: list[np.ndarray]) -> np.ndarray:
         padded[0 : arr.shape[0]] = arr
         vecs.append(padded)
 
-    return np.array(vecs)
+    return np.stack(vecs)
 
 
 def prepare_trees[NodeT](
@@ -196,7 +196,11 @@ def prepare_trees[NodeT](
 ) -> tuple[torch.Tensor, torch.Tensor]:
     flat_trees = [_flatten(x, transformer, left_child, right_child) for x in trees]
     flat_trees = _pad_and_combine(flat_trees)
-    flat_trees = torch.Tensor(flat_trees)
+    flat_trees = (
+        torch.Tensor(flat_trees)
+        if not isinstance(flat_trees, torch.Tensor)
+        else flat_trees
+    )
 
     # flat trees is now batch x max tree nodes x channels
     flat_trees = flat_trees.transpose(1, 2)

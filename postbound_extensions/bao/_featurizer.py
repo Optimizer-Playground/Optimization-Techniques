@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import collections
 import json
 import queue
 from collections.abc import Iterable
 from dataclasses import dataclass
+from enum import IntEnum
 from pathlib import Path
 from typing import Optional
 
@@ -13,8 +15,6 @@ import postbound as pb
 import torch
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import FunctionTransformer, MinMaxScaler, OneHotEncoder
-
-from ._util import prepare_trees
 
 
 @dataclass
@@ -26,6 +26,49 @@ class BinarizedQep:
     cardinality: int
     cost: float
     cache_pct: float
+
+    @staticmethod
+    def create_for(
+        plan: pb.QueryPlan, *, database: Optional[pb.Database] = None
+    ) -> BinarizedQep:
+        if plan.is_scan():
+            cache_pct = _determine_cache_pct(plan, database)
+            return BinarizedQep.scan(
+                plan.node_type,
+                cardinality=int(plan.estimated_cardinality),
+                cost=plan.estimated_cost,
+                cache_pct=cache_pct,
+            )
+
+        elif plan.is_join():
+            assert plan.outer_child and plan.inner_child
+            binarized_outer = BinarizedQep.create_for(
+                plan.outer_child, database=database
+            )
+            binarized_inner = BinarizedQep.create_for(
+                plan.inner_child, database=database
+            )
+            return BinarizedQep.pseudo_join(
+                plan.node_type,
+                binarized_outer,
+                binarized_inner,
+                cardinality=int(plan.estimated_cardinality),
+                cost=plan.estimated_cost,
+                cache_pct=0,
+            )
+
+        assert plan.input_node
+
+        dummy_child = BinarizedQep.dummy()
+        binarized_input = BinarizedQep.create_for(plan.input_node, database=database)
+        return BinarizedQep.pseudo_join(
+            plan.node_type,
+            binarized_input,
+            dummy_child,
+            cardinality=int(plan.estimated_cardinality),
+            cost=plan.estimated_cost,
+            cache_pct=0,
+        )
 
     @staticmethod
     def scan(
@@ -58,6 +101,47 @@ class BinarizedQep:
         # we need this method for the TCNN's flatten() method
         # functionally it is completely redundant
         return self.inner_child
+
+    def is_scan(self) -> bool:
+        return not self.is_dummy and self.outer_child is None
+
+    def is_join(self) -> bool:
+        return (
+            self.outer_child is not None
+            and self.inner_child is not None
+            and not self.inner_child.is_dummy
+        )
+
+    def is_intermediate(self) -> bool:
+        return self.inner_child is not None and self.inner_child.is_dummy
+
+
+class NodeType(IntEnum):
+    Join = 1
+    Scan = 2
+    Intermediate = 3
+    Dummy = 4
+
+
+FeaturizedNode = collections.namedtuple(
+    "FeaturizedNode", ["node_type", "encoding", "outer_child", "inner_child"]
+)
+
+
+def node_features(node: FeaturizedNode) -> np.ndarray:
+    return node.encoding
+
+
+def outer_child(node: FeaturizedNode) -> Optional[FeaturizedNode]:
+    if node.node_type == NodeType.Dummy or node.node_type == NodeType.Scan:
+        return None
+    return node.outer_child
+
+
+def inner_child(node: FeaturizedNode) -> Optional[FeaturizedNode]:
+    if node.node_type == NodeType.Dummy or node.node_type == NodeType.Scan:
+        return None
+    return node.inner_child
 
 
 def _determine_cache_pct(
@@ -98,45 +182,6 @@ def _determine_cache_pct(
     return pct_sum / len(rels)
 
 
-def binarize_qep(
-    plan: pb.QueryPlan, *, database: Optional[pb.Database] = None
-) -> BinarizedQep:
-    if plan.is_scan():
-        cache_pct = _determine_cache_pct(plan, database)
-        return BinarizedQep.scan(
-            plan.node_type,
-            cardinality=int(plan.estimated_cardinality),
-            cost=plan.estimated_cost,
-            cache_pct=cache_pct,
-        )
-
-    elif plan.is_join():
-        assert plan.outer_child and plan.inner_child
-        binarized_outer = binarize_qep(plan.outer_child, database=database)
-        binarized_inner = binarize_qep(plan.inner_child, database=database)
-        return BinarizedQep.pseudo_join(
-            plan.node_type,
-            binarized_outer,
-            binarized_inner,
-            cardinality=int(plan.estimated_cardinality),
-            cost=plan.estimated_cost,
-            cache_pct=0,
-        )
-
-    assert plan.input_node
-
-    dummy_child = BinarizedQep.dummy()
-    binarized_input = binarize_qep(plan.input_node, database=database)
-    return BinarizedQep.pseudo_join(
-        plan.node_type,
-        binarized_input,
-        dummy_child,
-        cardinality=int(plan.estimated_cardinality),
-        cost=plan.estimated_cost,
-        cache_pct=0,
-    )
-
-
 _PGNodeMap = {
     pb.ScanOperator.SequentialScan: "Seq Scan",
     pb.ScanOperator.IndexScan.value: "Index Scan",
@@ -149,24 +194,6 @@ _PGNodeMap = {
     pb.IntermediateOperator.Memoize: "Memoize",
     pb.IntermediateOperator.Sort.value: "Sort",
 }
-
-
-class RuntimeTransformer:
-    def __init__(self, min_runtime: float, max_runtime: float) -> None:
-        self._min_runtime = min_runtime
-        self._max_runtime = max_runtime
-        self._min_max_scaler = MinMaxScaler(
-            (np.log1p(self._min_runtime), np.log1p(self._max_runtime))
-        )
-        self._min_max_scaler.fit([(self._min_runtime,), (self._max_runtime,)])
-
-    def transform(self, xs, y=None):
-        log_scaled = np.log1p(xs)
-        return self._min_max_scaler.transform(log_scaled)
-
-    def inverse_transform(self, xs):
-        inverse_min_max = self._min_max_scaler.inverse_transform(xs)
-        return np.expm1(inverse_min_max)
 
 
 class BaoFeaturizer:
@@ -332,13 +359,13 @@ class BaoFeaturizer:
         )
 
     def encode_plan(
-        self, plan: pb.QueryPlan, *, database: Optional[pb.Database] = None
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        binarized = binarize_qep(plan, database=database)
-        featurized = prepare_trees(
-            [binarized], self.encode, BinarizedQep.outer, BinarizedQep.inner
-        )
-        return featurized
+        self,
+        plan: pb.QueryPlan,
+        *,
+        database: Optional[pb.Database] = None,
+    ) -> FeaturizedNode | tuple:
+        binarized = BinarizedQep.create_for(plan, database=database)
+        return self._featurize_qep(binarized)
 
     def encode_operator(self, node: BinarizedQep) -> np.ndarray:
         operator = "__bao_null__" if node.is_dummy else node.node
@@ -386,3 +413,27 @@ class BaoFeaturizer:
         }
         with open(path, "w") as f:
             json.dump(serialized, f)
+
+    def _featurize_qep(self, node: BinarizedQep | None) -> FeaturizedNode:
+        if node is None or node.is_dummy:
+            encoding = torch.zeros(self.out_shape)
+            return FeaturizedNode(NodeType.Dummy, encoding, [], [])
+
+        encoding = self.encode(node)
+        if node.is_scan():
+            return FeaturizedNode(NodeType.Scan, encoding, [], [])
+        elif node.is_join():
+            return FeaturizedNode(
+                NodeType.Join,
+                encoding,
+                self._featurize_qep(node.outer_child),
+                self._featurize_qep(node.inner_child),
+            )
+        else:
+            assert node.is_intermediate()
+            return FeaturizedNode(
+                NodeType.Intermediate,
+                encoding,
+                self._featurize_qep(node.outer_child),
+                self._featurize_qep(node.inner_child),
+            )

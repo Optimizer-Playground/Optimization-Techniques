@@ -223,3 +223,5 @@ localtest*
 .pg-connect*.toml
 *.prof
 .query_cache*.json
+models/
+
