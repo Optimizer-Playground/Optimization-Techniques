@@ -25,6 +25,4 @@ def valid_compress(ds: DegreeSequence, *, accurracy: float) -> PiecewiseLinearFn
 
         segments[-1].higher += deg / segments[-1].slope
 
-    return PiecewiseLinearFn(
-        segments, num_distinct=ds.distinct_values, final_card=ds.cardinality
-    )
+    return PiecewiseLinearFn(segments, num_distinct=ds.distinct_values)
