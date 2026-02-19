@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import bisect
 import itertools
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from typing import overload
 
@@ -44,6 +44,10 @@ class Segment:
         return Segment(self.lower, self.higher, 1 / self.slope, -self.intercept)
 
     def __call__(self, i: int) -> int:
+        if not self.lower <= i < self.higher:
+            raise ValueError(
+                f"i={i} is out of bounds for segment [{self.lower}, {self.higher})"
+            )
         return round(self.slope * i + self.intercept)
 
 
@@ -54,9 +58,13 @@ class PiecewiseConstantFn:
         self._segments = list(segments)
         self._num_distinct = num_distinct
 
-    def upper_bound(self, other: PiecewiseConstantFn) -> int:
-        degrees, widths = self._align_segments(other)
-        return degrees @ widths
+    @property
+    def n_distinct(self) -> int:
+        return self._num_distinct
+
+    @property
+    def segments(self) -> Sequence[Segment]:
+        return self._segments
 
     def cardinality(self) -> int:
         widths = np.asarray(seg.width for seg in self._segments)
@@ -81,21 +89,12 @@ class PiecewiseConstantFn:
 
         return PiecewiseLinearFn(linear_segments, num_distinct=self._num_distinct)
 
-    def _align_segments(
-        self, other: PiecewiseConstantFn
-    ) -> tuple[np.ndarray, np.ndarray]:
-        degrees: list[int] = []
-        widths: list[int] = []
-
-        # TODO
-
-        return np.asarray(degrees), np.asarray(widths)
-
     def __call__(self, i: int) -> int:
         # XXX: should we rather use np.searchsorted and maintain an ndarray with the upper bounds directly?
         idx = bisect.bisect_left(self._segments, x=i, key=lambda s: s.higher)
         if idx == len(self._segments):
-            return round(self._segments[-1].intercept)
+            # out of bounds -> no distinct values left -> frequency is 0
+            return 0
 
         segment = self._segments[idx]
         return round(segment.intercept)
@@ -106,7 +105,15 @@ class PiecewiseLinearFn:
         self._segments = list(segments)
         self._num_distinct = num_distinct
 
-    def upper_bound(self) -> int:
+    @property
+    def n_distinct(self) -> int:
+        return self._num_distinct
+
+    @property
+    def segments(self) -> Sequence[Segment]:
+        return self._segments
+
+    def cardinality(self) -> int:
         slopes: list[np.ndarray] = []
         intercepts: list[np.ndarray] = []
         for seg in self._segments:
@@ -144,20 +151,83 @@ class PiecewiseLinearFn:
     def _fuse_with(self, inner: PiecewiseLinearFn) -> PiecewiseLinearFn:
         pass
 
-    @overload
-    def __call__(self, i: int) -> int: ...
-
-    @overload
-    def __call__(self, i: PiecewiseLinearFn) -> PiecewiseLinearFn: ...
-
-    def __call__(self, i):
-        if isinstance(i, PiecewiseLinearFn):
-            return self._fuse_with(i)
-
+    def __call__(self, i: int) -> int:
         # XXX: should we rather use np.searchsorted and maintain an ndarray with the upper bounds directly?
         idx = bisect.bisect_left(self._segments, x=i, key=lambda s: s.higher)
         if idx == len(self._segments):
-            idx = -1
+            # out of bounds -> no distinct values left -> frequency is 0
+            return 0
 
         segment = self._segments[idx]
         return segment(i)
+
+
+@overload
+def align_functions(
+    a: PiecewiseConstantFn, b: PiecewiseConstantFn
+) -> tuple[PiecewiseConstantFn, PiecewiseConstantFn]: ...
+
+
+@overload
+def align_functions(
+    a: PiecewiseLinearFn, b: PiecewiseLinearFn
+) -> tuple[PiecewiseLinearFn, PiecewiseLinearFn]: ...
+
+
+def align_functions(
+    a: PiecewiseLinearFn | PiecewiseConstantFn,
+    b: PiecewiseLinearFn | PiecewiseConstantFn,
+) -> tuple[
+    PiecewiseLinearFn | PiecewiseConstantFn, PiecewiseLinearFn | PiecewiseConstantFn
+]:
+    if not isinstance(a, type(b)) or not isinstance(b, type(a)):
+        raise TypeError("Both functions must be of the same type")
+
+    target = type(a)
+    num_distinct = min(a.n_distinct, b.n_distinct)
+    a_iter = iter(a.segments)
+    b_iter = iter(b.segments)
+
+    a_segments: list[Segment] = []
+    b_segments: list[Segment] = []
+    last_cutoff = 0
+    current_a = next(a_iter, None)
+    current_b = next(b_iter, None)
+    while True:
+        if current_a is None or current_b is None:
+            break
+
+        if current_a.higher == current_b.higher:
+            a_segments.append(current_a)
+            b_segments.append(current_b)
+            last_cutoff = current_a.higher
+            current_a = next(a_iter, None)
+            current_b = next(b_iter, None)
+        elif current_a.higher < current_b.higher:
+            a_segments.append(current_a)
+            b_segments.append(
+                Segment(
+                    lower=last_cutoff,
+                    higher=current_a.higher,
+                    slope=current_b.slope,
+                    intercept=current_b(current_a.higher),
+                )
+            )
+            last_cutoff = current_a.higher
+            current_a = next(a_iter, None)
+        else:
+            a_segments.append(
+                Segment(
+                    lower=last_cutoff,
+                    higher=current_b.higher,
+                    slope=current_a.slope,
+                    intercept=current_a(current_b.higher),
+                )
+            )
+            b_segments.append(current_b)
+            last_cutoff = current_b.higher
+            current_b = next(b_iter, None)
+
+    aligned_a = target(a_segments, num_distinct=num_distinct)
+    aligned_b = target(b_segments, num_distinct=num_distinct)
+    return aligned_a, aligned_b
