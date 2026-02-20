@@ -52,6 +52,18 @@ class Segment:
 
 
 class PiecewiseConstantFn:
+    @staticmethod
+    def unit_segments(intercepts: Sequence[int]) -> PiecewiseConstantFn:
+        num_distinct = len(intercepts)
+        segments: list[Segment] = [
+            Segment.constant(intercept, lower=lo, higher=lo + 1)
+            for lo, intercept in enumerate(intercepts)
+        ]
+        return PiecewiseConstantFn(
+            segments,
+            num_distinct=num_distinct,
+        )
+
     def __init__(self, segments: Iterable[Segment], *, num_distinct: int) -> None:
         if any(not seg.is_constant() for seg in segments):
             raise ValueError("All segments must be constant")
@@ -89,6 +101,9 @@ class PiecewiseConstantFn:
 
         return PiecewiseLinearFn(linear_segments, num_distinct=self._num_distinct)
 
+    def as_linear(self) -> PiecewiseLinearFn:
+        return PiecewiseLinearFn(self._segments, num_distinct=self._num_distinct)
+
     def __call__(self, i: int) -> int:
         # XXX: should we rather use np.searchsorted and maintain an ndarray with the upper bounds directly?
         idx = bisect.bisect_left(self._segments, x=i, key=lambda s: s.higher)
@@ -98,6 +113,20 @@ class PiecewiseConstantFn:
 
         segment = self._segments[idx]
         return round(segment.intercept)
+
+    def __mul__(self, other: PiecewiseConstantFn) -> PiecewiseConstantFn:
+        aligned_self, aligned_other = align_functions(self, other)
+        new_segments: list[Segment] = []
+        for seg_a, seg_b in zip(aligned_self.segments, aligned_other.segments):
+            new_segments.append(
+                Segment.constant(
+                    seg_a.intercept * seg_b.intercept,
+                    lower=seg_a.lower,
+                    higher=seg_a.higher,
+                )
+            )
+
+        return PiecewiseConstantFn(new_segments, num_distinct=self._num_distinct)
 
 
 class PiecewiseLinearFn:
@@ -148,10 +177,35 @@ class PiecewiseLinearFn:
             num_distinct=self._num_distinct,
         )
 
-    def _fuse_with(self, inner: PiecewiseLinearFn) -> PiecewiseLinearFn:
-        pass
+    def compose_with(
+        self, inner: PiecewiseLinearFn | PiecewiseConstantFn
+    ) -> PiecewiseLinearFn:
+        if isinstance(inner, PiecewiseConstantFn):
+            inner = inner.as_linear()
 
-    def __call__(self, i: int) -> int:
+        aligned_self, aligned_other = align_functions(self, inner)
+        new_segments: list[Segment] = []
+        for seg_outer, seg_inner in zip(aligned_self.segments, aligned_other.segments):
+            new_slope = seg_outer.slope * seg_inner.slope
+            new_intercept = seg_outer.slope * seg_inner.intercept + seg_inner.intercept
+            new_segments.append(
+                Segment(seg_outer.lower, seg_outer.higher, new_slope, new_intercept)
+            )
+
+        return PiecewiseLinearFn(new_segments, num_distinct=self._num_distinct)
+
+    @overload
+    def __call__(
+        self, i: PiecewiseLinearFn | PiecewiseConstantFn
+    ) -> PiecewiseLinearFn: ...
+
+    @overload
+    def __call__(self, i: int) -> int: ...
+
+    def __call__(self, i) -> int | PiecewiseLinearFn:
+        if isinstance(i, (PiecewiseConstantFn | PiecewiseLinearFn)):
+            return self.compose_with(i)
+
         # XXX: should we rather use np.searchsorted and maintain an ndarray with the upper bounds directly?
         idx = bisect.bisect_left(self._segments, x=i, key=lambda s: s.higher)
         if idx == len(self._segments):
