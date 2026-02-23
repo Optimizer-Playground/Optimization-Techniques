@@ -3,84 +3,79 @@ from __future__ import annotations
 import functools
 import operator
 from collections.abc import Iterable
-from dataclasses import dataclass
-from typing import Protocol
+from typing import Optional
 
 import networkx as nx
 import postbound as pb
 
-from ._piecewise_fns import PiecewiseConstantFn, PiecewiseLinearFn
-
-
-class Step(Protocol):
-    def __call__(self) -> PiecewiseConstantFn:
-        pass
-
-
-class LeafStep:
-    def __init__(self, fn: PiecewiseConstantFn) -> None:
-        self._fn = fn
-
-    def __call__(self) -> PiecewiseConstantFn:
-        return self._fn
+from ._compress import merge_constants
+from ._piecewise_fns import PiecewiseConstantFn
 
 
 class AlphaStep:
-    def __init__(self, functions: Iterable[Step]) -> None:
-        self._fns = list(functions)
-        self._out: PiecewiseConstantFn | None = None
+    def __init__(
+        self, relations: Iterable[PiecewiseConstantFn], *, n_distinct: int
+    ) -> None:
+        self._fns = list(relations)
+        self._combined = functools.reduce(operator.mul, self._fns).cut_at(n_distinct)
+
+    @property
+    def n_distinct(self) -> int:
+        return self._combined.n_distinct
+
+    @property
+    def output(self) -> PiecewiseConstantFn:
+        return self._combined
 
     def cardinality(self) -> int:
-        final_fn = self()
-        return final_fn.cardinality()
+        return self._combined.cardinality()
 
     def __call__(self) -> PiecewiseConstantFn:
-        if self._out is None:
-            self._out = functools.reduce(operator.mul, [fn() for fn in self._fns])
-        return self._out
-
-
-@dataclass
-class _Join:
-    fn: PiecewiseConstantFn
-    cdf: PiecewiseLinearFn
-    inv: PiecewiseLinearFn
-
-    @staticmethod
-    def of(fn: Step):
-        cdf = fn().integrate()
-        return _Join(fn(), cdf, cdf.invert())
+        return self._combined
 
 
 class BetaStep:
     def __init__(
         self,
-        joins: Iterable[Step],
+        star_joins: Iterable[PiecewiseConstantFn],
+        *,
+        projection: Optional[PiecewiseConstantFn] = None,
+        n_distinct: int,
     ) -> None:
-        joins: list[_Join] = [_Join.of(fn) for fn in joins]
-        sorted(joins, key=lambda j: j.fn.n_distinct)
+        if projection is None:
+            candidates = sorted(star_joins, key=lambda join: join.n_distinct)
+            projection, star_joins = candidates[0], candidates[1:]
 
-        self._target = self._joins[0]
-        self._joins = self._joins[1:]
-        self._n_distinct = self._target.fn.n_distinct
+        self._proj = projection
+        self._proj_cumulative = self._proj.integ()
+        self._star_joins = list(star_joins)
+        self._join_cumulative = [star_join.integ() for star_join in self._star_joins]
+
+        cards: list[int] = []
+        for i in range(self._proj.n_distinct):
+            card = self(i)
+            if card == 0:
+                break
+            cards.append(card)
+        self._combined = merge_constants(cards)
+
+    @property
+    def n_distinct(self) -> int:
+        return self._proj.n_distinct
+
+    @property
+    def output(self) -> PiecewiseConstantFn:
+        return self._combined
 
     def cardinality(self) -> int:
-        final_fn = self()
-        return final_fn.cardinality()
+        return self._combined.cardinality()
 
-    def __call__(self) -> PiecewiseConstantFn:
-        distincts: list[int] = []
-
-        for i in range(self._n_distinct):
-            freq = self._target.fn(i)
-
-            for star_fn in self._joins:
-                star, inv = star_fn.fn, star_fn.inv
-                freq *= star(inv(self._target.cdf(i)))
-
-            distincts.append(freq)
-
-        return PiecewiseConstantFn.unit_segments(distincts)
+    def __call__(self, i: int) -> int:
+        card = self._proj(i)
+        for star_join, join_cumulative in zip(self._star_joins, self._join_cumulative):
+            bucket = join_cumulative.invert_at(self._proj_cumulative(i))
+            card *= star_join(bucket)
+        return card
 
 
 def decompose_query(
