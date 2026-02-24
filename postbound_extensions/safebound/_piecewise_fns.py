@@ -2,8 +2,22 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 from dataclasses import dataclass
+from typing import Protocol, overload
 
 import numpy as np
+
+
+class FunctionLike(Protocol):
+    @property
+    def n_distinct(self) -> int: ...
+
+    def evaluate_at(self, vals: np.ndarray) -> np.ndarray: ...
+
+    def cumulative_at(self, vals: np.ndarray) -> np.ndarray: ...
+
+    def invert_cumulative_at(self, vals: np.ndarray) -> np.ndarray: ...
+
+    def __call__(self, vals: np.ndarray) -> np.ndarray: ...
 
 
 @dataclass
@@ -68,6 +82,7 @@ class PiecewiseConstantFn:
 
         self._widths = np.diff(np.concat(([0], self._bounds)))
         self._num_distinct = self._bounds[-1]
+        self._cumulative = np.cumsum(self._values * self._widths)
 
     @property
     def values(self) -> np.ndarray:
@@ -104,7 +119,41 @@ class PiecewiseConstantFn:
     def align_with(
         self, other: PiecewiseConstantFn
     ) -> tuple[PiecewiseConstantFn, PiecewiseConstantFn]:
-        return align_pcfs(self, other)
+        return align_functions(self, other)
+
+    def evaluate_at(self, vals: np.ndarray) -> np.ndarray:
+        idx = np.searchsorted(self._bounds, vals)
+        out_of_bounds = idx >= self._num_distinct
+        clipped_idx = np.where(out_of_bounds, self._num_distinct - 1, idx)
+        return np.where(
+            out_of_bounds,
+            0,  # too few distinct values
+            self._values[clipped_idx],
+        )
+
+    def cumulative_at(self, vals: np.ndarray) -> np.ndarray:
+        idx = np.searchsorted(self._bounds, vals)
+        out_of_bounds = idx >= self._num_distinct
+        clipped_upper = np.where(out_of_bounds, self._num_distinct - 1, idx)
+        initial_bucket = idx == 0
+        clipped_lower = np.where(initial_bucket, 1, clipped_upper)
+
+        cumulative_until_idx = np.where(
+            initial_bucket | out_of_bounds,
+            self._cumulative[clipped_lower],
+            0,  # out of bounds
+        )
+        bucket_vals = np.where(out_of_bounds, 0, self._values[clipped_upper])
+        in_bucket = np.where(
+            out_of_bounds,
+            0,  # mask
+            (self._widths[clipped_upper] - vals) * bucket_vals,  # interpolate in bucket
+        )
+
+        return cumulative_until_idx + in_bucket
+
+    def invert_cumulative_at(self, vals: np.ndarray) -> np.ndarray:
+        pass
 
     def __len__(self) -> int:
         return len(self._values)
@@ -114,11 +163,8 @@ class PiecewiseConstantFn:
         frequencies = aligned_self._values * aligned_other._values
         return PiecewiseConstantFn(frequencies, aligned_self._bounds)
 
-    def __call__(self, i: int) -> int:
-        idx = np.searchsorted(self._bounds, i)
-        if idx >= self._num_distinct:
-            return 0
-        return self._values[idx]
+    def __call__(self, vals: np.ndarray) -> np.ndarray:
+        return self.evaluate_at(vals)
 
 
 class PiecewiseLinearFn:
@@ -150,33 +196,75 @@ class PiecewiseLinearFn:
         self._widths = np.diff(np.concat(([0], self._bounds)))
         self._num_distinct = self._bounds[-1]
 
+    @property
+    def n_distinct(self) -> int:
+        return self._num_distinct
+
+    @property
+    def slopes(self) -> np.ndarray:
+        return self._slopes
+
+    @property
+    def intercepts(self) -> np.ndarray:
+        return self._intercepts
+
+    @property
+    def bounds(self) -> np.ndarray:
+        return self._bounds
+
     def deriv(self) -> PiecewiseConstantFn:
         return PiecewiseConstantFn(self._slopes, self._bounds)
 
-    def invert_at(self, y: float) -> int:
-        idx = np.searchsorted(self._intercepts, y)
-        if idx < len(self._intercepts):
-            return (y - self._intercepts[idx]) / self._slopes[idx]
+    def invert(self) -> PiecewiseLinearFn:
+        return PiecewiseLinearFn(
+            slopes=1 / self._slopes,
+            intercepts=-1 * self._intercepts,
+            bounds=self._bounds,
+        )
 
-        # y is larger than our largest intercept.
-        # It might still be part of the very last segment, though.
-        x = (y - self._intercepts[-1]) / self._slopes[-1]
-        return 0 if x > self._widths[-1] else x
+    def compose_with(self, other: PiecewiseLinearFn) -> PiecewiseLinearFn:
+        aligned_self, aligned_other = align_functions(self, other)
+        slopes = aligned_self.slopes * aligned_other.slopes
+        intercepts = (
+            aligned_self.slopes * aligned_other.intercepts + aligned_other.intercepts
+        )
 
-    def __call__(self, i: int) -> int:
-        idx = np.searchsorted(self._bounds, i)
-        if idx >= self._num_distinct:
-            # too few distinct values
-            return 0
+        return PiecewiseLinearFn(
+            slopes=slopes, intercepts=intercepts, bounds=aligned_self.bounds
+        )
 
-        return self._slopes[idx] * i + self._intercepts[idx]
+    def __len__(self) -> int:
+        return len(self._slopes)
+
+    def __call__(self, vals: np.ndarray) -> np.ndarray:
+        idx = np.searchsorted(self._bounds, vals)
+        return np.where(
+            idx >= self._num_distinct,
+            0,  # too few distinct values
+            self._slopes[idx] * vals + self._intercepts[idx],
+        )
 
 
-def align_pcfs(
+@overload
+def align_functions(
+    a: PiecewiseConstantFn, b: PiecewiseConstantFn
+) -> tuple[PiecewiseConstantFn, PiecewiseConstantFn]: ...
+
+
+@overload
+def align_functions(
+    a: PiecewiseLinearFn, b: PiecewiseLinearFn
+) -> tuple[PiecewiseLinearFn, PiecewiseLinearFn]:
+    pass
+
+
+def _align_constant_fns(
     a: PiecewiseConstantFn, b: PiecewiseConstantFn
 ) -> tuple[PiecewiseConstantFn, PiecewiseConstantFn]:
     values_a, values_b = [], []
     bounds_a, bounds_b = [], []
+
+    # FIXME: the iteration loop is complete bullsh*t
 
     steps = min(len(a), len(b))
     for i in range(steps):
@@ -193,7 +281,7 @@ def align_pcfs(
             values_a.append(val_a)
             bounds_a.append(bound_a)
 
-            # we need to split the other fn into two equal fns
+            # we need to split b into two equal fns
             values_b.append(val_b)
             values_b.append(val_b)
             bounds_b.append(bound_a)
@@ -201,7 +289,7 @@ def align_pcfs(
 
         else:
             assert bound_a > bound_b
-            # we need to split our own fn into two equal fns
+            # we need to split a into two equal fns
             values_a.append(val_a)
             values_a.append(val_a)
             bounds_a.append(bound_b)
@@ -214,3 +302,75 @@ def align_pcfs(
         PiecewiseConstantFn(values_a, bounds_a),
         PiecewiseConstantFn(values_b, bounds_b),
     )
+
+
+def _align_linear_fns(
+    a: PiecewiseLinearFn, b: PiecewiseLinearFn
+) -> tuple[PiecewiseLinearFn, PiecewiseLinearFn]:
+    slopes_a, slopes_b = [], []
+    intercepts_a, intercepts_b = [], []
+    bounds_a, bounds_b = [], []
+
+    # FIXME: the iteration loop is complete bullsh*t
+
+    steps = min(len(a), len(b))
+    for i in range(steps):
+        bound_a, bound_b = a.bounds[i], b.bounds[i]
+
+        if bound_a == bound_b:
+            slopes_a.append(a.slopes[i])
+            intercepts_a.append(a.intercepts[i])
+            bounds_a.append(bound_a)
+
+            slopes_b.append(b.slopes[i])
+            intercepts_b.append(b.intercepts[i])
+            bounds_b.append(bound_b)
+
+        elif bound_a < bound_b:
+            # we need to split b into two equal fns
+            slopes_a.append(a.slopes[i])
+            intercepts_a.append(a.intercepts[i])
+            bounds_a.append(bound_a)
+
+            slopes_b.append(b.slopes[i])
+            intercepts_b.append(b.intercepts[i])
+            bounds_b.append(bound_a)
+
+            used_interval = bound_b - bound_a
+            new_intercept = b.slopes[i] * used_interval + b.intercepts[i]
+            slopes_b.append(b.slopes[i])
+            intercepts_b.append(new_intercept)
+            bounds_b.append(bound_b)
+
+        else:
+            assert bound_a > bound_b
+
+            slopes_a.append(a.slopes[i])
+            intercepts_a.append(a.intercepts[i])
+            bounds_a.append(bound_b)
+
+            used_interval = bound_a - bound_b
+            new_intercept = a.slopes[i] * used_interval + a.intercepts[i]
+            slopes_a.append(a.slopes[i])
+            intercepts_a.append(new_intercept)
+            bound_a.append(bound_a)
+
+            slopes_b.append(b.slopes[i])
+            intercepts_b.append(b.intercepts[i])
+            bounds_b.append(bound_b)
+
+    return (
+        PiecewiseLinearFn(slopes=slopes_a, intercepts=intercepts_a, bounds=bounds_a),
+        PiecewiseLinearFn(slopes=slopes_b, intercepts=intercepts_b, bounds=bounds_b),
+    )
+
+
+def align_functions(
+    a: PiecewiseConstantFn, b: PiecewiseConstantFn
+) -> tuple[PiecewiseConstantFn, PiecewiseConstantFn]:
+    if isinstance(a, PiecewiseConstantFn) and isinstance(b, PiecewiseConstantFn):
+        return _align_constant_fns(a, b)
+    elif isinstance(a, PiecewiseLinearFn) and isinstance(b, PiecewiseLinearFn):
+        return _align_linear_fns(a, b)
+    else:
+        raise TypeError("Both functions must be of the same type")
