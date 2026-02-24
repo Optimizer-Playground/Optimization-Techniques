@@ -17,7 +17,7 @@ class FunctionLike(Protocol):
 
     def invert_cumulative_at(self, vals: np.ndarray) -> np.ndarray: ...
 
-    def __call__(self, vals: np.ndarray) -> np.ndarray: ...
+    def cardinality(self) -> int: ...
 
 
 @dataclass
@@ -83,6 +83,7 @@ class PiecewiseConstantFn:
         self._widths = np.diff(np.concat(([0], self._bounds)))
         self._num_distinct = self._bounds[-1]
         self._cumulative = np.cumsum(self._values * self._widths)
+        self._cum_widths = np.cumsum(self._widths)
 
     @property
     def values(self) -> np.ndarray:
@@ -122,38 +123,95 @@ class PiecewiseConstantFn:
         return align_functions(self, other)
 
     def evaluate_at(self, vals: np.ndarray) -> np.ndarray:
+        if not isinstance(vals, np.ndarray):
+            vals = np.asarray(vals)
+
         idx = np.searchsorted(self._bounds, vals)
-        out_of_bounds = idx >= self._num_distinct
-        clipped_idx = np.where(out_of_bounds, self._num_distinct - 1, idx)
+        out_of_bounds = idx >= len(self._values)
+        clipped = np.where(out_of_bounds, 0, idx)
         return np.where(
             out_of_bounds,
             0,  # too few distinct values
-            self._values[clipped_idx],
+            self._values[clipped],
         )
 
     def cumulative_at(self, vals: np.ndarray) -> np.ndarray:
+        if not isinstance(vals, np.ndarray):
+            vals = np.asarray(vals)
+
         idx = np.searchsorted(self._bounds, vals)
-        out_of_bounds = idx >= self._num_distinct
-        clipped_upper = np.where(out_of_bounds, self._num_distinct - 1, idx)
-        initial_bucket = idx == 0
-        clipped_lower = np.where(initial_bucket, 1, clipped_upper)
+        out_of_bounds = idx >= len(self._values)
+        clipped_upper = np.where(out_of_bounds, 0, idx)
+        in_initial_bucket = idx == 0
+        clipped_lower = np.where(in_initial_bucket, 1, clipped_upper)
 
         cumulative_until_idx = np.where(
-            initial_bucket | out_of_bounds,
-            self._cumulative[clipped_lower],
+            in_initial_bucket | out_of_bounds,
             0,  # out of bounds
+            self._cumulative[clipped_lower - 1],
         )
+
         bucket_vals = np.where(out_of_bounds, 0, self._values[clipped_upper])
         in_bucket = np.where(
             out_of_bounds,
             0,  # mask
-            (self._widths[clipped_upper] - vals) * bucket_vals,  # interpolate in bucket
+            (self._cum_widths[clipped_upper] - vals) * bucket_vals,
         )
 
         return cumulative_until_idx + in_bucket
 
     def invert_cumulative_at(self, vals: np.ndarray) -> np.ndarray:
-        pass
+        if not isinstance(vals, np.ndarray):
+            vals = np.asarray(vals)
+
+        idx = np.searchsorted(self._cumulative, vals)
+        out_of_bounds = idx >= len(self._values)
+        clipped_upper = np.where(out_of_bounds, 0, idx)
+        in_initial_bucket = idx == 0
+        clipped_lower = np.where(in_initial_bucket, 1, clipped_upper)
+
+        freq_until_bucket = np.where(
+            in_initial_bucket | out_of_bounds, 0, self._cum_widths[clipped_lower - 1]
+        )
+
+        prev_bucket_freq = np.where(
+            in_initial_bucket, 0, self._cumulative[clipped_lower - 1]
+        )
+        per_elem_freq = np.where(
+            out_of_bounds, 1, self._values[clipped_upper]
+        )  # use 1 to prevent division by 0
+        in_bucket_freq = (vals - prev_bucket_freq) / per_elem_freq
+
+        return np.where(out_of_bounds, 0, freq_until_bucket + in_bucket_freq)
+
+    def inspect(self) -> str:
+        lines: list[str] = [
+            f"PCF ({len(self._values)} segments, {self._num_distinct} distinct values)"
+        ]
+
+        prev_bound = 0
+        max_bound = self._bounds[-1]
+        max_freq = np.max(self._values)
+        max_total = self._cumulative[-1]
+
+        bound_padding = len(str(max_bound))
+        freq_padding = len(str(max_freq))
+        total_padding = len(str(max_total))
+
+        for i in range(len(self._values)):
+            freq = self._values[i]
+            bound = self._bounds[i]
+            total = self._cumulative[i]
+            lines.append(
+                f" +-- Segment {i}: "
+                f"range=[{prev_bound:>{bound_padding}}, {bound:>{bound_padding}}), "
+                f"value={freq:>{freq_padding}} "
+                f"({total:>{total_padding}} total)"
+            )
+
+            prev_bound = bound
+
+        return "\n".join(lines)
 
     def __len__(self) -> int:
         return len(self._values)
