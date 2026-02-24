@@ -224,6 +224,16 @@ class PiecewiseConstantFn:
     def __call__(self, vals: np.ndarray) -> np.ndarray:
         return self.evaluate_at(vals)
 
+    def __hash__(self) -> int:
+        return hash((self._values.tobytes(), self._bounds.tobytes()))
+
+    def __eq__(self, other: object) -> bool:
+        return (
+            isinstance(other, type(self))
+            and np.array_equal(self._values, other._values)
+            and np.array_equal(self._bounds, other._bounds)
+        )
+
 
 class PiecewiseLinearFn:
     @staticmethod

@@ -14,7 +14,7 @@ from ._piecewise_fns import FunctionLike, PiecewiseConstantFn
 
 class AlphaStep:
     def __init__(self, relations: Iterable[FunctionLike]) -> None:
-        self._fns: list[FunctionLike] = list(relations)
+        self._fns: tuple[FunctionLike, ...] = tuple(relations)
         self._combined: PiecewiseConstantFn | None = None
         if all(isinstance(rel, PiecewiseConstantFn) for rel in self._fns):
             self._combined = functools.reduce(operator.mul, self._fns)  # type: ignore
@@ -70,6 +70,14 @@ class AlphaStep:
     def __call__(self, vals: np.ndarray) -> np.ndarray:
         return self.evaluate_at(vals)
 
+    def __hash__(self) -> int:
+        if self._combined is not None:
+            return hash(self._combined)
+        return hash(self._fns)
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, type(self)) and self._fns == other._fns
+
 
 class BetaStep:
     def __init__(
@@ -83,8 +91,8 @@ class BetaStep:
             sorted(star_joins, key=lambda j: j.n_distinct)
             projection, star_joins = star_joins[0], star_joins[1:]
 
-        self._proj = projection
-        self._star_joins = list(star_joins)
+        self._proj: FunctionLike = projection
+        self._star_joins: tuple[FunctionLike, ...] = tuple(star_joins)
 
     @property
     def n_distinct(self) -> int:
@@ -117,64 +125,49 @@ class BetaStep:
     def __call__(self, vals: np.ndarray) -> np.ndarray:
         return self.evaluate_at(vals)
 
+    def __hash__(self) -> int:
+        return hash((self._proj, self._star_joins))
 
-def _create_alpha_step(
-    join_node: int,
-    *,
-    graph: nx.Graph,
-    anchor: Optional[pb.TableReference],
-    stats: dict[pb.ColumnReference, PiecewiseConstantFn],
-) -> AlphaStep:
-    functions: list[FunctionLike] = []
-    for neighbor, data in graph.adj[join_node].items():
-        if neighbor == anchor:
-            continue
-        functions.append(
-            _create_spanning_tree(neighbor, graph=graph, anchor=join_node, stats=stats)
+    def __eq__(self, other: object) -> bool:
+        return (
+            isinstance(other, type(self))
+            and self._proj == other._proj
+            and self._star_joins == other._star_joins
         )
 
-    if anchor is None:
-        return AlphaStep(functions)
 
-    edge = graph.edges[join_node, anchor]
-    join_col = edge["join_col"]
-    functions.append(stats[join_col])
-    return AlphaStep(functions)
-
-
-def _create_beta_step(
-    join_node: int,
+def _generate_alpha(
+    join_graph: nx.Graph,
+    join: int,
     *,
-    graph: nx.Graph,
-    anchor: Optional[pb.TableReference],
-    stats: dict[pb.ColumnReference, PiecewiseConstantFn],
-) -> BetaStep:
-    star_joins: list[FunctionLike] = []
-    for neighbor, data in graph.adj[join_node].items():
-        if neighbor == anchor:
-            continue
-        star_joins.append(
-            _create_spanning_tree(neighbor, graph=graph, anchor=join_node, stats=stats)
-        )
+    statistics: dict[pb.ColumnReference, PiecewiseConstantFn],
+) -> tuple[AlphaStep | None, set]:
+    free_nodes = []
+    total_nodes = 0
+    for node, edge in join_graph.adj[join].items():
+        total_nodes += 1
+        if len(join_graph.adj[node]) == 1:
+            free_nodes.append((node, edge.get("join_col", node)))
 
-    if anchor is None:
-        return BetaStep(star_joins)
+    if len(free_nodes) < total_nodes - 1:
+        return None, set()
 
-    edge = graph.edges[join_node, anchor]
-    join_col = edge["join_col"]
-    return BetaStep(star_joins, projection=stats[join_col])
+    relations = [
+        node if join_col is None else statistics[join_col]
+        for node, join_col in free_nodes
+    ]
+    step = AlphaStep(relations)
+    return step, {node[0] for node in free_nodes}
 
 
-def _create_spanning_tree(
-    node: pb.TableReference,
+def _generate_beta(
+    join_graph: nx.Graph,
+    node,
     *,
-    graph: nx.Graph,
-    anchor: Optional[int],
-    stats: dict[pb.ColumnReference, PiecewiseConstantFn],
-) -> AlphaStep | BetaStep:
-    joins = graph.adj[node]
-
-    # TODO
+    statistics: dict[pb.ColumnReference, PiecewiseConstantFn],
+) -> tuple[BetaStep | None, set]:
+    # XXX: make sure to only include each node in one step!
+    pass
 
 
 def decompose_query(
@@ -187,8 +180,48 @@ def decompose_query(
         join_graph.add_node(i, node_type="join")
         join_graph.add_edges_from((i, col.table, {"join_col": col}) for col in eqc)
 
-    root: pb.TableReference = None  # TODO
-    return _create_spanning_tree(root, graph=join_graph, anchor=None, stats=statistics)
+    while len(join_graph) > 1:
+        alpha_steps: dict[int, AlphaStep] = {}
+        nodes_to_pop: set[pb.TableReference] = set()
+
+        for join, data in join_graph.nodes(data=True):
+            if data["node_type"] != "join":
+                continue
+
+            step, removed = _generate_alpha(join_graph, join, statistics=statistics)
+            if step is None:
+                # not suitable for an alpha step
+                continue
+
+            alpha_steps[join] = step
+            nodes_to_pop |= removed
+
+        # TODO:
+        # - insert alpha steps
+        # - remove leaf nodes + joins
+        # - re-connect alpha steps
+
+        beta_steps: list[BetaStep] = []
+        nodes_to_pop.clear()
+        for table, data in join_graph.nodes(data=True):
+            if data["node_type"] not in ("base_table", "step"):
+                continue
+
+            step, removed = _generate_beta(join_graph, table, statistics=statistics)
+            if step is None:
+                # not suitable for beta step
+                continue
+
+            beta_steps.append(step)
+            nodes_to_pop |= removed
+
+        # TODO:
+        # - insert beta steps
+        # - remove leaf nodes + joins
+        # - re-connect beta steps
+
+    root = next(iter(join_graph.nodes()))
+    return root
 
 
 def fdsb(root: AlphaStep | BetaStep) -> pb.Cardinality:
