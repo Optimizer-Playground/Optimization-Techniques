@@ -2,14 +2,17 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Protocol, overload
+from typing import Optional, Protocol, overload
 
 import numpy as np
+import postbound as pb
 
 
 class FunctionLike(Protocol):
     @property
     def n_distinct(self) -> int: ...
+
+    def columns(self) -> set[pb.ColumnReference]: ...
 
     def evaluate_at(self, vals: np.ndarray) -> np.ndarray: ...
 
@@ -18,6 +21,10 @@ class FunctionLike(Protocol):
     def invert_cumulative_at(self, vals: np.ndarray) -> np.ndarray: ...
 
     def cardinality(self) -> int: ...
+
+    def __hash__(self) -> int: ...
+
+    def __eq__(self, other: object) -> bool: ...
 
 
 @dataclass
@@ -64,7 +71,9 @@ class Segment:
 
 class PiecewiseConstantFn:
     @staticmethod
-    def from_segments(segments: Iterable[Segment]) -> PiecewiseConstantFn:
+    def from_segments(
+        segments: Iterable[Segment], *, column: Optional[pb.ColumnReference] = None
+    ) -> PiecewiseConstantFn:
         values: list[float] = []
         bounds: list[int] = []
         for seg in segments:
@@ -72,9 +81,17 @@ class PiecewiseConstantFn:
                 raise ValueError("All segments must be constant")
             values.append(seg.intercept)
             bounds.append(seg.higher)
-        return PiecewiseConstantFn(values, bounds)
+        return PiecewiseConstantFn(values, bounds, column=column)
 
-    def __init__(self, values: Iterable[float], bounds: Iterable[int]) -> None:
+    def __init__(
+        self,
+        values: Iterable[float],
+        bounds: Iterable[int],
+        *,
+        column: Optional[pb.ColumnReference] = None,
+    ) -> None:
+        self.column = column
+
         self._values = np.asarray(values)
         self._bounds = np.asarray(bounds)
         if len(self._values) != len(self._bounds):
@@ -96,6 +113,9 @@ class PiecewiseConstantFn:
     @property
     def n_distinct(self) -> int:
         return self._num_distinct
+
+    def columns(self) -> set[pb.ColumnReference]:
+        return set() if self.column is None else {self.column}
 
     def cardinality(self) -> int:
         return self._values @ self._widths
@@ -185,8 +205,13 @@ class PiecewiseConstantFn:
         return np.where(out_of_bounds, 0, freq_until_bucket + in_bucket_freq)
 
     def inspect(self) -> str:
+        if self.column is not None:
+            col_desc = f"for column {self.column}"
+        else:
+            col_desc = ""
+
         lines: list[str] = [
-            f"PCF ({len(self._values)} segments, {self._num_distinct} distinct values)"
+            f"PCF {col_desc}({len(self._values)} segments, {self._num_distinct} distinct values)"
         ]
 
         prev_bound = 0
@@ -237,7 +262,9 @@ class PiecewiseConstantFn:
 
 class PiecewiseLinearFn:
     @staticmethod
-    def from_segments(segments: Iterable[Segment]) -> PiecewiseLinearFn:
+    def from_segments(
+        segments: Iterable[Segment], column: Optional[pb.ColumnReference] = None
+    ) -> PiecewiseLinearFn:
         slopes: list[float] = []
         intercepts: list[float] = []
         bounds: list[int] = []
@@ -246,7 +273,9 @@ class PiecewiseLinearFn:
             intercepts.append(seg.intercept)
             bounds.append(seg.higher)
 
-        return PiecewiseLinearFn(slopes=slopes, intercepts=intercepts, bounds=bounds)
+        return PiecewiseLinearFn(
+            slopes=slopes, intercepts=intercepts, bounds=bounds, column=column
+        )
 
     def __init__(
         self,
@@ -254,7 +283,10 @@ class PiecewiseLinearFn:
         slopes: Iterable[float],
         intercepts: Iterable[float],
         bounds: Iterable[int],
+        column: Optional[pb.ColumnReference] = None,
     ) -> None:
+        self.column = column
+
         self._slopes = np.asarray(slopes)
         self._intercepts = np.asarray(intercepts)
         self._bounds = np.asarray(bounds)
@@ -281,13 +313,14 @@ class PiecewiseLinearFn:
         return self._bounds
 
     def deriv(self) -> PiecewiseConstantFn:
-        return PiecewiseConstantFn(self._slopes, self._bounds)
+        return PiecewiseConstantFn(self._slopes, self._bounds, column=self.column)
 
     def invert(self) -> PiecewiseLinearFn:
         return PiecewiseLinearFn(
             slopes=1 / self._slopes,
             intercepts=-1 * self._intercepts,
             bounds=self._bounds,
+            column=self.column,
         )
 
     def compose_with(self, other: PiecewiseLinearFn) -> PiecewiseLinearFn:
@@ -298,7 +331,10 @@ class PiecewiseLinearFn:
         )
 
         return PiecewiseLinearFn(
-            slopes=slopes, intercepts=intercepts, bounds=aligned_self.bounds
+            slopes=slopes,
+            intercepts=intercepts,
+            bounds=aligned_self.bounds,
+            column=self.column,
         )
 
     def __len__(self) -> int:
@@ -367,8 +403,8 @@ def _align_constant_fns(
             bounds_b.append(bound_b)
 
     return (
-        PiecewiseConstantFn(values_a, bounds_a),
-        PiecewiseConstantFn(values_b, bounds_b),
+        PiecewiseConstantFn(values_a, bounds_a, column=a.column),
+        PiecewiseConstantFn(values_b, bounds_b, column=b.column),
     )
 
 
@@ -428,8 +464,12 @@ def _align_linear_fns(
             bounds_b.append(bound_b)
 
     return (
-        PiecewiseLinearFn(slopes=slopes_a, intercepts=intercepts_a, bounds=bounds_a),
-        PiecewiseLinearFn(slopes=slopes_b, intercepts=intercepts_b, bounds=bounds_b),
+        PiecewiseLinearFn(
+            slopes=slopes_a, intercepts=intercepts_a, bounds=bounds_a, column=a.column
+        ),
+        PiecewiseLinearFn(
+            slopes=slopes_b, intercepts=intercepts_b, bounds=bounds_b, column=b.column
+        ),
     )
 
 
