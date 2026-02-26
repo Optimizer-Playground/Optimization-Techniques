@@ -150,6 +150,9 @@ def _determine_cache_pct(
     measures = node.measures
     if measures.cache_hits is not None and measures.cache_misses is not None:
         total_cache_accesses = measures.cache_hits + measures.cache_misses
+        if total_cache_accesses == 0:
+            return 1
+
         return measures.cache_hits / total_cache_accesses
 
     if database is None or not isinstance(database, pb.postgres.PostgresInterface):
