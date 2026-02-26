@@ -573,7 +573,11 @@ class BaoOptimizer(pb.CompleteOptimizationAlgorithm):
         self._train(loader)
 
     def calibrate(
-        self, workload: pb.Workload, *, timeout_ms: Optional[float] = None
+        self,
+        workload: pb.Workload,
+        *,
+        timeout_ms: Optional[float] = None,
+        from_scratch: bool = False,
     ) -> None:
         self._log("Gathering query plans for calibration queries")
         query_iter = (
@@ -602,6 +606,10 @@ class BaoOptimizer(pb.CompleteOptimizationAlgorithm):
             plan = self._db.optimizer().parse_plan(raw_plan, query=query)
             runtime = plan.execution_time
             self._experience.add(plan, runtime * 1000)
+
+        if from_scratch:
+            self._log("Obtaining new model")
+            self._tcnn = BaoModel(self._featurizer.out_shape)
 
         dataset = self._experience.samples()
         loader = torch.utils.data.DataLoader(
