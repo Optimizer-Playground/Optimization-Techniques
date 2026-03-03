@@ -83,6 +83,10 @@ class PiecewiseConstantFn:
             bounds.append(seg.higher)
         return PiecewiseConstantFn(values, bounds, column=column)
 
+    @staticmethod
+    def zero(column: Optional[pb.ColumnReference] = None) -> PiecewiseConstantFn:
+        return PiecewiseConstantFn([0], [0], column=column)
+
     def __init__(
         self,
         values: Iterable[float],
@@ -141,6 +145,13 @@ class PiecewiseConstantFn:
         self, other: PiecewiseConstantFn
     ) -> tuple[PiecewiseConstantFn, PiecewiseConstantFn]:
         return align_functions(self, other)
+
+    def min_with(self, other: PiecewiseConstantFn) -> PiecewiseConstantFn:
+        aligned_self, aligned_other = align_functions(self, other)
+        return PiecewiseConstantFn(
+            np.min([aligned_self._values, aligned_other._values], axis=0),
+            aligned_self._bounds,
+        )
 
     def evaluate_at(self, vals: np.ndarray) -> np.ndarray:
         if not isinstance(vals, np.ndarray):
@@ -241,10 +252,15 @@ class PiecewiseConstantFn:
     def __len__(self) -> int:
         return len(self._values)
 
+    def __add__(self, other: PiecewiseConstantFn) -> PiecewiseConstantFn:
+        aligned_self, aligned_other = align_functions(self, other)
+        values = aligned_self._values + aligned_other._values
+        return PiecewiseConstantFn(values, aligned_self._bounds, column=self.column)
+
     def __mul__(self, other: PiecewiseConstantFn) -> PiecewiseConstantFn:
-        aligned_self, aligned_other = self.align_with(other)
-        frequencies = aligned_self._values * aligned_other._values
-        return PiecewiseConstantFn(frequencies, aligned_self._bounds)
+        aligned_self, aligned_other = align_functions(self, other)
+        values = aligned_self._values * aligned_other._values
+        return PiecewiseConstantFn(values, aligned_self._bounds)
 
     def __call__(self, vals: np.ndarray) -> np.ndarray:
         return self.evaluate_at(vals)

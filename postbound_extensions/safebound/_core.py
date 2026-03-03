@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable, Sequence
+from typing import Optional
 
 import numpy as np
 import postbound as pb
@@ -9,11 +10,22 @@ from numpy.typing import NDArray
 
 class DegreeSequence:
     @staticmethod
-    def from_mcv(mcv: pb.db.MostCommonValues) -> DegreeSequence:
-        return DegreeSequence(mcv.frequencies)
+    def from_mcv(
+        mcv: pb.db.MostCommonValues, *, column: Optional[pb.ColumnReference] = None
+    ) -> DegreeSequence:
+        return DegreeSequence(mcv.frequencies, column=column)
+
+    @staticmethod
+    def for_primary_key(
+        n_values: int, *, column: Optional[pb.ColumnReference] = None
+    ) -> DegreeSequence:
+        return DegreeSequence(np.ones(n_values), column=column)
 
     def __init__(
-        self, degrees: Iterable[int | pb.Cardinality] | NDArray[np.int_]
+        self,
+        degrees: Iterable[int | pb.Cardinality] | NDArray[np.int_],
+        *,
+        column: Optional[pb.ColumnReference] = None,
     ) -> None:
         if not isinstance(degrees, np.ndarray):
             degrees = [
@@ -24,6 +36,11 @@ class DegreeSequence:
             degrees = np.asarray(degrees)
         degrees = np.sort(degrees)[::-1]  # see https://stackoverflow.com/q/26984414
         self._degrees: NDArray[np.int_] = np.array(degrees)
+        self._column = column
+
+    @property
+    def column(self) -> Optional[pb.ColumnReference]:
+        return self._column
 
     @property
     def max_deg(self) -> int:

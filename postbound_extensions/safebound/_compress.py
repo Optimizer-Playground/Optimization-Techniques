@@ -6,9 +6,9 @@ from ._core import DegreeSequence
 from ._piecewise_fns import PiecewiseConstantFn, PiecewiseLinearFn, Segment
 
 
-def valid_compress(ds: DegreeSequence, *, accurracy: float) -> PiecewiseLinearFn:
+def valid_compress(ds: DegreeSequence, *, accuracy: float) -> PiecewiseLinearFn:
     selfjoin_bound = ds.join_bound(ds)
-    err_threshold = accurracy * selfjoin_bound
+    err_threshold = accuracy * selfjoin_bound
 
     error = 0
     segments: list[Segment] = [Segment.initial(ds.max_deg)]
@@ -27,7 +27,7 @@ def valid_compress(ds: DegreeSequence, *, accurracy: float) -> PiecewiseLinearFn
 
         segments[-1].higher += deg / segments[-1].slope
 
-    return PiecewiseLinearFn.from_segments(segments)
+    return PiecewiseLinearFn.from_segments(segments, column=ds.column)
 
 
 def merge_constants(values: Iterable[int]) -> PiecewiseConstantFn:
