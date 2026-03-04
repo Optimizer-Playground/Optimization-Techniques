@@ -211,10 +211,10 @@ class EqualityConditionedPCF[T]:
 class EqualityConditionsRepo:
     def __init__(
         self,
-        join_functions: dict[pb.ColumnReference, list[EqualityConditionedPCF]],
+        join_pcfs: dict[pb.ColumnReference, list[EqualityConditionedPCF]],
         fallbacks: dict[pb.ColumnReference, PiecewiseConstantFn],
     ) -> None:
-        self._functions = join_functions
+        self._functions = join_pcfs
         self._fallbacks = fallbacks
 
     def lookup(
@@ -248,7 +248,7 @@ class EqualityConditionsRepo:
 def build_equality_mcvs(
     spec: CatalogSpec, *, mcv_size: int, accuracy: float, database: pb.Database
 ) -> EqualityConditionsRepo:
-    join_functions = collections.defaultdict(list)
+    pcfs = collections.defaultdict(list)
     fallbacks: dict[pb.ColumnReference, PiecewiseConstantFn] = {}
 
     for join_col, filter_cols in spec.equality_cols.items():
@@ -283,9 +283,9 @@ def build_equality_mcvs(
                 non_mcv_pcf += pcf
 
             repo = EqualityConditionedPCF(filter_col, correlated_pcfs, non_mcv_pcf)
-            join_functions[join_col].append(repo)
+            pcfs[join_col].append(repo)
 
-    return EqualityConditionsRepo(join_functions, fallbacks)
+    return EqualityConditionsRepo(pcfs, fallbacks)
 
 
 class RangeConditionedPCF[T: _HistogramKey]:
@@ -294,13 +294,27 @@ class RangeConditionedPCF[T: _HistogramKey]:
         buckets: Sequence[PiecewiseConstantFn],
         bounds: Sequence[T],
         *,
+        column: pb.ColumnReference,
         higher_res: RangeConditionedPCF[T] | None = None,
     ) -> None:
         if len(buckets) != len(bounds):
             raise ValueError("bounds and buckets have to have the same length")
         self._buckets = list(buckets)
         self._bounds = list(bounds)
+        self._column = column
         self._higher_res = higher_res
+
+    @property
+    def column(self) -> pb.ColumnReference:
+        return self._column
+
+    @property
+    def higher_res(self) -> Optional[RangeConditionedPCF[T]]:
+        return self._higher_res
+
+    @higher_res.setter
+    def higher_res(self, value: RangeConditionedPCF[T] | None) -> None:
+        self._higher_res = value
 
     def pcf_from_buckets(self, rng: slice) -> PiecewiseConstantFn:
         buckets = self._buckets[rng]
@@ -374,11 +388,125 @@ class RangeConditionedPCF[T: _HistogramKey]:
 
 
 class RangeConditionedSequenceRepo:
-    pass
+    def __init__(
+        self, join_pcfs: dict[pb.ColumnReference, list[RangeConditionedPCF]]
+    ) -> None:
+        self._join_pcfs = join_pcfs
 
 
-def build_histograms(spec: CatalogSpec) -> RangeConditionedSequenceRepo:
-    pass
+def fetch_column_distribution[T](
+    column: pb.ColumnReference, database: pb.Database
+) -> list[tuple[T, int]]:
+    select_clause = pb.qal.Select(
+        [pb.qal.BaseProjection.column(column), pb.qal.BaseProjection.count_star()]
+    )
+    from_clause = pb.qal.From.create_for(column.table)
+    group_clause = pb.qal.GroupBy.create_for(column)
+    order_clause = pb.qal.OrderBy.create_for(column, ascending=True)
+    sql = pb.SqlQuery(
+        select_clause=select_clause,
+        from_clause=from_clause,
+        groupby_clause=group_clause,
+        orderby_clause=order_clause,
+    )
+
+    return database.execute_query(sql, raw=True)
+
+
+def histogram_for_bucket[T: _HistogramKey](
+    range_distribution: list[tuple[T, int]],
+    *,
+    k: int,
+    total_cardinality: int,
+    accuracy: float,
+    join_col: pb.ColumnReference,
+    range_col: pb.ColumnReference,
+    database: pb.Database,
+) -> RangeConditionedPCF[T]:
+    freq_per_bucket = total_cardinality // k
+    buckets: list[PiecewiseConstantFn] = []
+    bounds: list[T] = []
+
+    total_freq = 0
+    lower_bound: T | None = None
+    for prev, cur, nxt in pb.util.sliding_window(range_distribution, 3):
+        cur_val, cur_freq = cur
+        prev_val, prev_freq = prev
+        nxt_val, nxt_freq = nxt
+        updated_freq = total_freq + cur_freq
+        if updated_freq < freq_per_bucket:
+            # we still have room in our bucket
+            total_freq = updated_freq
+            continue
+
+        # Our current frequency exceeds the target frequency of each bucket,
+        # therefore we need to create a new bucket.
+        # To minimize the difference between ideal frequency of each bucket and
+        # the actual frequency, we need to compare whether the new bucket should
+        # end at the current element, or (if the current element's frequency is huge)
+        # if ending at the previous bucket would be even better.
+
+        lower_err = freq_per_bucket - total_freq
+        cur_err = updated_freq - freq_per_bucket
+        if lower_err < cur_err:
+            # stop at the previous value, include the current value in the next bucket
+            upper_bound = cur_val  # upper bound is exclusive
+            total_freq = cur_freq
+        else:
+            # include the current value in the bucket
+            upper_bound = nxt_val  # upper bound is exclusive
+            total_freq = 0
+
+        lower_pred = pb.qal.as_predicate(range_col, ">=", lower_bound)
+        upper_pred = pb.qal.as_predicate(range_col, "<", upper_bound)
+        range_pred = pb.qal.CompoundPredicate.create_and([lower_pred, upper_pred])
+
+        pcf = fetch_correlated_ds(
+            range_pred, on=join_col, database=database, accuracy=accuracy
+        )
+        buckets.append(pcf)
+        bounds.append(upper_bound)
+
+        # since our upper bound is exclusive, the next bucket has to start at our current
+        # upper bound to make sure we don't miss any values.
+        lower_bound = upper_bound
+
+    return RangeConditionedPCF(buckets, bounds, column=join_col)
+
+
+def build_histograms(
+    spec: CatalogSpec, *, hierarchy_depth: int, accuracy: float, database: pb.Database
+) -> RangeConditionedSequenceRepo:
+    pcfs = collections.defaultdict(list)
+
+    for join_col, filter_cols in spec.range_cols.items():
+        for range_col in filter_cols:
+            filter_distribution = fetch_column_distribution(range_col, database)
+            cardinality = database.statistics().total_rows(join_col.table)
+            assert cardinality is not None
+
+            last_histogram: RangeConditionedPCF | None = None
+            for i in range(hierarchy_depth, 0, -1):
+                # XXX: The current implementation is pretty inefficient:
+                # We essentially scan the entire distribution k times, summing
+                # up all the frequencies each and every time. Maybe we can use
+                # cumulative sums to eliminate some of this?
+
+                current_histogram = histogram_for_bucket(
+                    filter_distribution,
+                    k=i,
+                    total_cardinality=cardinality,
+                    accuracy=accuracy,
+                    join_col=join_col,
+                    range_col=range_col,
+                    database=database,
+                )
+                current_histogram.higher_res = last_histogram
+                last_histogram = current_histogram
+
+            pcfs[join_col].append(last_histogram)
+
+    return RangeConditionedSequenceRepo(pcfs)
 
 
 ThreeGram = str
