@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
-from typing import Optional, Protocol, overload
+from typing import Optional, Protocol
 
 import numpy as np
 import postbound as pb
@@ -252,6 +252,9 @@ class PiecewiseConstantFn:
     def __len__(self) -> int:
         return len(self._values)
 
+    def __iter__(self) -> Iterator[tuple[float, int]]:
+        return ((self._values[i], self._bounds[i]) for i in range(len(self)))
+
     def __add__(self, other: PiecewiseConstantFn) -> PiecewiseConstantFn:
         aligned_self, aligned_other = align_functions(self, other)
         values = aligned_self._values + aligned_other._values
@@ -339,20 +342,6 @@ class PiecewiseLinearFn:
             column=self.column,
         )
 
-    def compose_with(self, other: PiecewiseLinearFn) -> PiecewiseLinearFn:
-        aligned_self, aligned_other = align_functions(self, other)
-        slopes = aligned_self.slopes * aligned_other.slopes
-        intercepts = (
-            aligned_self.slopes * aligned_other.intercepts + aligned_other.intercepts
-        )
-
-        return PiecewiseLinearFn(
-            slopes=slopes,
-            intercepts=intercepts,
-            bounds=aligned_self.bounds,
-            column=self.column,
-        )
-
     def __len__(self) -> int:
         return len(self._slopes)
 
@@ -365,136 +354,82 @@ class PiecewiseLinearFn:
         )
 
 
-@overload
 def align_functions(
-    a: PiecewiseConstantFn, b: PiecewiseConstantFn
-) -> tuple[PiecewiseConstantFn, PiecewiseConstantFn]: ...
-
-
-@overload
-def align_functions(
-    a: PiecewiseLinearFn, b: PiecewiseLinearFn
-) -> tuple[PiecewiseLinearFn, PiecewiseLinearFn]:
-    pass
-
-
-def _align_constant_fns(
     a: PiecewiseConstantFn, b: PiecewiseConstantFn
 ) -> tuple[PiecewiseConstantFn, PiecewiseConstantFn]:
     values_a, values_b = [], []
     bounds_a, bounds_b = [], []
 
-    # FIXME: the iteration loop is complete bullsh*t
+    iter_a, iter_b = iter(a), iter(b)
+    cur_a, cur_b = next(iter_a, None), next(iter_b, None)
+    while cur_a is not None or cur_b is not None:
+        if cur_a is None:
+            a_val, a_bound = None, None
+        else:
+            a_val, a_bound = cur_a
 
-    steps = min(len(a), len(b))
-    for i in range(steps):
-        val_a, val_b = a.values[i], b.values[i]
-        bound_a, bound_b = a.bounds[i], b.bounds[i]
+        if cur_b is None:
+            b_val, b_bound = None, None
+        else:
+            b_val, b_bound = cur_b
 
-        if bound_a == bound_b:
-            values_a.append(val_a)
-            bounds_a.append(bound_a)
-            values_b.append(val_b)
-            bounds_b.append(bound_b)
+        if cur_a is None:
+            values_a.append(0)
+            bounds_a.append(b_bound)
 
-        elif bound_a < bound_b:
-            values_a.append(val_a)
-            bounds_a.append(bound_a)
+            values_b.append(b_val)
+            bounds_b.append(b_bound)
 
-            # we need to split b into two equal fns
-            values_b.append(val_b)
-            values_b.append(val_b)
-            bounds_b.append(bound_a)
-            bounds_b.append(bound_b)
+            cur_b = next(iter_b, None)
+            continue
+
+        if cur_b is None:
+            values_a.append(a_val)
+            bounds_a.append(a_bound)
+
+            values_b.append(0)
+            bounds_b.append(a_bound)
+
+            cur_a = next(iter_a, None)
+            continue
+
+        assert (
+            a_val is not None
+            and b_val is not None
+            and a_bound is not None
+            and b_bound is not None
+        )
+
+        if a_bound == b_bound:
+            values_a.append(a_val)
+            bounds_a.append(a_bound)
+
+            values_b.append(b_val)
+            bounds_b.append(b_bound)
+
+            cur_a = next(iter_a, None)
+            cur_b = next(iter_b, None)
+
+        elif a_bound < b_bound:
+            values_a.append(a_val)
+            bounds_a.append(a_val)
+
+            values_b.append(b_val)
+            bounds_b.append(a_bound)
+
+            cur_a = next(iter_a, None)
 
         else:
-            assert bound_a > bound_b
-            # we need to split a into two equal fns
-            values_a.append(val_a)
-            values_a.append(val_a)
-            bounds_a.append(bound_b)
-            bounds_a.append(bound_a)
+            assert a_bound > b_bound
+            values_a.append(a_val)
+            values_b.append(b_bound)
 
-            values_b.append(val_b)
-            bounds_b.append(bound_b)
+            values_b.append(b_val)
+            values_b.append(b_bound)
+
+            cur_b = next(iter_b, None)
 
     return (
         PiecewiseConstantFn(values_a, bounds_a, column=a.column),
         PiecewiseConstantFn(values_b, bounds_b, column=b.column),
     )
-
-
-def _align_linear_fns(
-    a: PiecewiseLinearFn, b: PiecewiseLinearFn
-) -> tuple[PiecewiseLinearFn, PiecewiseLinearFn]:
-    slopes_a, slopes_b = [], []
-    intercepts_a, intercepts_b = [], []
-    bounds_a, bounds_b = [], []
-
-    # FIXME: the iteration loop is complete bullsh*t
-
-    steps = min(len(a), len(b))
-    for i in range(steps):
-        bound_a, bound_b = a.bounds[i], b.bounds[i]
-
-        if bound_a == bound_b:
-            slopes_a.append(a.slopes[i])
-            intercepts_a.append(a.intercepts[i])
-            bounds_a.append(bound_a)
-
-            slopes_b.append(b.slopes[i])
-            intercepts_b.append(b.intercepts[i])
-            bounds_b.append(bound_b)
-
-        elif bound_a < bound_b:
-            # we need to split b into two equal fns
-            slopes_a.append(a.slopes[i])
-            intercepts_a.append(a.intercepts[i])
-            bounds_a.append(bound_a)
-
-            slopes_b.append(b.slopes[i])
-            intercepts_b.append(b.intercepts[i])
-            bounds_b.append(bound_a)
-
-            used_interval = bound_b - bound_a
-            new_intercept = b.slopes[i] * used_interval + b.intercepts[i]
-            slopes_b.append(b.slopes[i])
-            intercepts_b.append(new_intercept)
-            bounds_b.append(bound_b)
-
-        else:
-            assert bound_a > bound_b
-
-            slopes_a.append(a.slopes[i])
-            intercepts_a.append(a.intercepts[i])
-            bounds_a.append(bound_b)
-
-            used_interval = bound_a - bound_b
-            new_intercept = a.slopes[i] * used_interval + a.intercepts[i]
-            slopes_a.append(a.slopes[i])
-            intercepts_a.append(new_intercept)
-            bound_a.append(bound_a)
-
-            slopes_b.append(b.slopes[i])
-            intercepts_b.append(b.intercepts[i])
-            bounds_b.append(bound_b)
-
-    return (
-        PiecewiseLinearFn(
-            slopes=slopes_a, intercepts=intercepts_a, bounds=bounds_a, column=a.column
-        ),
-        PiecewiseLinearFn(
-            slopes=slopes_b, intercepts=intercepts_b, bounds=bounds_b, column=b.column
-        ),
-    )
-
-
-def align_functions(
-    a: PiecewiseConstantFn, b: PiecewiseConstantFn
-) -> tuple[PiecewiseConstantFn, PiecewiseConstantFn]:
-    if isinstance(a, PiecewiseConstantFn) and isinstance(b, PiecewiseConstantFn):
-        return _align_constant_fns(a, b)
-    elif isinstance(a, PiecewiseLinearFn) and isinstance(b, PiecewiseLinearFn):
-        return _align_linear_fns(a, b)
-    else:
-        raise TypeError("Both functions must be of the same type")
