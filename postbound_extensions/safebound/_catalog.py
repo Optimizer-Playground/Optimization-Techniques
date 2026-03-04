@@ -2,14 +2,15 @@ from __future__ import annotations
 
 import bisect
 import collections
-from collections.abc import Generator, Sequence
+from collections.abc import Generator, Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal, Optional, Protocol, overload
+from typing import Any, Optional, Protocol
 
 import numpy as np
 import postbound as pb
 
+from ..util import wrap_logger
 from ._compress import valid_compress
 from ._core import DegreeSequence
 from ._piecewise_fns import PiecewiseConstantFn
@@ -27,10 +28,10 @@ class _HistogramKey(Protocol):
 
 @dataclass
 class CatalogSpec:
-    simple_cols: set[pb.ColumnReference]
-    equality_cols: dict[pb.ColumnReference, set[pb.ColumnReference]]
-    range_cols: dict[pb.ColumnReference, set[pb.ColumnReference]]
-    like_cols: dict[pb.ColumnReference, set[pb.ColumnReference]]
+    simple_cols: set[pb.BoundColumnReference]
+    equality_cols: dict[pb.BoundColumnReference, set[pb.BoundColumnReference]]
+    range_cols: dict[pb.BoundColumnReference, set[pb.BoundColumnReference]]
+    like_cols: dict[pb.BoundColumnReference, set[pb.BoundColumnReference]]
 
     @staticmethod
     def empty() -> CatalogSpec:
@@ -52,6 +53,7 @@ class _CatalogVisitor(pb.qal.PredicateVisitor[None]):
         if not pb.qal.SimpleFilter.can_wrap(predicate):
             return
         simplified = pb.qal.SimpleFilter.wrap(predicate)
+        assert pb.ColumnReference.assert_bound(simplified.column)
         join_map = kwargs["join_map"]
 
         match simplified.operation:
@@ -85,6 +87,7 @@ class _CatalogVisitor(pb.qal.PredicateVisitor[None]):
         if not pb.qal.SimpleFilter.can_wrap(predicate):
             return
         simplified = pb.qal.SimpleFilter.wrap(predicate)
+        assert pb.ColumnReference.assert_bound(simplified.column)
         join_map = kwargs["join_map"]
         for join_col in join_map[simplified.column.table]:
             self.spec.range_cols[join_col].add(simplified.column)
@@ -98,6 +101,7 @@ class _CatalogVisitor(pb.qal.PredicateVisitor[None]):
         if not pb.qal.SimpleFilter.can_wrap(predicate):
             return
         simplified = pb.qal.SimpleFilter.wrap(predicate)
+        assert pb.ColumnReference.assert_bound(simplified.column)
         join_map = kwargs["join_map"]
         for join_col in join_map[simplified.column.table]:
             self.spec.equality_cols[join_col].add(simplified.column)
@@ -142,7 +146,7 @@ class _CatalogVisitor(pb.qal.PredicateVisitor[None]):
 def _build_join_map(
     query: pb.SqlQuery,
 ) -> dict[pb.TableReference, set[pb.ColumnReference]]:
-    join_cols = join_cols = pb.util.set_union(join.columns() for join in query.joins())
+    join_cols = pb.util.set_union(join.columns() for join in query.joins())
     join_map = collections.defaultdict(set)
     for col in join_cols:
         join_map[col.table].add(col)
@@ -168,7 +172,7 @@ def fetch_raw_ds(
 def fetch_correlated_ds(
     predicate: pb.qal.AbstractPredicate,
     *,
-    on: pb.ColumnReference,
+    on: pb.BoundColumnReference,
     database: pb.Database,
     accuracy: float,
 ) -> PiecewiseConstantFn:
@@ -186,6 +190,39 @@ def fetch_correlated_ds(
     ds = DegreeSequence(database.execute_query(sql), column=on)
     piecewiese_linear = valid_compress(ds, accuracy=accuracy)
     return piecewiese_linear.deriv()
+
+
+def fetch_column_values[T](
+    column: pb.BoundColumnReference, database: pb.Database
+) -> list[T]:
+    select_clause = pb.qal.Select.create_for(column)
+    from_clause = pb.qal.From.create_for(column.table)
+    sql = pb.SqlQuery(select_clause=select_clause, from_clause=from_clause)
+
+    return database.execute_query(sql, raw=False)
+
+
+def fetch_column_distribution[T](
+    column: pb.BoundColumnReference, database: pb.Database
+) -> list[tuple[T, int]]:
+    """Builds an ordered list of (value, frequency) pairs of all distinct values in the column.
+
+    In contrast to an MCV list, the column distribution is ordered by column value and not by value frequency.
+    """
+    select_clause = pb.qal.Select(
+        [pb.qal.BaseProjection.column(column), pb.qal.BaseProjection.count_star()]
+    )
+    from_clause = pb.qal.From.create_for(column.table)
+    group_clause = pb.qal.GroupBy.create_for(column)
+    order_clause = pb.qal.OrderBy.create_for(column, ascending=True)
+    sql = pb.SqlQuery(
+        select_clause=select_clause,
+        from_clause=from_clause,
+        groupby_clause=group_clause,
+        orderby_clause=order_clause,
+    )
+
+    return database.execute_query(sql, raw=True)
 
 
 class EqualityConditionedPCF[T]:
@@ -212,10 +249,8 @@ class EqualityConditionsRepo:
     def __init__(
         self,
         join_pcfs: dict[pb.ColumnReference, list[EqualityConditionedPCF]],
-        fallbacks: dict[pb.ColumnReference, PiecewiseConstantFn],
     ) -> None:
         self._functions = join_pcfs
-        self._fallbacks = fallbacks
 
     def lookup(
         self,
@@ -223,24 +258,20 @@ class EqualityConditionsRepo:
         *,
         filter_col: pb.ColumnReference,
         filter_val: Any,
-    ) -> PiecewiseConstantFn:
+    ) -> Optional[PiecewiseConstantFn]:
         candidates = self._functions.get(join_col)
         if candidates is None:
-            raise KeyError(f"Catalog has no PCF for join column {join_col}")
+            return None
 
         target_pcf: EqualityConditionedPCF | None = None
         for current in candidates:
             if current.filter_col != filter_col:
                 continue
             target_pcf = current
+            break
 
         if target_pcf is None:
-            fallback = self._fallbacks.get(join_col)
-            if fallback is None:
-                raise KeyError(
-                    f"Catalog has no fallback PCF for join column {join_col}"
-                )
-            return fallback
+            return None
 
         return target_pcf.get(filter_val)
 
@@ -249,13 +280,8 @@ def build_equality_mcvs(
     spec: CatalogSpec, *, mcv_size: int, accuracy: float, database: pb.Database
 ) -> EqualityConditionsRepo:
     pcfs = collections.defaultdict(list)
-    fallbacks: dict[pb.ColumnReference, PiecewiseConstantFn] = {}
 
     for join_col, filter_cols in spec.equality_cols.items():
-        fallback_ds = fetch_raw_ds(join_col, database=database)
-        fallback_pcf = valid_compress(fallback_ds, accuracy=accuracy)
-        fallbacks[join_col] = fallback_pcf.deriv()
-
         for filter_col in filter_cols:
             mcv = database.statistics().most_common_values(filter_col, k=-1)
             correlated_pcfs: dict[Any, PiecewiseConstantFn] = {}
@@ -285,7 +311,7 @@ def build_equality_mcvs(
             repo = EqualityConditionedPCF(filter_col, correlated_pcfs, non_mcv_pcf)
             pcfs[join_col].append(repo)
 
-    return EqualityConditionsRepo(pcfs, fallbacks)
+    return EqualityConditionsRepo(pcfs)
 
 
 class RangeConditionedPCF[T: _HistogramKey]:
@@ -294,19 +320,19 @@ class RangeConditionedPCF[T: _HistogramKey]:
         buckets: Sequence[PiecewiseConstantFn],
         bounds: Sequence[T],
         *,
-        column: pb.ColumnReference,
+        conditioned_col: pb.ColumnReference,
         higher_res: RangeConditionedPCF[T] | None = None,
     ) -> None:
         if len(buckets) != len(bounds):
             raise ValueError("bounds and buckets have to have the same length")
         self._buckets = list(buckets)
         self._bounds = list(bounds)
-        self._column = column
+        self._conditioned_col = conditioned_col
         self._higher_res = higher_res
 
     @property
-    def column(self) -> pb.ColumnReference:
-        return self._column
+    def conditioned_col(self) -> pb.ColumnReference:
+        return self._conditioned_col
 
     @property
     def higher_res(self) -> Optional[RangeConditionedPCF[T]]:
@@ -342,7 +368,9 @@ class RangeConditionedPCF[T: _HistogramKey]:
         # with this for now.
         return self._higher_res.get_range(lower, upper)
 
-    def get_less(self, value: T) -> PiecewiseConstantFn:
+    def get_less(self, value: T, *, inclusive: bool = False) -> PiecewiseConstantFn:
+        # TODO: support inclusive!
+
         own_range = self.error_less(value)
         if self._higher_res is None:
             return self.pcf_from_buckets(slice(own_range[1]))
@@ -353,9 +381,11 @@ class RangeConditionedPCF[T: _HistogramKey]:
             return self.pcf_from_buckets(slice(own_range[1]))
 
         # See comment in get_range() for why we have to call get_less()
-        return self._higher_res.get_less(value)
+        return self._higher_res.get_less(value, inclusive=inclusive)
 
-    def get_greater(self, value: T) -> PiecewiseConstantFn:
+    def get_greater(self, value: T, *, inclusive: bool = False) -> PiecewiseConstantFn:
+        # TODO: support inclusive!
+
         own_range = self.error_greater(value)
         if self._higher_res is None:
             return self.pcf_from_buckets(slice(own_range[1] + 1))
@@ -366,7 +396,7 @@ class RangeConditionedPCF[T: _HistogramKey]:
             return self.pcf_from_buckets(slice(own_range[1] + 1))
 
         # See comment in get_range() for why we have to call get_greater()
-        return self._higher_res.get_greater(value)
+        return self._higher_res.get_greater(value, inclusive=inclusive)
 
     def error_range(self, lower: T, upper: T) -> tuple[T, slice]:
         err_lo = self.error_greater(lower)
@@ -393,24 +423,100 @@ class RangeConditionedSequenceRepo:
     ) -> None:
         self._join_pcfs = join_pcfs
 
+    def lookup_range[T](
+        self,
+        join_col: pb.ColumnReference,
+        *,
+        range_col: pb.ColumnReference,
+        between: tuple[T, T],
+    ) -> Optional[PiecewiseConstantFn]:
+        candidates = self._join_pcfs.get(join_col)
+        if candidates is None:
+            return None
 
-def fetch_column_distribution[T](
-    column: pb.ColumnReference, database: pb.Database
-) -> list[tuple[T, int]]:
-    select_clause = pb.qal.Select(
-        [pb.qal.BaseProjection.column(column), pb.qal.BaseProjection.count_star()]
-    )
-    from_clause = pb.qal.From.create_for(column.table)
-    group_clause = pb.qal.GroupBy.create_for(column)
-    order_clause = pb.qal.OrderBy.create_for(column, ascending=True)
-    sql = pb.SqlQuery(
-        select_clause=select_clause,
-        from_clause=from_clause,
-        groupby_clause=group_clause,
-        orderby_clause=order_clause,
-    )
+        target_pcf: RangeConditionedPCF | None = None
+        for current in candidates:
+            if current.conditioned_col != range_col:
+                continue
+            target_pcf = current
+            break
 
-    return database.execute_query(sql, raw=True)
+        if target_pcf is None:
+            return None
+        lo, hi = between
+        return target_pcf.get_range(lo, hi)
+
+    def lookup_less_equal[T](
+        self, join_col: pb.ColumnReference, *, range_col: pb.ColumnReference, bound: T
+    ) -> Optional[PiecewiseConstantFn]:
+        candidates = self._join_pcfs.get(join_col)
+        if candidates is None:
+            return None
+
+        target_pcf: RangeConditionedPCF | None = None
+        for current in candidates:
+            if current.conditioned_col != range_col:
+                continue
+            target_pcf = current
+            break
+
+        if target_pcf is None:
+            return None
+        return target_pcf.get_less(bound, inclusive=True)
+
+    def lookup_strict_less[T](
+        self, join_col: pb.ColumnReference, *, range_col: pb.ColumnReference, bound: T
+    ) -> Optional[PiecewiseConstantFn]:
+        candidates = self._join_pcfs.get(join_col)
+        if candidates is None:
+            return None
+
+        target_pcf: RangeConditionedPCF | None = None
+        for current in candidates:
+            if current.conditioned_col != range_col:
+                continue
+            target_pcf = current
+            break
+
+        if target_pcf is None:
+            return None
+        return target_pcf.get_less(bound, inclusive=False)
+
+    def lookup_greater_equal[T](
+        self, join_col: pb.ColumnReference, *, range_col: pb.ColumnReference, bound: T
+    ) -> Optional[PiecewiseConstantFn]:
+        candidates = self._join_pcfs.get(join_col)
+        if candidates is None:
+            return None
+
+        target_pcf: RangeConditionedPCF | None = None
+        for current in candidates:
+            if current.conditioned_col != range_col:
+                continue
+            target_pcf = current
+            break
+
+        if target_pcf is None:
+            return None
+        return target_pcf.get_greater(bound, inclusive=True)
+
+    def lookup_strict_greater[T](
+        self, join_col: pb.ColumnReference, *, range_col: pb.ColumnReference, bound: T
+    ) -> Optional[PiecewiseConstantFn]:
+        candidates = self._join_pcfs.get(join_col)
+        if candidates is None:
+            return None
+
+        target_pcf: RangeConditionedPCF | None = None
+        for current in candidates:
+            if current.conditioned_col != range_col:
+                continue
+            target_pcf = current
+            break
+
+        if target_pcf is None:
+            return None
+        return target_pcf.get_greater(bound, inclusive=False)
 
 
 def histogram_for_bucket[T: _HistogramKey](
@@ -419,8 +525,8 @@ def histogram_for_bucket[T: _HistogramKey](
     k: int,
     total_cardinality: int,
     accuracy: float,
-    join_col: pb.ColumnReference,
-    range_col: pb.ColumnReference,
+    join_col: pb.BoundColumnReference,
+    range_col: pb.BoundColumnReference,
     database: pb.Database,
 ) -> RangeConditionedPCF[T]:
     freq_per_bucket = total_cardinality // k
@@ -471,7 +577,7 @@ def histogram_for_bucket[T: _HistogramKey](
         # upper bound to make sure we don't miss any values.
         lower_bound = upper_bound
 
-    return RangeConditionedPCF(buckets, bounds, column=join_col)
+    return RangeConditionedPCF(buckets, bounds, conditioned_col=join_col)
 
 
 def build_histograms(
@@ -521,25 +627,19 @@ class LikeConditionedPCF:
     def __init__(
         self,
         three_grams: dict[ThreeGram, PiecewiseConstantFn],
+        *,
         default: PiecewiseConstantFn,
+        conditioned_col: pb.ColumnReference,
     ) -> None:
         self._grams = three_grams
         self._default = default
+        self._column = conditioned_col
 
-    @overload
-    def get(self, key: str, default: PiecewiseConstantFn) -> PiecewiseConstantFn: ...
+    @property
+    def conditioned_col(self) -> pb.ColumnReference:
+        return self._column
 
-    @overload
-    def get(
-        self, key: str, default: Literal[None]
-    ) -> Optional[PiecewiseConstantFn]: ...
-
-    @overload
-    def get(self, key: str) -> Optional[PiecewiseConstantFn]: ...
-
-    def get(
-        self, key: str, default: PiecewiseConstantFn | None
-    ) -> Optional[PiecewiseConstantFn]:
+    def get(self, key: str) -> PiecewiseConstantFn:
         current_pcf: PiecewiseConstantFn | None = None
         for gram in three_grams(key):
             pcf = self._grams.get(gram)
@@ -551,16 +651,238 @@ class LikeConditionedPCF:
             else:
                 current_pcf = current_pcf.min_with(pcf)
 
-        if current_pcf is None:
-            return default
-
-    def __getitem__(self, key: str) -> PiecewiseConstantFn:
-        pcf = self.get(key)
-        return self._default if pcf is None else pcf
+        return current_pcf or self._default
 
 
 class LikeConditionedSequenceRepo:
-    pass
+    def __init__(
+        self, join_pcfs: dict[pb.ColumnReference, list[LikeConditionedPCF]]
+    ) -> None:
+        self._pcfs = join_pcfs
+
+    def lookup(
+        self,
+        join_col: pb.ColumnReference,
+        *,
+        like_col: pb.ColumnReference,
+        like_val: str,
+    ) -> Optional[PiecewiseConstantFn]:
+        candidates = self._pcfs.get(join_col)
+        if candidates is None:
+            return None
+
+        target_pcf: LikeConditionedPCF | None = None
+        for current in candidates:
+            if current.conditioned_col != like_col:
+                continue
+            target_pcf = current
+            break
+
+        if target_pcf is None:
+            return None
+
+        return target_pcf.get(like_val)
+
+
+def gram_frequency(values: list[str], *, mcv_size: int) -> tuple[list[str], list[str]]:
+    counter = collections.Counter()
+    for txt in values:
+        for gram in three_grams(txt):
+            counter[gram] += 1
+
+    frequent_grams = [elem for elem, _ in counter.most_common(mcv_size)]
+    # see https://docs.python.org/3/library/collections.html#counter-objects for the weird syntax
+    rare_grams = [elem for elem, _ in counter.most_common()[: -mcv_size - 1 : -1]]
+
+    return frequent_grams, rare_grams
+
+
+def build_gram_pcf(
+    frequent_grams: list[str],
+    rare_grams: list[str],
+    *,
+    join_col: pb.BoundColumnReference,
+    like_col: pb.BoundColumnReference,
+    accuracy: float,
+    database: pb.Database,
+) -> LikeConditionedPCF:
+    frequent_pcfs: dict[str, PiecewiseConstantFn] = {}
+
+    for gram in frequent_grams:
+        like_pred = pb.qal.as_predicate(like_col, "LIKE", f"%{gram}%")
+        frequent_pcfs[gram] = fetch_correlated_ds(
+            like_pred, on=join_col, accuracy=accuracy, database=database
+        )
+
+    rare_pcf = PiecewiseConstantFn.zero()
+    for gram in rare_grams:
+        like_pred = pb.qal.as_predicate(like_col, "LIKE", f"%{gram}%")
+        rare_pcf += fetch_correlated_ds(
+            like_pred, on=join_col, accuracy=accuracy, database=database
+        )
+
+    return LikeConditionedPCF(frequent_pcfs, default=rare_pcf, conditioned_col=like_col)
+
+
+def build_3grams(
+    spec: CatalogSpec, *, mcv_size: int, accuracy: float, database: pb.Database
+) -> LikeConditionedSequenceRepo:
+    pcfs = collections.defaultdict(list)
+
+    for join_col, filter_cols in spec.like_cols.items():
+        for like_col in filter_cols:
+            text_values = fetch_column_values(like_col, database)
+            frequent_grams, rare_grams = gram_frequency(text_values, mcv_size=mcv_size)
+            pcf = build_gram_pcf(
+                frequent_grams,
+                rare_grams,
+                join_col=join_col,
+                like_col=like_col,
+                accuracy=accuracy,
+                database=database,
+            )
+            pcfs[join_col].append(pcf)
+
+    return LikeConditionedSequenceRepo(pcfs)
+
+
+class _PCFCollector(pb.qal.PredicateVisitor[PiecewiseConstantFn]):
+    def __init__(self, catalog: SafeBoundCatalog, *, log: pb.util.Logger) -> None:
+        self._catalog = catalog
+        self._log = log
+
+    def visit_binary_predicate(
+        self, predicate: pb.qal.BinaryPredicate, *args, **kwargs
+    ) -> PiecewiseConstantFn:
+        join_col = kwargs["join_col"]
+        if not pb.qal.SimpleFilter.can_wrap(predicate):
+            return self._catalog.lookup_unconditioned(join_col)
+        simplified = pb.qal.SimpleFilter(predicate)
+
+        match simplified.operation:
+            case pb.qal.LogicalOperator.Equal:
+                return self._catalog.lookup_eq_conditioned(
+                    join_col, filter_col=simplified.column, filter_val=simplified.value
+                )
+
+            case pb.qal.LogicalOperator.Less:
+                return self._catalog.lookup_range_conditioned(
+                    join_col,
+                    range_col=simplified.column,
+                    upper_bound=simplified.value,
+                    upper_inclusive=False,
+                )
+
+            case pb.qal.LogicalOperator.LessEqual:
+                return self._catalog.lookup_range_conditioned(
+                    join_col,
+                    range_col=simplified.column,
+                    upper_bound=simplified.value,
+                    upper_inclusive=True,
+                )
+
+            case pb.qal.LogicalOperator.Greater:
+                return self._catalog.lookup_range_conditioned(
+                    join_col,
+                    range_col=simplified.column,
+                    lower_bound=simplified.value,
+                    lower_inclusive=False,
+                )
+
+            case pb.qal.LogicalOperator.GreaterEqual:
+                return self._catalog.lookup_range_conditioned(
+                    join_col,
+                    range_col=simplified.column,
+                    lower_bound=simplified.value,
+                    lower_inclusive=True,
+                )
+
+            case pb.qal.LogicalOperator.Like | pb.qal.LogicalOperator.ILike:
+                assert isinstance(simplified.value, str)
+                return self._catalog.lookup_like_conditioned(
+                    join_col, like_col=simplified.column, like_val=simplified.value
+                )
+
+            case _:
+                return self._catalog.lookup_unconditioned(join_col)
+
+    def visit_between_predicate(
+        self, predicate: pb.qal.BetweenPredicate, *args, **kwargs
+    ) -> PiecewiseConstantFn:
+        join_col = kwargs["join_col"]
+        if not pb.qal.SimpleFilter.can_wrap(predicate):
+            return self._catalog.lookup_unconditioned(join_col)
+        simplified = pb.qal.SimpleFilter(predicate)
+        assert isinstance(simplified.value, tuple)
+        lo, hi = simplified.value
+        return self._catalog.lookup_range_conditioned(
+            join_col, range_col=simplified.column, lower_bound=lo, upper_bound=hi
+        )
+
+    def visit_in_predicate(
+        self, predicate: pb.qal.InPredicate, *args, **kwargs
+    ) -> PiecewiseConstantFn:
+        join_col = kwargs["join_col"]
+        if not pb.qal.SimpleFilter.can_wrap(predicate):
+            return self._catalog.lookup_unconditioned(join_col)
+        simplified = pb.qal.SimpleFilter(predicate)
+        assert isinstance(simplified.value, Iterable)
+        pcf = PiecewiseConstantFn.zero()
+        for filter_val in simplified.value:
+            filter_pcf = self._catalog.lookup_eq_conditioned(
+                join_col, filter_col=simplified.column, filter_val=filter_val
+            )
+            pcf += filter_pcf
+        return pcf
+
+    def visit_unary_predicate(
+        self, predicate: pb.qal.UnaryPredicate, *args, **kwargs
+    ) -> PiecewiseConstantFn:
+        join_col = kwargs["join_col"]
+        self._log(
+            f"Falling back to unconditioned PCF for unary predicate {predicate} on join column {join_col}"
+        )
+        return self._catalog.lookup_unconditioned(join_col)
+
+    def visit_not_predicate(
+        self,
+        predicate: pb.qal.CompoundPredicate,
+        child_predicate: pb.qal.AbstractPredicate,
+        *args,
+        **kwargs,
+    ) -> PiecewiseConstantFn:
+        join_col = kwargs["join_col"]
+        self._log(
+            f"Falling back to unconditioned PCF for NOT predicate {predicate} on join column {join_col}"
+        )
+        return self._catalog.lookup_unconditioned(join_col)
+
+    def visit_or_predicate(
+        self,
+        predicate: pb.qal.CompoundPredicate,
+        components: Sequence[pb.qal.AbstractPredicate],
+        *args,
+        **kwargs,
+    ) -> PiecewiseConstantFn:
+        pcf = PiecewiseConstantFn.zero()
+        for child in components:
+            child_pcf = child.accept_visitor(self, *args, **kwargs)
+            pcf += child_pcf
+        return pcf
+
+    def visit_and_predicate(
+        self,
+        predicate: pb.qal.CompoundPredicate,
+        components: Sequence[pb.qal.AbstractPredicate],
+        *args,
+        **kwargs,
+    ) -> PiecewiseConstantFn:
+        head, tail = components[0], components[1:]
+        pcf = head.accept_visitor(self, *args, **kwargs)
+        for child in tail:
+            child_pcf = child.accept_visitor(self, *args, **kwargs)
+            pcf = pcf.min_with(child_pcf)
+        return pcf
 
 
 class SafeBoundCatalog:
@@ -584,13 +906,128 @@ class SafeBoundCatalog:
         catalog.store(archive)
         return catalog
 
-    def __init__(self) -> None:
-        pass
+    def __init__(
+        self,
+        *,
+        equality_pcfs: EqualityConditionsRepo,
+        range_pcfs: RangeConditionedSequenceRepo,
+        like_pcfs: LikeConditionedSequenceRepo,
+        unconditioned_pcfs: dict[pb.ColumnReference, PiecewiseConstantFn],
+        verbose: bool | pb.util.Logger = False,
+    ) -> None:
+        self._eq_pcfs = equality_pcfs
+        self._range_pcfs = range_pcfs
+        self._like_pcfs = like_pcfs
+        self._unconditioned_pcfs = unconditioned_pcfs
+        self._log = wrap_logger(verbose)
 
     def retrieve_stats(
         self, query: pb.SqlQuery
     ) -> dict[pb.ColumnReference, PiecewiseConstantFn]:
-        pass
+        join_map: dict[pb.ColumnReference, pb.qal.AbstractPredicate] = {}
+        join_cols = pb.util.set_union(join.columns() for join in query.joins())
+        for join_col in join_cols:
+            assert pb.ColumnReference.assert_bound(join_col)
+            filter_preds = query.filters_for(join_col.table)
+            if not filter_preds:
+                continue
+            join_map[join_col] = filter_preds
+
+        pred_traversal = _PCFCollector(self, log=self._log)
+        return {
+            col: pred.accept_visitor(pred_traversal, join_col=col)
+            for col, pred in join_map.items()
+        }
+
+    def lookup_unconditioned(self, join_col: pb.ColumnReference) -> PiecewiseConstantFn:
+        pcf = self._unconditioned_pcfs.get(join_col)
+        if pcf is None:
+            raise KeyError(
+                f"Catalog has no unconditioned PCF for join column {join_col}"
+            )
+        return pcf
+
+    def lookup_eq_conditioned[T](
+        self,
+        join_col: pb.ColumnReference,
+        *,
+        filter_col: pb.ColumnReference,
+        filter_val: T,
+    ) -> PiecewiseConstantFn:
+        pcf = self._eq_pcfs.lookup(
+            join_col, filter_col=filter_col, filter_val=filter_val
+        )
+
+        if pcf is None:
+            self._log(
+                f"Falling back to unconditioned PCF for join column {join_col} on equality condition {filter_col} = {filter_val}"
+            )
+            return self.lookup_unconditioned(join_col)
+
+        return pcf
+
+    def lookup_range_conditioned[T](
+        self,
+        join_col: pb.ColumnReference,
+        *,
+        range_col: pb.ColumnReference,
+        lower_bound: T | None = None,
+        upper_bound: T | None = None,
+        lower_inclusive: bool = True,
+        upper_inclusive: bool = True,
+    ) -> PiecewiseConstantFn:
+        if lower_bound is not None and upper_bound is not None:
+            pcf = self._range_pcfs.lookup_range(
+                join_col, range_col=range_col, between=(lower_bound, upper_bound)
+            )
+
+        elif lower_bound is not None and lower_inclusive:
+            pcf = self._range_pcfs.lookup_less_equal(
+                join_col, range_col=range_col, bound=lower_bound
+            )
+        elif lower_bound is not None and not lower_inclusive:
+            pcf = self._range_pcfs.lookup_strict_less(
+                join_col, range_col=range_col, bound=lower_bound
+            )
+
+        elif upper_bound is not None and lower_inclusive:
+            pcf = self._range_pcfs.lookup_greater_equal(
+                join_col, range_col=range_col, bound=upper_bound
+            )
+        elif upper_bound is not None and not lower_inclusive:
+            pcf = self._range_pcfs.lookup_strict_greater(
+                join_col, range_col=range_col, bound=upper_bound
+            )
+
+        else:
+            raise ValueError(
+                "At least one of lower_bound and upper_bound has to be non-None"
+            )
+
+        if pcf is None:
+            self._log(
+                f"Falling back to unconditioned PCF for join column {join_col} on range condition {range_col} between {lower_bound} and {upper_bound}"
+            )
+            return self.lookup_unconditioned(join_col)
+
+        return pcf
+
+    def lookup_like_conditioned(
+        self,
+        join_col: pb.ColumnReference,
+        *,
+        like_col: pb.ColumnReference,
+        like_val: str,
+    ) -> PiecewiseConstantFn:
+        pcf = self._like_pcfs.lookup(join_col, like_col=like_col, like_val=like_val)
+
+        if pcf is None:
+            self._log(
+                f"Falling back to unconditioned PCF for join column {join_col} on like condition {like_col} LIKE {like_val}"
+            )
+            return self.lookup_unconditioned(join_col)
+
+        return pcf
 
     def store(self, archive: Path | str) -> None:
         pass
