@@ -27,6 +27,17 @@ class _HistogramKey(Protocol):
 
 
 @dataclass
+class SafeBoundSpec:
+    accuracy: float
+    mcv_size: int
+    hist_hierarchy_depth: int
+
+    @staticmethod
+    def default() -> SafeBoundSpec:
+        return SafeBoundSpec(accuracy=0.01, mcv_size=1000, hist_hierarchy_depth=7)
+
+
+@dataclass
 class CatalogSpec:
     simple_cols: set[pb.BoundColumnReference]
     equality_cols: dict[pb.BoundColumnReference, set[pb.BoundColumnReference]]
@@ -42,10 +53,24 @@ class CatalogSpec:
             collections.defaultdict(set),
         )
 
+    def columns(self) -> set[pb.ColumnReference]:
+        cols = self.simple_cols
+        for join_col, filter_cols in self.equality_cols.items():
+            cols |= filter_cols
+            cols.add(join_col)
+        for join_col, range_cols in self.range_cols.items():
+            cols |= range_cols
+            cols.add(join_col)
+        for join_col, like_cols in self.like_cols.items():
+            cols |= like_cols
+            cols.add(join_col)
+        return cols  # type: ignore
+
 
 class _CatalogVisitor(pb.qal.PredicateVisitor[None]):
-    def __init__(self, spec: CatalogSpec) -> None:
+    def __init__(self, spec: CatalogSpec, *, log: pb.util.Logger) -> None:
         self.spec = spec
+        self._log = log
 
     def visit_binary_predicate(
         self, predicate: pb.qal.BinaryPredicate, *args, **kwargs
@@ -59,6 +84,9 @@ class _CatalogVisitor(pb.qal.PredicateVisitor[None]):
         match simplified.operation:
             case pb.qal.LogicalOperator.Equal:
                 for join_col in join_map[simplified.column.table]:
+                    self._log(
+                        f"Detected equality-conditioned PCF on {join_col} for {simplified}"
+                    )
                     self.spec.equality_cols[join_col].add(simplified.column)
 
             case (
@@ -68,10 +96,16 @@ class _CatalogVisitor(pb.qal.PredicateVisitor[None]):
                 | pb.qal.LogicalOperator.GreaterEqual
             ):
                 for join_col in join_map[simplified.column.table]:
+                    self._log(
+                        f"Detected range-conditioned PCF on {join_col} for {simplified}"
+                    )
                     self.spec.range_cols[join_col].add(simplified.column)
 
             case pb.qal.LogicalOperator.Like | pb.qal.LogicalOperator.ILike:
                 for join_col in join_map[simplified.column.table]:
+                    self._log(
+                        f"Detected like-conditioned PCF on {join_col} for {simplified}"
+                    )
                     self.spec.like_cols[join_col].add(simplified.column)
 
             case _:
@@ -90,6 +124,7 @@ class _CatalogVisitor(pb.qal.PredicateVisitor[None]):
         assert pb.ColumnReference.assert_bound(simplified.column)
         join_map = kwargs["join_map"]
         for join_col in join_map[simplified.column.table]:
+            self._log(f"Detected range-conditioned PCF on {join_col} for {simplified}")
             self.spec.range_cols[join_col].add(simplified.column)
 
     def visit_in_predicate(
@@ -104,6 +139,9 @@ class _CatalogVisitor(pb.qal.PredicateVisitor[None]):
         assert pb.ColumnReference.assert_bound(simplified.column)
         join_map = kwargs["join_map"]
         for join_col in join_map[simplified.column.table]:
+            self._log(
+                f"Detected equality-conditioned PCF on {join_col} for {simplified}"
+            )
             self.spec.equality_cols[join_col].add(simplified.column)
 
     def visit_unary_predicate(
@@ -153,9 +191,13 @@ def _build_join_map(
     return join_map
 
 
-def derive_catalog(workload: pb.Workload) -> CatalogSpec:
+def derive_catalog(
+    workload: pb.Workload,
+    verbose: bool | pb.util.Logger = False,
+) -> CatalogSpec:
+    logger = wrap_logger(verbose)
     spec = CatalogSpec.empty()
-    visitor = _CatalogVisitor(spec)
+    visitor = _CatalogVisitor(spec, log=logger)
     for query in workload.queries():
         join_map = _build_join_map(query)
         visitor.visit_query_predicates(query, join_map=join_map)
@@ -885,10 +927,56 @@ class _PCFCollector(pb.qal.PredicateVisitor[PiecewiseConstantFn]):
         return pcf
 
 
+def build_unconditioned_pcfs(
+    spec: CatalogSpec, *, accuracy: float, database: pb.Database
+) -> dict[pb.ColumnReference, PiecewiseConstantFn]:
+    pcfs: dict[pb.ColumnReference, PiecewiseConstantFn] = {}
+    for col in spec.columns():
+        mcv = database.statistics().most_common_values(col, k=-1, emulated=True)
+        ds = DegreeSequence.from_mcv(mcv, column=col)
+        compressed = valid_compress(ds, accuracy=accuracy)
+        pcfs[col] = compressed.deriv()
+    return pcfs
+
+
 class SafeBoundCatalog:
     @staticmethod
-    def online(workload: pb.Workload, database: pb.Database) -> SafeBoundCatalog:
-        pass
+    def online(
+        workload: pb.Workload,
+        database: pb.Database,
+        *,
+        spec: SafeBoundSpec = SafeBoundSpec.default(),
+        verbose: bool | pb.util.Logger = False,
+    ) -> SafeBoundCatalog:
+        catalog_spec = derive_catalog(workload, verbose=verbose)
+        eq_pcfs_repo = build_equality_mcvs(
+            catalog_spec,
+            mcv_size=spec.mcv_size,
+            accuracy=spec.accuracy,
+            database=database,
+        )
+        range_pcfs_repo = build_histograms(
+            catalog_spec,
+            hierarchy_depth=spec.hist_hierarchy_depth,
+            accuracy=spec.accuracy,
+            database=database,
+        )
+        like_pcfs_repo = build_3grams(
+            catalog_spec,
+            mcv_size=spec.mcv_size,
+            accuracy=spec.accuracy,
+            database=database,
+        )
+        unconditioned_pcfs = build_unconditioned_pcfs(
+            catalog_spec, accuracy=spec.accuracy, database=database
+        )
+        return SafeBoundCatalog(
+            equality_pcfs=eq_pcfs_repo,
+            range_pcfs=range_pcfs_repo,
+            like_pcfs=like_pcfs_repo,
+            unconditioned_pcfs=unconditioned_pcfs,
+            verbose=verbose,
+        )
 
     @staticmethod
     def load(archive: Path | str) -> SafeBoundCatalog:
@@ -896,13 +984,20 @@ class SafeBoundCatalog:
 
     @staticmethod
     def load_or_build(
-        archive: Path | str, *, workload: pb.Workload, database: pb.Database
+        archive: Path | str,
+        *,
+        workload: pb.Workload,
+        spec: SafeBoundSpec = SafeBoundSpec.default(),
+        database: pb.Database,
+        verbose: bool | pb.util.Logger = False,
     ) -> SafeBoundCatalog:
         archive = Path(archive)
         if archive.is_file():
             return SafeBoundCatalog.load(archive)
 
-        catalog = SafeBoundCatalog.online(workload, database)
+        catalog = SafeBoundCatalog.online(
+            workload, database, spec=spec, verbose=verbose
+        )
         catalog.store(archive)
         return catalog
 
