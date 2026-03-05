@@ -46,7 +46,6 @@ class SafeBoundSpec:
 
 @dataclass
 class CatalogSpec:
-    simple_cols: set[pb.BoundColumnReference]
     equality_cols: dict[pb.BoundColumnReference, set[pb.BoundColumnReference]]
     range_cols: dict[pb.BoundColumnReference, set[pb.BoundColumnReference]]
     like_cols: dict[pb.BoundColumnReference, set[pb.BoundColumnReference]]
@@ -54,14 +53,13 @@ class CatalogSpec:
     @staticmethod
     def empty() -> CatalogSpec:
         return CatalogSpec(
-            set(),
             collections.defaultdict(set),
             collections.defaultdict(set),
             collections.defaultdict(set),
         )
 
     def columns(self) -> set[pb.ColumnReference]:
-        cols = self.simple_cols
+        cols: set[pb.ColumnReference] = set()
         for join_col, filter_cols in self.equality_cols.items():
             cols |= filter_cols
             cols.add(join_col)
@@ -71,7 +69,7 @@ class CatalogSpec:
         for join_col, like_cols in self.like_cols.items():
             cols |= like_cols
             cols.add(join_col)
-        return cols  # type: ignore
+        return cols
 
 
 class _CatalogVisitor(pb.qal.PredicateVisitor[None]):
@@ -237,17 +235,28 @@ def fetch_correlated_ds(
     )
 
     result_set = database.execute_query(sql, raw=True)
+    if not result_set:
+        raise ValueError(f"No matches for correlated query {sql}")
+
     ds = DegreeSequence([row[0] for row in result_set], column=on)
     piecewiese_linear = valid_compress(ds, accuracy=accuracy)
     return piecewiese_linear.deriv()
 
 
 def fetch_column_values[T](
-    column: pb.BoundColumnReference, database: pb.Database
+    column: pb.BoundColumnReference, database: pb.Database, *, drop_null: bool = False
 ) -> list[T]:
     select_clause = pb.qal.Select.create_for(column)
     from_clause = pb.qal.From.create_for(column.table)
-    sql = pb.SqlQuery(select_clause=select_clause, from_clause=from_clause)
+    if drop_null:
+        no_null = pb.qal.as_predicate(column, "is not", None)
+        where_clause = pb.qal.Where(no_null)
+    else:
+        where_clause = None
+
+    sql = pb.SqlQuery(
+        select_clause=select_clause, from_clause=from_clause, where_clause=where_clause
+    )
 
     # we cannot use result set simplification here because the table might contain
     # just a single row. In that case, simplification would unwrap the column
@@ -269,7 +278,7 @@ def fetch_column_distribution[T](
     )
     from_clause = pb.qal.From.create_for(column.table)
     group_clause = pb.qal.GroupBy.create_for(column)
-    order_clause = pb.qal.OrderBy.create_for(column, ascending=True)
+    order_clause = pb.qal.OrderBy.create_for(column, ascending=True, nulls_first=True)
     sql = pb.SqlQuery(
         select_clause=select_clause,
         from_clause=from_clause,
@@ -332,12 +341,18 @@ class EqualityConditionsRepo:
 
 
 def build_equality_mcvs(
-    spec: CatalogSpec, *, mcv_size: int, accuracy: float, database: pb.Database
+    spec: CatalogSpec,
+    *,
+    mcv_size: int,
+    accuracy: float,
+    database: pb.Database,
+    log: pb.util.Logger,
 ) -> EqualityConditionsRepo:
     pcfs = collections.defaultdict(list)
 
     for join_col, filter_cols in spec.equality_cols.items():
         for filter_col in filter_cols:
+            log(f"Fetching MCV for {filter_col}")
             mcv = database.statistics().most_common_values(
                 filter_col, k=-1, emulated=True
             )
@@ -351,7 +366,9 @@ def build_equality_mcvs(
             # MCVs. We just need to split them up and compress them in Python.
 
             for val in mcv.values[:mcv_size]:
-                pred = pb.qal.as_predicate(filter_col, "=", val)
+                operator = "is" if val is None else "="
+                pred = pb.qal.as_predicate(filter_col, operator, val)
+                log(f"Building conditioned PCF for {join_col} on {pred}")
                 pcf = fetch_correlated_ds(
                     pred, on=join_col, accuracy=accuracy, database=database
                 )
@@ -359,6 +376,7 @@ def build_equality_mcvs(
 
             non_mcv_pcf = PiecewiseConstantFn.zero(column=join_col)
             for val in mcv.values[mcv_size:]:
+                log(f"Building un-conditioned PCF for {join_col} on {pred}")
                 pred = pb.qal.as_predicate(filter_col, "=", val)
                 pcf = fetch_correlated_ds(
                     pred, on=join_col, accuracy=accuracy, database=database
@@ -585,6 +603,7 @@ def histogram_for_bucket[T: _HistogramKey](
     join_col: pb.BoundColumnReference,
     range_col: pb.BoundColumnReference,
     database: pb.Database,
+    log: pb.util.Logger,
 ) -> RangeConditionedPCF[T]:
     freq_per_bucket = total_cardinality // k
     buckets: list[PiecewiseConstantFn] = []
@@ -620,10 +639,14 @@ def histogram_for_bucket[T: _HistogramKey](
             upper_bound = nxt_val  # upper bound is exclusive
             total_freq = 0
 
-        lower_pred = pb.qal.as_predicate(range_col, ">=", lower_bound)
+        if lower_bound is None:
+            lower_pred = pb.qal.as_predicate(range_col, "is not", None)
+        else:
+            lower_pred = pb.qal.as_predicate(range_col, ">=", lower_bound)
         upper_pred = pb.qal.as_predicate(range_col, "<", upper_bound)
         range_pred = pb.qal.CompoundPredicate.create_and([lower_pred, upper_pred])
 
+        log(f"Loading range-conditioned PCF for {join_col} on bucket {range_pred}")
         pcf = fetch_correlated_ds(
             range_pred, on=join_col, database=database, accuracy=accuracy
         )
@@ -638,17 +661,24 @@ def histogram_for_bucket[T: _HistogramKey](
 
 
 def build_histograms(
-    spec: CatalogSpec, *, hierarchy_depth: int, accuracy: float, database: pb.Database
+    spec: CatalogSpec,
+    *,
+    hierarchy_depth: int,
+    accuracy: float,
+    database: pb.Database,
+    log: pb.util.Logger,
 ) -> RangeConditionedSequenceRepo:
     pcfs = collections.defaultdict(list)
 
     for join_col, filter_cols in spec.range_cols.items():
         for range_col in filter_cols:
+            log(
+                f"Loading column distribution for {join_col} conditioned on on {range_col}"
+            )
             filter_distribution = fetch_column_distribution(range_col, database)
             cardinality = database.statistics().total_rows(
                 join_col.table, emulated=True
             )
-            assert cardinality is not None
 
             last_histogram: RangeConditionedPCF | None = None
             for i in range(hierarchy_depth, 0, -1):
@@ -656,6 +686,7 @@ def build_histograms(
                 # We essentially scan the entire distribution k times, summing up all the frequencies
                 # each and every time. Maybe we can use cumulative sums to eliminate some of this?
 
+                log(f"Building histogram for {join_col} on {range_col} at depth {i}")
                 current_histogram = histogram_for_bucket(
                     filter_distribution,
                     k=i,
@@ -664,6 +695,7 @@ def build_histograms(
                     join_col=join_col,
                     range_col=range_col,
                     database=database,
+                    log=log,
                 )
                 current_histogram.higher_res = last_histogram
                 last_histogram = current_histogram
@@ -763,10 +795,14 @@ def build_gram_pcf(
     like_col: pb.BoundColumnReference,
     accuracy: float,
     database: pb.Database,
+    log: pb.util.Logger,
 ) -> LikeConditionedPCF:
     frequent_pcfs: dict[str, PiecewiseConstantFn] = {}
 
     for gram in frequent_grams:
+        log(
+            f"Building like-conditioned PCF for {join_col} on {like_col} for 3-gram '{gram}'"
+        )
         like_pred = pb.qal.as_predicate(like_col, "LIKE", f"%{gram}%")
         frequent_pcfs[gram] = fetch_correlated_ds(
             like_pred, on=join_col, accuracy=accuracy, database=database
@@ -774,6 +810,9 @@ def build_gram_pcf(
 
     rare_pcf = PiecewiseConstantFn.zero()
     for gram in rare_grams:
+        log(
+            f"Building like-conditioned PCF for {join_col} on {like_col} for rare 3-gram '{gram}'"
+        )
         like_pred = pb.qal.as_predicate(like_col, "LIKE", f"%{gram}%")
         rare_pcf += fetch_correlated_ds(
             like_pred, on=join_col, accuracy=accuracy, database=database
@@ -783,13 +822,20 @@ def build_gram_pcf(
 
 
 def build_3grams(
-    spec: CatalogSpec, *, mcv_size: int, accuracy: float, database: pb.Database
+    spec: CatalogSpec,
+    *,
+    mcv_size: int,
+    accuracy: float,
+    database: pb.Database,
+    log: pb.util.Logger,
 ) -> LikeConditionedSequenceRepo:
     pcfs = collections.defaultdict(list)
 
     for join_col, filter_cols in spec.like_cols.items():
         for like_col in filter_cols:
-            text_values = fetch_column_values(like_col, database)
+            log(f"Loading all text values for {join_col} conditioned on {like_col}")
+            text_values = fetch_column_values(like_col, database, drop_null=True)
+            log(f"Extracing 3-grams for {join_col} conditioned on {like_col}")
             frequent_grams, rare_grams = gram_frequency(text_values, mcv_size=mcv_size)
             pcf = build_gram_pcf(
                 frequent_grams,
@@ -798,13 +844,14 @@ def build_3grams(
                 like_col=like_col,
                 accuracy=accuracy,
                 database=database,
+                log=log,
             )
             pcfs[join_col].append(pcf)
 
     return LikeConditionedSequenceRepo(pcfs)
 
 
-class _PCFCollector(pb.qal.PredicateVisitor[PiecewiseConstantFn]):
+class _Predicate2PCF(pb.qal.PredicateVisitor[PiecewiseConstantFn]):
     def __init__(self, catalog: SafeBoundCatalog, *, log: pb.util.Logger) -> None:
         self._catalog = catalog
         self._log = log
@@ -944,10 +991,11 @@ class _PCFCollector(pb.qal.PredicateVisitor[PiecewiseConstantFn]):
 
 
 def build_unconditioned_pcfs(
-    spec: CatalogSpec, *, accuracy: float, database: pb.Database
+    spec: CatalogSpec, *, accuracy: float, database: pb.Database, log: pb.util.Logger
 ) -> dict[pb.ColumnReference, PiecewiseConstantFn]:
     pcfs: dict[pb.ColumnReference, PiecewiseConstantFn] = {}
     for col in spec.columns():
+        log(f"Building unconditioned PCF on {col}")
         mcv = database.statistics().most_common_values(col, k=-1, emulated=True)
         ds = DegreeSequence.from_mcv(mcv, column=col)
         compressed = valid_compress(ds, accuracy=accuracy)
@@ -964,27 +1012,31 @@ class SafeBoundCatalog:
         spec: SafeBoundSpec = SafeBoundSpec.default(),
         verbose: bool | pb.util.Logger = False,
     ) -> SafeBoundCatalog:
-        catalog_spec = derive_catalog(workload, verbose=verbose)
+        logger = wrap_logger(verbose)
+        catalog_spec = derive_catalog(workload, verbose=False)
         eq_pcfs_repo = build_equality_mcvs(
             catalog_spec,
             mcv_size=spec.mcv_size,
             accuracy=spec.accuracy,
             database=database,
+            log=logger,
         )
         range_pcfs_repo = build_histograms(
             catalog_spec,
             hierarchy_depth=spec.hist_hierarchy_depth,
             accuracy=spec.accuracy,
             database=database,
+            log=logger,
         )
         like_pcfs_repo = build_3grams(
             catalog_spec,
             mcv_size=spec.mcv_size,
             accuracy=spec.accuracy,
             database=database,
+            log=logger,
         )
         unconditioned_pcfs = build_unconditioned_pcfs(
-            catalog_spec, accuracy=spec.accuracy, database=database
+            catalog_spec, accuracy=spec.accuracy, database=database, log=logger
         )
         return SafeBoundCatalog(
             equality_pcfs=eq_pcfs_repo,
@@ -1037,18 +1089,25 @@ class SafeBoundCatalog:
     ) -> dict[pb.ColumnReference, PiecewiseConstantFn]:
         join_map: dict[pb.ColumnReference, pb.qal.AbstractPredicate] = {}
         join_cols = pb.util.set_union(join.columns() for join in query.joins())
+        unconditioned_cols: list[pb.ColumnReference] = []
         for join_col in join_cols:
             assert pb.ColumnReference.assert_bound(join_col)
             filter_preds = query.filters_for(join_col.table)
             if not filter_preds:
+                unconditioned_cols.append(join_col)
                 continue
             join_map[join_col] = filter_preds
 
-        pred_traversal = _PCFCollector(self, log=self._log)
-        return {
+        pred_traversal = _Predicate2PCF(self, log=self._log)
+        stats = {
             col: pred.accept_visitor(pred_traversal, join_col=col)
             for col, pred in join_map.items()
         }
+
+        for join_col in unconditioned_cols:
+            stats[join_col] = self.lookup_unconditioned(join_col)
+
+        return stats
 
     def lookup_unconditioned(self, join_col: pb.ColumnReference) -> PiecewiseConstantFn:
         pcf = self._unconditioned_pcfs.get(join_col)

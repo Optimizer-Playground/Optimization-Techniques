@@ -234,16 +234,17 @@ class PiecewiseConstantFn:
         max_freq = np.max(self._values)
         max_total = self._cumulative[-1]
 
+        segno_padding = len(str(len(self._values) - 1))
         bound_padding = len(str(round(max_bound, 3)))
         freq_padding = len(str(max_freq))
-        total_padding = len(str(max_total))
+        total_padding = len(str(round(max_total)))
 
         for i in range(len(self._values)):
             freq = self._values[i]
             bound = round(self._bounds[i], 3)
-            total = self._cumulative[i]
+            total = round(self._cumulative[i])
             lines.append(
-                f" +-- Segment {i}: "
+                f" +-- Segment {i:>{segno_padding}}: "
                 f"range=[{prev_bound:>{bound_padding}}, {bound:>{bound_padding}}), "
                 f"value={freq:>{freq_padding}} "
                 f"({total:>{total_padding}} total)"
