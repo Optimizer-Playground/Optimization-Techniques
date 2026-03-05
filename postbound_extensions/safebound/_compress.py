@@ -1,9 +1,8 @@
 from __future__ import annotations
 
-from collections.abc import Iterable
 
 from ._core import DegreeSequence
-from ._piecewise_fns import PiecewiseConstantFn, PiecewiseLinearFn, Segment
+from ._piecewise_fns import PiecewiseLinearFn, Segment
 
 
 def valid_compress(ds: DegreeSequence, *, accuracy: float) -> PiecewiseLinearFn:
@@ -28,7 +27,3 @@ def valid_compress(ds: DegreeSequence, *, accuracy: float) -> PiecewiseLinearFn:
         segments[-1].higher += deg / segments[-1].slope
 
     return PiecewiseLinearFn.from_segments(segments, column=ds.column)
-
-
-def merge_constants(values: Iterable[int]) -> PiecewiseConstantFn:
-    pass

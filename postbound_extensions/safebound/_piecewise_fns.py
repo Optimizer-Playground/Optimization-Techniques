@@ -216,6 +216,10 @@ class PiecewiseConstantFn:
         return np.where(out_of_bounds, 0, freq_until_bucket + in_bucket_freq)
 
     def inspect(self) -> str:
+        lines = self._inspect_internal()
+        return "\n".join(lines)
+
+    def _inspect_internal(self) -> list[str]:
         if self.column is not None:
             col_desc = f"for column {self.column}"
         else:
@@ -230,13 +234,13 @@ class PiecewiseConstantFn:
         max_freq = np.max(self._values)
         max_total = self._cumulative[-1]
 
-        bound_padding = len(str(max_bound))
+        bound_padding = len(str(round(max_bound, 3)))
         freq_padding = len(str(max_freq))
         total_padding = len(str(max_total))
 
         for i in range(len(self._values)):
             freq = self._values[i]
-            bound = self._bounds[i]
+            bound = round(self._bounds[i], 3)
             total = self._cumulative[i]
             lines.append(
                 f" +-- Segment {i}: "
@@ -247,7 +251,7 @@ class PiecewiseConstantFn:
 
             prev_bound = bound
 
-        return "\n".join(lines)
+        return lines
 
     def __len__(self) -> int:
         return len(self._values)
@@ -277,6 +281,18 @@ class PiecewiseConstantFn:
             and np.array_equal(self._values, other._values)
             and np.array_equal(self._bounds, other._bounds)
         )
+
+    def _repr_pretty_(self, p, cycle):
+        if cycle:
+            p.text("PiecewiseConstantFn(...)")
+            return
+
+        lines = self._inspect_internal()
+        head, tail = lines[0], lines[1:]
+        p.text(head)
+        for line in tail:
+            p.breakable()
+            p.text(line)
 
 
 class PiecewiseLinearFn:

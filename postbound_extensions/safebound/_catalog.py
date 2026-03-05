@@ -34,6 +34,13 @@ class SafeBoundSpec:
 
     @staticmethod
     def default() -> SafeBoundSpec:
+        """Use the "hyperparameters" from the original SafeBound paper.
+
+        As a caveat, the original paper frequently mentions that they *typically* use a certain value
+        (e.g. `hist_hierarchy_depth` = 7), or that they *generally* pick a values in a certain range
+        (e.g. `mcv_size` in [1000, 5000]). In these cases, we use the smaller value or select the
+        "typical" value.
+        """
         return SafeBoundSpec(accuracy=0.01, mcv_size=1000, hist_hierarchy_depth=7)
 
 
@@ -207,7 +214,7 @@ def derive_catalog(
 def fetch_raw_ds(
     column: pb.ColumnReference, *, database: pb.Database
 ) -> DegreeSequence:
-    mcv_list = database.statistics().most_common_values(column, k=-1)
+    mcv_list = database.statistics().most_common_values(column, k=-1, emulated=True)
     return DegreeSequence.from_mcv(mcv_list, column=column)
 
 
@@ -229,7 +236,8 @@ def fetch_correlated_ds(
         groupby_clause=group_clause,
     )
 
-    ds = DegreeSequence(database.execute_query(sql), column=on)
+    result_set = database.execute_query(sql, raw=True)
+    ds = DegreeSequence([row[0] for row in result_set], column=on)
     piecewiese_linear = valid_compress(ds, accuracy=accuracy)
     return piecewiese_linear.deriv()
 
@@ -241,7 +249,11 @@ def fetch_column_values[T](
     from_clause = pb.qal.From.create_for(column.table)
     sql = pb.SqlQuery(select_clause=select_clause, from_clause=from_clause)
 
-    return database.execute_query(sql, raw=False)
+    # we cannot use result set simplification here because the table might contain
+    # just a single row. In that case, simplification would unwrap the column
+    # value completely.
+    result_set = database.execute_query(sql, raw=True)
+    return [row[0] for row in result_set]
 
 
 def fetch_column_distribution[T](
@@ -249,7 +261,8 @@ def fetch_column_distribution[T](
 ) -> list[tuple[T, int]]:
     """Builds an ordered list of (value, frequency) pairs of all distinct values in the column.
 
-    In contrast to an MCV list, the column distribution is ordered by column value and not by value frequency.
+    In contrast to an MCV list, the column distribution is ordered by column value and not by value
+    frequency.
     """
     select_clause = pb.qal.Select(
         [pb.qal.BaseProjection.column(column), pb.qal.BaseProjection.count_star()]
@@ -325,7 +338,9 @@ def build_equality_mcvs(
 
     for join_col, filter_cols in spec.equality_cols.items():
         for filter_col in filter_cols:
-            mcv = database.statistics().most_common_values(filter_col, k=-1)
+            mcv = database.statistics().most_common_values(
+                filter_col, k=-1, emulated=True
+            )
             correlated_pcfs: dict[Any, PiecewiseConstantFn] = {}
 
             # TODO: this implementation is incredibly inefficient, likely prohibititely so
@@ -615,8 +630,8 @@ def histogram_for_bucket[T: _HistogramKey](
         buckets.append(pcf)
         bounds.append(upper_bound)
 
-        # since our upper bound is exclusive, the next bucket has to start at our current
-        # upper bound to make sure we don't miss any values.
+        # since our upper bound is exclusive, the next bucket has to start at our current upper bound
+        # to make sure we don't miss any values.
         lower_bound = upper_bound
 
     return RangeConditionedPCF(buckets, bounds, conditioned_col=join_col)
@@ -630,15 +645,16 @@ def build_histograms(
     for join_col, filter_cols in spec.range_cols.items():
         for range_col in filter_cols:
             filter_distribution = fetch_column_distribution(range_col, database)
-            cardinality = database.statistics().total_rows(join_col.table)
+            cardinality = database.statistics().total_rows(
+                join_col.table, emulated=True
+            )
             assert cardinality is not None
 
             last_histogram: RangeConditionedPCF | None = None
             for i in range(hierarchy_depth, 0, -1):
                 # XXX: The current implementation is pretty inefficient:
-                # We essentially scan the entire distribution k times, summing
-                # up all the frequencies each and every time. Maybe we can use
-                # cumulative sums to eliminate some of this?
+                # We essentially scan the entire distribution k times, summing up all the frequencies
+                # each and every time. Maybe we can use cumulative sums to eliminate some of this?
 
                 current_histogram = histogram_for_bucket(
                     filter_distribution,
@@ -1055,7 +1071,8 @@ class SafeBoundCatalog:
 
         if pcf is None:
             self._log(
-                f"Falling back to unconditioned PCF for join column {join_col} on equality condition {filter_col} = {filter_val}"
+                f"Falling back to unconditioned PCF for join column {join_col} "
+                f"on equality condition {filter_col} = {filter_val}"
             )
             return self.lookup_unconditioned(join_col)
 
@@ -1101,7 +1118,8 @@ class SafeBoundCatalog:
 
         if pcf is None:
             self._log(
-                f"Falling back to unconditioned PCF for join column {join_col} on range condition {range_col} between {lower_bound} and {upper_bound}"
+                f"Falling back to unconditioned PCF for join column {join_col} "
+                f"on range condition {range_col} between {lower_bound} and {upper_bound}"
             )
             return self.lookup_unconditioned(join_col)
 
@@ -1118,7 +1136,8 @@ class SafeBoundCatalog:
 
         if pcf is None:
             self._log(
-                f"Falling back to unconditioned PCF for join column {join_col} on like condition {like_col} LIKE {like_val}"
+                f"Falling back to unconditioned PCF for join column {join_col} "
+                f"on like condition {like_col} LIKE {like_val}"
             )
             return self.lookup_unconditioned(join_col)
 

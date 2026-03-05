@@ -96,6 +96,18 @@ class AlphaStep:
 
         return lines
 
+    def _repr_pretty_(self, p, cycle):
+        if cycle:
+            p.text("AlphaStep(...)")
+            return
+
+        lines = self._inspect_internal()
+        head, tail = lines[0], lines[1:]
+        p.text(head)
+        for line in tail:
+            p.breakable()
+            p.text(line)
+
     def __call__(self, vals: np.ndarray) -> np.ndarray:
         return self.evaluate_at(vals)
 
@@ -209,6 +221,18 @@ class BetaStep:
             lines.extend(nested_inspect)
 
         return lines
+
+    def _repr_pretty(self, p, cycle):
+        if cycle:
+            p.text("BetaStep(...)")
+            return
+
+        lines = self._inspect_internal()
+        head, tail = lines[0], lines[1:]
+        p.text(head)
+        for line in tail:
+            p.breakable()
+            p.text(line)
 
     def __call__(self, vals: np.ndarray) -> np.ndarray:
         return self.evaluate_at(vals)
