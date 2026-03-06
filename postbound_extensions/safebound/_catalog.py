@@ -71,6 +71,37 @@ class CatalogSpec:
             cols.add(join_col)
         return cols
 
+    def _repr_pretty_(self, p, cycle):
+        if cycle:
+            p.text("CatalogSpec(...)")
+            return
+
+        indent = 2
+        p.begin_group(indent, "CatalogSpec")
+
+        for join_col, equality_filters in self.equality_cols.items():
+            p.begin_group(indent, "equality-conditioned columns")
+            for mcv_col in equality_filters:
+                p.text(f"+- MCV for join column {join_col} on {mcv_col}")
+                p.breakable()
+            p.end_group(indent)
+
+        for join_col, range_filters in self.range_cols.items():
+            p.begin_group(indent, "range-conditioned columns")
+            for hist_col in range_filters:
+                p.text(f"+- Histogram for join column {join_col} on {hist_col}")
+                p.breakable()
+            p.end_group(indent)
+
+        for join_col, like_filters in self.like_cols.items():
+            p.begin_group(indent, "like-conditioned columns")
+            for gram_col in like_filters:
+                p.text(f"+- 3-gram for join column {join_col} on {gram_col}")
+                p.breakable()
+            p.end_group(indent)
+
+        p.end_group(indent)
+
 
 class _CatalogVisitor(pb.qal.PredicateVisitor[None]):
     def __init__(self, spec: CatalogSpec, *, log: pb.util.Logger) -> None:
@@ -339,6 +370,19 @@ class EqualityConditionsRepo:
 
         return target_pcf.get(filter_val)
 
+    def _repr_pretty_(self, p, cycle):
+        if cycle:
+            p.text("EqualityConditionsRepo(...)")
+            return
+
+        indent = 2
+        p.begin_group(indent, "equality-conditioned PCFs")
+        for join_col, mcv_set in self._functions.items():
+            mcv_cols = ", ".join(str(pcf.filter_col) for pcf in mcv_set)
+            p.text(f"+- join column {join_col} conditioned on {{{mcv_cols}}}")
+            p.breakable()
+        p.end_group(indent)
+
 
 def build_equality_mcvs(
     spec: CatalogSpec,
@@ -593,6 +637,23 @@ class RangeConditionedSequenceRepo:
             return None
         return target_pcf.get_greater(bound, inclusive=False)
 
+    def _repr_pretty_(self, p, cycle):
+        if cycle:
+            p.text("RangeConditionedSequenceRepo(...)")
+            return
+
+        indent = 2
+        p.begin_group(indent, "range-conditioned PCFs")
+
+        for join_col, histograms in self._join_pcfs.items():
+            hist_cols = ", ".join(
+                str(histogram.conditioned_col) for histogram in histograms
+            )
+            p.text(f"+- join column {join_col} conditioned on {{{hist_cols}}}")
+            p.breakable()
+
+        p.end_group(indent)
+
 
 def histogram_for_bucket[T: _HistogramKey](
     range_distribution: list[tuple[T, int]],
@@ -772,6 +833,19 @@ class LikeConditionedSequenceRepo:
             return None
 
         return target_pcf.get(like_val)
+
+    def _repr_pretty_(self, p, cycle):
+        if cycle:
+            p.text("LikeConditionedSequenceRepo(...)")
+            return
+
+        indent = 2
+        p.begin_group(indent, "like-conditioned PCFs")
+        for join_col, gram_set in self._pcfs.items():
+            gram_cols = ", ".join(str(pcf.conditioned_col) for pcf in gram_set)
+            p.text(f"+- join column {join_col} conditioned on {{{gram_cols}}}")
+            p.breakable()
+        p.end_group(indent)
 
 
 def gram_frequency(values: list[str], *, mcv_size: int) -> tuple[list[str], list[str]]:
@@ -1204,3 +1278,15 @@ class SafeBoundCatalog:
 
     def store(self, archive: Path | str) -> None:
         pass
+
+    def _repr_pretty_(self, p, cycle):
+        if cycle:
+            p.text("SafeBoundCatalog(...)")
+            return
+
+        indent = 2
+        p.begin_group(indent, "SafeBoundCatalog")
+        p.pretty(self._eq_pcfs)
+        p.pretty(self._range_pcfs)
+        p.pretty(self._like_pcfs)
+        p.end_group(indent)

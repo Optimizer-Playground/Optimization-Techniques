@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import functools
-import operator
 from collections.abc import Iterable
 from typing import Literal, Optional
 
@@ -15,10 +13,13 @@ from ._piecewise_fns import FunctionLike, PiecewiseConstantFn
 class AlphaStep:
     def __init__(self, relations: Iterable[FunctionLike]) -> None:
         self._fns: tuple[FunctionLike, ...] = tuple(relations)
+        if len(self._fns) < 2:
+            raise ValueError("alpha-step requires at least two PCFs to join")
         self._combined: PiecewiseConstantFn | None = None
         if all(isinstance(rel, PiecewiseConstantFn) for rel in self._fns):
-            self._combined = functools.reduce(operator.mul, self._fns)  # type: ignore
-            self._n_distinct = self._combined.n_distinct  # type: ignore
+            self._combined = self._fns[0]  # type: ignore
+            for pcf in self._fns[1:]:
+                self._combined *= pcf
         else:
             self._combined = None
             self._n_distinct = min(fn.n_distinct for fn in self._fns)
@@ -331,7 +332,7 @@ def _generate_beta(
 
 def _prune_danling_joins(join_graph: nx.Graph) -> None:
     dangling = []
-    for node, data in join_graph.nodes():
+    for node, data in join_graph.nodes(data=True):
         if data["node_type"] != "join":
             continue
         degree = join_graph.degree[node]

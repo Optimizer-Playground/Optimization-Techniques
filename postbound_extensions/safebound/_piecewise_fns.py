@@ -97,9 +97,16 @@ class PiecewiseConstantFn:
         self.column = column
 
         self._values = np.asarray(values)
+        if len(self._values) == 0:
+            raise ValueError("Empty PCFs are not allowed")
+
         self._bounds = np.asarray(bounds)
         if len(self._values) != len(self._bounds):
-            raise ValueError("values and bounds must be the same length")
+            raise ValueError(
+                "values and bounds must be the same length "
+                f"({len(self._values)} vs. {len(self._bounds)}): "
+                f"values = {self._values}, bounds = {self._bounds}"
+            )
 
         self._widths = np.diff(np.concat(([0], self._bounds)))
         self._num_distinct = self._bounds[-1]
@@ -147,10 +154,19 @@ class PiecewiseConstantFn:
         return align_functions(self, other)
 
     def min_with(self, other: PiecewiseConstantFn) -> PiecewiseConstantFn:
-        aligned_self, aligned_other = align_functions(self, other)
+        aligned_self, aligned_other = align_functions(self, other, cut_early=True)
+        if self.column is None:
+            col = other.column
+        elif other.column is None:
+            col = self.column
+        elif self.column == other.column:
+            col = self.column
+        else:
+            col = None
         return PiecewiseConstantFn(
             np.min([aligned_self._values, aligned_other._values], axis=0),
             aligned_self._bounds,
+            column=col,
         )
 
     def evaluate_at(self, vals: np.ndarray) -> np.ndarray:
@@ -261,14 +277,22 @@ class PiecewiseConstantFn:
         return ((self._values[i], self._bounds[i]) for i in range(len(self)))
 
     def __add__(self, other: PiecewiseConstantFn) -> PiecewiseConstantFn:
-        aligned_self, aligned_other = align_functions(self, other)
+        aligned_self, aligned_other = align_functions(self, other, cut_early=False)
         values = aligned_self._values + aligned_other._values
         return PiecewiseConstantFn(values, aligned_self._bounds, column=self.column)
 
     def __mul__(self, other: PiecewiseConstantFn) -> PiecewiseConstantFn:
-        aligned_self, aligned_other = align_functions(self, other)
+        aligned_self, aligned_other = align_functions(self, other, cut_early=True)
         values = aligned_self._values * aligned_other._values
-        return PiecewiseConstantFn(values, aligned_self._bounds)
+        if self.column is None:
+            col = other.column
+        elif other.column is None:
+            col = self.column
+        elif self.column == other.column:
+            col = self.column
+        else:
+            col = None
+        return PiecewiseConstantFn(values, aligned_self._bounds, column=col)
 
     def __call__(self, vals: np.ndarray) -> np.ndarray:
         return self.evaluate_at(vals)
@@ -372,7 +396,7 @@ class PiecewiseLinearFn:
 
 
 def align_functions(
-    a: PiecewiseConstantFn, b: PiecewiseConstantFn
+    a: PiecewiseConstantFn, b: PiecewiseConstantFn, *, cut_early: bool = False
 ) -> tuple[PiecewiseConstantFn, PiecewiseConstantFn]:
     values_a, values_b = [], []
     bounds_a, bounds_b = [], []
@@ -380,6 +404,9 @@ def align_functions(
     iter_a, iter_b = iter(a), iter(b)
     cur_a, cur_b = next(iter_a, None), next(iter_b, None)
     while cur_a is not None or cur_b is not None:
+        if cut_early and (cur_a is None or cur_b is None):
+            break
+
         if cur_a is None:
             a_val, a_bound = None, None
         else:
@@ -429,7 +456,7 @@ def align_functions(
 
         elif a_bound < b_bound:
             values_a.append(a_val)
-            bounds_a.append(a_val)
+            bounds_a.append(a_bound)
 
             values_b.append(b_val)
             bounds_b.append(a_bound)
@@ -439,14 +466,13 @@ def align_functions(
         else:
             assert a_bound > b_bound
             values_a.append(a_val)
-            values_b.append(b_bound)
+            bounds_a.append(b_bound)
 
             values_b.append(b_val)
-            values_b.append(b_bound)
+            bounds_b.append(b_bound)
 
             cur_b = next(iter_b, None)
 
-    return (
-        PiecewiseConstantFn(values_a, bounds_a, column=a.column),
-        PiecewiseConstantFn(values_b, bounds_b, column=b.column),
-    )
+    aligned_a = PiecewiseConstantFn(values_a, bounds_a, column=a.column)
+    aligned_b = PiecewiseConstantFn(values_b, bounds_b, column=b.column)
+    return aligned_a, aligned_b
