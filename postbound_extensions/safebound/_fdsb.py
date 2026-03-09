@@ -262,7 +262,7 @@ def _generate_alpha(
         if len(join_graph.adj[node]) == 1:
             free_nodes.append((node, edge.get("join_col", node)))
 
-    if len(free_nodes) < total_nodes - 1:
+    if len(free_nodes) < 2 or len(free_nodes) < total_nodes - 1:
         return None, set()
 
     relations = [
@@ -300,7 +300,7 @@ def _generate_beta(
                 break
             base_tab, edge = next(
                 (node, edge)
-                for node, edge in join_graph.adj[neighbor]
+                for node, edge in join_graph.adj[neighbor].items()
                 if node != neighbor
             )
             join_col = edge["join_col"]
@@ -313,7 +313,7 @@ def _generate_beta(
                 # traditional star join table
                 base_tab, edge = next(
                     (node, edge)
-                    for node, edge in join_graph.adj[neighbor]
+                    for node, edge in join_graph.adj[neighbor].items()
                     if node != neighbor
                 )
                 join_col = edge["join_col"]
@@ -370,11 +370,16 @@ def decompose_query(
     query: pb.SqlQuery, *, statistics: dict[pb.ColumnReference, PiecewiseConstantFn]
 ) -> AlphaStep | BetaStep:
     join_graph = nx.Graph()
-    join_graph.add_nodes_from(query.tables(), node_type="base_table")
+    join_graph.add_nodes_from(
+        (tab.drop_alias() for tab in query.tables()), node_type="base_table"
+    )
 
     for i, eqc in enumerate(pb.qal.determine_join_equivalence_classes(query.joins())):
         join_graph.add_node(i, node_type="join")
-        join_graph.add_edges_from((i, col.table, {"join_col": col}) for col in eqc)
+        join_graph.add_edges_from(
+            (i, col.table.drop_alias(), {"join_col": col.drop_table_alias()})
+            for col in eqc
+        )
 
     while len(join_graph) > 1:
         # BetaStep is just to keep the type checker quiet

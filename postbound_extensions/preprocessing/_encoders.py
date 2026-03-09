@@ -118,7 +118,6 @@ class ColumnEncoder:
                 )
 
     def _unwrap_value(self, value: object) -> Optional[object]:
-        print("Checking", value)
         match self.dtype:
             case "integer" | "smallint" | "bigint":
                 return None if np.isnan(value) else value
