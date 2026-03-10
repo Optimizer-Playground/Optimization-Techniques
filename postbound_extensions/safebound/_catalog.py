@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import bisect
 import collections
+import lzma
 from collections.abc import Generator, Iterable, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime
@@ -330,26 +331,42 @@ def fetch_column_distribution[T](
 
 
 class EqualityConditionedPCF[T]:
+    """Represents the Piecewise Constant Functions for equality predicates over an MCV list.
+
+    The PCF for each MCV value is stored separately, and there is an additional "unconditioned" PCF that represents the
+    frequencies of all non-MCV values combined.
+
+    The column that the PCF is conditioned on (i.e. the column containing the MCV values) is stored in `equality_col`.
+    It is the client's responsibility to keep track of the join column that this PCF is associated with.
+    """
+
     def __init__(
         self,
-        filtered_column: pb.ColumnReference,
+        equality_col: pb.ColumnReference,
         functions: dict[T, PiecewiseConstantFn],
-        fallback: PiecewiseConstantFn,
+        unconditioned: PiecewiseConstantFn,
     ) -> None:
-        self._col = filtered_column
+        self._col = equality_col
         self._functions = functions
-        self._fallback = fallback
+        self._unconditioned = unconditioned
 
     @property
-    def filter_col(self) -> pb.ColumnReference:
+    def equality_col(self) -> pb.ColumnReference:
         return self._col
 
     def get(self, key: T) -> PiecewiseConstantFn:
         fn = self._functions.get(key)
-        return fn or self._fallback
+        return fn or self._unconditioned
+
+    def __json__(self) -> pb.util.jsondict:
+        return {
+            "equality_col": self._col,
+            "functions": self._functions,
+            "unconditioned": self._unconditioned,
+        }
 
     def __repr__(self) -> str:
-        return f"Equality-conditioned PCF on {self.filter_col}"
+        return f"Equality-conditioned PCF on {self.equality_col}"
 
 
 class EqualityConditionsRepo:
@@ -372,7 +389,7 @@ class EqualityConditionsRepo:
 
         target_pcf: EqualityConditionedPCF | None = None
         for current in candidates:
-            if current.filter_col != filter_col:
+            if current.equality_col != filter_col:
                 continue
             target_pcf = current
             break
@@ -390,10 +407,15 @@ class EqualityConditionsRepo:
         indent = 2
         p.begin_group(indent, "equality-conditioned PCFs")
         for join_col, mcv_set in self._functions.items():
-            mcv_cols = ", ".join(str(pcf.filter_col) for pcf in mcv_set)
+            mcv_cols = ", ".join(str(pcf.equality_col) for pcf in mcv_set)
             p.text(f"+- join column {join_col} conditioned on {{{mcv_cols}}}")
             p.breakable()
         p.end_group(indent)
+
+    def __json__(self) -> pb.util.jsondict:
+        return {
+            "pcfs": self._functions,
+        }
 
 
 def build_equality_mcvs(
@@ -468,7 +490,7 @@ class RangeConditionedPCF[T: _HistogramKey]:
         buckets: Sequence[PiecewiseConstantFn],
         bounds: Sequence[T],
         *,
-        conditioned_col: pb.ColumnReference,
+        range_col: pb.ColumnReference,
         higher_res: RangeConditionedPCF[T] | None = None,
     ) -> None:
         if not buckets:
@@ -477,12 +499,12 @@ class RangeConditionedPCF[T: _HistogramKey]:
             raise ValueError("bounds and buckets have to have the same length")
         self._buckets = list(buckets)
         self._bounds = list(bounds)
-        self._conditioned_col = conditioned_col
+        self._range_col = range_col
         self._higher_res = higher_res
 
     @property
-    def conditioned_col(self) -> pb.ColumnReference:
-        return self._conditioned_col
+    def range_col(self) -> pb.ColumnReference:
+        return self._range_col
 
     @property
     def higher_res(self) -> Optional[RangeConditionedPCF[T]]:
@@ -556,7 +578,7 @@ class RangeConditionedPCF[T: _HistogramKey]:
         err_hi = self._error_less(upper, inclusive=True)
         if err_lo.out_of_bounds or err_hi.out_of_bounds:
             raise KeyError(
-                f"Range [{lower}, {upper}] out of bounds for column {self.conditioned_col}"
+                f"Range [{lower}, {upper}] out of bounds for column {self.range_col}"
             )
         err_total = err_lo.distance + err_hi.distance
         return (err_total, slice(err_lo.closest_bound, err_hi.closest_bound + 1))
@@ -577,11 +599,19 @@ class RangeConditionedPCF[T: _HistogramKey]:
         distance = value - self._bounds[idx]
         return _RangeCheckRes.valid(idx, distance)
 
+    def __json__(self) -> pb.util.jsondict:
+        return {
+            "buckets": self._buckets,
+            "bounds": self._bounds,
+            "conditioned_col": self._range_col,
+            "higher_res": self._higher_res,
+        }
+
     def __repr__(self) -> str:
-        return f"Range-conditioned PCF on {self.conditioned_col} with k = {len(self._bounds)}"
+        return f"Range-conditioned PCF on {self.range_col} with k = {len(self._bounds)}"
 
 
-class RangeConditionedSequenceRepo:
+class RangeConditionsRepo:
     def __init__(
         self, join_pcfs: dict[pb.ColumnReference, list[RangeConditionedPCF]]
     ) -> None:
@@ -600,7 +630,7 @@ class RangeConditionedSequenceRepo:
 
         target_pcf: RangeConditionedPCF | None = None
         for current in candidates:
-            if current.conditioned_col != range_col:
+            if current.range_col != range_col:
                 continue
             target_pcf = current
             break
@@ -619,7 +649,7 @@ class RangeConditionedSequenceRepo:
 
         target_pcf: RangeConditionedPCF | None = None
         for current in candidates:
-            if current.conditioned_col != range_col:
+            if current.range_col != range_col:
                 continue
             target_pcf = current
             break
@@ -637,7 +667,7 @@ class RangeConditionedSequenceRepo:
 
         target_pcf: RangeConditionedPCF | None = None
         for current in candidates:
-            if current.conditioned_col != range_col:
+            if current.range_col != range_col:
                 continue
             target_pcf = current
             break
@@ -655,7 +685,7 @@ class RangeConditionedSequenceRepo:
 
         target_pcf: RangeConditionedPCF | None = None
         for current in candidates:
-            if current.conditioned_col != range_col:
+            if current.range_col != range_col:
                 continue
             target_pcf = current
             break
@@ -673,7 +703,7 @@ class RangeConditionedSequenceRepo:
 
         target_pcf: RangeConditionedPCF | None = None
         for current in candidates:
-            if current.conditioned_col != range_col:
+            if current.range_col != range_col:
                 continue
             target_pcf = current
             break
@@ -691,13 +721,16 @@ class RangeConditionedSequenceRepo:
         p.begin_group(indent, "range-conditioned PCFs")
 
         for join_col, histograms in self._join_pcfs.items():
-            hist_cols = ", ".join(
-                str(histogram.conditioned_col) for histogram in histograms
-            )
+            hist_cols = ", ".join(str(histogram.range_col) for histogram in histograms)
             p.text(f"+- join column {join_col} conditioned on {{{hist_cols}}}")
             p.breakable()
 
         p.end_group(indent)
+
+    def __json__(self) -> pb.util.jsondict:
+        return {
+            "pcfs": self._join_pcfs,
+        }
 
 
 def histogram_for_precision[T: _HistogramKey](
@@ -769,7 +802,7 @@ def histogram_for_precision[T: _HistogramKey](
         # to make sure we don't miss any values.
         lower_bound = upper_bound
 
-    return RangeConditionedPCF(buckets, bounds, conditioned_col=range_col)
+    return RangeConditionedPCF(buckets, bounds, range_col=range_col)
 
 
 def build_histograms(
@@ -779,7 +812,7 @@ def build_histograms(
     accuracy: float,
     database: pb.Database,
     log: pb.util.Logger,
-) -> RangeConditionedSequenceRepo:
+) -> RangeConditionsRepo:
     pcfs = collections.defaultdict(list)
 
     for join_col, filter_cols in spec.range_cols.items():
@@ -814,7 +847,7 @@ def build_histograms(
 
             pcfs[join_col].append(last_histogram)
 
-    return RangeConditionedSequenceRepo(pcfs)
+    return RangeConditionsRepo(pcfs)
 
 
 ThreeGram = str
@@ -830,16 +863,16 @@ class LikeConditionedPCF:
         self,
         three_grams: dict[ThreeGram, PiecewiseConstantFn],
         *,
-        default: PiecewiseConstantFn,
-        conditioned_col: pb.ColumnReference,
+        unconditioned: PiecewiseConstantFn,
+        like_col: pb.ColumnReference,
     ) -> None:
         self._grams = three_grams
-        self._default = default
-        self._column = conditioned_col
+        self._unconditioned = unconditioned
+        self._like_col = like_col
 
     @property
-    def conditioned_col(self) -> pb.ColumnReference:
-        return self._column
+    def like_col(self) -> pb.ColumnReference:
+        return self._like_col
 
     def get(self, key: str) -> PiecewiseConstantFn:
         current_pcf: PiecewiseConstantFn | None = None
@@ -853,13 +886,20 @@ class LikeConditionedPCF:
             else:
                 current_pcf = current_pcf.min_with(pcf)
 
-        return current_pcf or self._default
+        return current_pcf or self._unconditioned
+
+    def __json__(self) -> pb.util.jsondict:
+        return {
+            "three_grams": self._grams,
+            "default": self._unconditioned,
+            "like_col": self._like_col,
+        }
 
     def __repr__(self) -> str:
-        return f"Like-conditioned PCF on {self.conditioned_col}"
+        return f"Like-conditioned PCF on {self.like_col}"
 
 
-class LikeConditionedSequenceRepo:
+class LikeConditionsRepo:
     def __init__(
         self, join_pcfs: dict[pb.ColumnReference, list[LikeConditionedPCF]]
     ) -> None:
@@ -878,7 +918,7 @@ class LikeConditionedSequenceRepo:
 
         target_pcf: LikeConditionedPCF | None = None
         for current in candidates:
-            if current.conditioned_col != like_col:
+            if current.like_col != like_col:
                 continue
             target_pcf = current
             break
@@ -896,10 +936,15 @@ class LikeConditionedSequenceRepo:
         indent = 2
         p.begin_group(indent, "like-conditioned PCFs")
         for join_col, gram_set in self._pcfs.items():
-            gram_cols = ", ".join(str(pcf.conditioned_col) for pcf in gram_set)
+            gram_cols = ", ".join(str(pcf.like_col) for pcf in gram_set)
             p.text(f"+- join column {join_col} conditioned on {{{gram_cols}}}")
             p.breakable()
         p.end_group(indent)
+
+    def __json__(self) -> pb.util.jsondict:
+        return {
+            "pcfs": self._pcfs,
+        }
 
 
 def gram_frequency(values: list[str], *, mcv_size: int) -> tuple[list[str], list[str]]:
@@ -946,7 +991,7 @@ def build_gram_pcf(
             like_pred, on=join_col, accuracy=accuracy, database=database
         )
 
-    return LikeConditionedPCF(frequent_pcfs, default=rare_pcf, conditioned_col=like_col)
+    return LikeConditionedPCF(frequent_pcfs, unconditioned=rare_pcf, like_col=like_col)
 
 
 def build_3grams(
@@ -956,7 +1001,7 @@ def build_3grams(
     accuracy: float,
     database: pb.Database,
     log: pb.util.Logger,
-) -> LikeConditionedSequenceRepo:
+) -> LikeConditionsRepo:
     pcfs = collections.defaultdict(list)
 
     for join_col, filter_cols in spec.like_cols.items():
@@ -976,7 +1021,7 @@ def build_3grams(
             )
             pcfs[join_col].append(pcf)
 
-    return LikeConditionedSequenceRepo(pcfs)
+    return LikeConditionsRepo(pcfs)
 
 
 class _Predicate2PCF(pb.qal.PredicateVisitor[PiecewiseConstantFn]):
@@ -1134,10 +1179,19 @@ def build_unconditioned_pcfs(
 class SafeBoundCatalog:
     @staticmethod
     def online(
-        workload: pb.Workload,
         database: pb.Database,
         *,
         spec: SafeBoundSpec = SafeBoundSpec.default(),
+        verbose: bool | pb.util.Logger = False,
+    ) -> SafeBoundCatalog:
+        pass
+
+    @staticmethod
+    def infer_from(
+        workload: pb.Workload,
+        *,
+        spec: SafeBoundSpec = SafeBoundSpec.default(),
+        database: pb.Database,
         verbose: bool | pb.util.Logger = False,
     ) -> SafeBoundCatalog:
         logger = wrap_logger(verbose)
@@ -1177,24 +1231,34 @@ class SafeBoundCatalog:
 
     @staticmethod
     def load(archive: Path | str, *, database: pb.Database) -> SafeBoundCatalog:
-        pass
+        archive = Path(archive)
+
+        match archive.suffixes:
+            case [".json", ".xz"]:
+                pass
+            case [".json"]:
+                pass
 
     @staticmethod
     def load_or_build(
         archive: Path | str,
         *,
-        workload: pb.Workload,
-        spec: SafeBoundSpec = SafeBoundSpec.default(),
         database: pb.Database,
+        workload: Optional[pb.Workload] = None,
+        spec: SafeBoundSpec = SafeBoundSpec.default(),
         verbose: bool | pb.util.Logger = False,
     ) -> SafeBoundCatalog:
         archive = Path(archive)
         if archive.is_file():
             return SafeBoundCatalog.load(archive, database=database)
 
-        catalog = SafeBoundCatalog.online(
-            workload, database, spec=spec, verbose=verbose
-        )
+        if workload is None:
+            catalog = SafeBoundCatalog.online(database, spec=spec, verbose=verbose)
+        else:
+            catalog = SafeBoundCatalog.infer_from(
+                workload, spec=spec, database=database, verbose=verbose
+            )
+
         catalog.store(archive)
         return catalog
 
@@ -1202,8 +1266,8 @@ class SafeBoundCatalog:
         self,
         *,
         equality_pcfs: EqualityConditionsRepo,
-        range_pcfs: RangeConditionedSequenceRepo,
-        like_pcfs: LikeConditionedSequenceRepo,
+        range_pcfs: RangeConditionsRepo,
+        like_pcfs: LikeConditionsRepo,
         unconditioned_pcfs: dict[pb.ColumnReference, PiecewiseConstantFn],
         database: pb.Database,
         verbose: bool | pb.util.Logger = False,
@@ -1348,8 +1412,22 @@ class SafeBoundCatalog:
 
         return pcf
 
-    def store(self, archive: Path | str) -> None:
-        pass
+    def store(self, archive: Path | str, *, compressed: bool = False) -> None:
+        archive = Path(archive)
+        if archive.is_dir():
+            archive = archive / "safebound-catalog.json.xz"
+        archive.parent.mkdir(parents=True, exist_ok=True)
+
+        if not compressed:
+            with archive.open("w", encoding="utf-8") as f:
+                pb.util.to_json_dump(self, f)
+            return
+
+        raw_dump = pb.util.to_json(self).encode("utf-8")
+        compressed_dump = lzma.compress(raw_dump)
+
+        with archive.open("wb") as f:
+            f.write(compressed_dump)
 
     def _cast_value(self, value: Any, *, column: pb.ColumnReference) -> Any:
         col_dtype = self._db.schema().datatype(column)
@@ -1372,3 +1450,11 @@ class SafeBoundCatalog:
         p.pretty(self._range_pcfs)
         p.pretty(self._like_pcfs)
         p.end_group(indent)
+
+    def __json__(self) -> pb.util.jsondict:
+        return {
+            "equality_pcfs": self._eq_pcfs,
+            "range_pcfs": self._range_pcfs,
+            "like_pcfs": self._like_pcfs,
+            "unconditioned_pcfs": self._unconditioned_pcfs,
+        }

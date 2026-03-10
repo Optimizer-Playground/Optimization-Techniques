@@ -270,6 +270,13 @@ class PiecewiseConstantFn:
 
         return lines
 
+    def __json__(self) -> pb.util.jsondict:
+        return {
+            "values": self._values.tolist(),
+            "bounds": self._bounds.tolist(),
+            "column": self.column,
+        }
+
     def __len__(self) -> int:
         return len(self._values)
 

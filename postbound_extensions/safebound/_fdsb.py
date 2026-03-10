@@ -109,6 +109,12 @@ class AlphaStep:
             p.breakable()
             p.text(line)
 
+    def __json__(self) -> pb.util.jsondict:
+        return {
+            "step_type": "alpha",
+            "relations": self._fns,
+        }
+
     def __call__(self, vals: np.ndarray) -> np.ndarray:
         return self.evaluate_at(vals)
 
@@ -234,6 +240,13 @@ class BetaStep:
         for line in tail:
             p.breakable()
             p.text(line)
+
+    def __json__(self) -> pb.util.jsondict:
+        return {
+            "step_type": "beta",
+            "projection": self._proj,
+            "star_joins": self._star_joins,
+        }
 
     def __call__(self, vals: np.ndarray) -> np.ndarray:
         return self.evaluate_at(vals)
