@@ -5,7 +5,7 @@ import collections
 import lzma
 from collections.abc import Generator, Iterable, Sequence
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional, Protocol
 
@@ -51,6 +51,7 @@ class CatalogSpec:
     equality_cols: dict[pb.BoundColumnReference, set[pb.BoundColumnReference]]
     range_cols: dict[pb.BoundColumnReference, set[pb.BoundColumnReference]]
     like_cols: dict[pb.BoundColumnReference, set[pb.BoundColumnReference]]
+    unconditioned_cols: set[pb.BoundColumnReference]
 
     @staticmethod
     def empty() -> CatalogSpec:
@@ -58,6 +59,7 @@ class CatalogSpec:
             collections.defaultdict(set),
             collections.defaultdict(set),
             collections.defaultdict(set),
+            set(),
         )
 
     def columns(self) -> set[pb.ColumnReference]:
@@ -71,6 +73,7 @@ class CatalogSpec:
         for join_col, like_cols in self.like_cols.items():
             cols |= like_cols
             cols.add(join_col)
+        cols |= self.unconditioned_cols
         return cols
 
     def _repr_pretty_(self, p, cycle):
@@ -247,6 +250,8 @@ def derive_catalog(
     for query in workload.queries():
         join_map = _build_join_map(query)
         visitor.visit_query_predicates(query, join_map=join_map)
+        join_cols = pb.util.set_union(pred.columns() for pred in query.joins())
+        spec.unconditioned_cols |= {col.drop_table_alias() for col in join_cols}
     return spec
 
 
@@ -926,7 +931,16 @@ class LikeConditionsRepo:
         if target_pcf is None:
             return None
 
-        return target_pcf.get(like_val)
+        components = like_val.split("%")
+        final_pcf: PiecewiseConstantFn | None = None
+        for val in components:
+            if not val:
+                continue
+            elif final_pcf is None:
+                final_pcf = target_pcf.get(val)
+            else:
+                final_pcf = final_pcf.min_with(target_pcf.get(val))
+        return final_pcf
 
     def _repr_pretty_(self, p, cycle):
         if cycle:
@@ -1167,7 +1181,7 @@ def build_unconditioned_pcfs(
     spec: CatalogSpec, *, accuracy: float, database: pb.Database, log: pb.util.Logger
 ) -> dict[pb.ColumnReference, PiecewiseConstantFn]:
     pcfs: dict[pb.ColumnReference, PiecewiseConstantFn] = {}
-    for col in spec.columns():
+    for col in spec.unconditioned_cols:
         log(f"Building unconditioned PCF on {col}")
         mcv = database.statistics().most_common_values(col, k=-1, emulated=True)
         ds = DegreeSequence.from_mcv(mcv, column=col)
@@ -1435,7 +1449,7 @@ class SafeBoundCatalog:
             case "timestamp without time zone" if isinstance(value, str):
                 return datetime.fromisoformat(value)
             case "date" if isinstance(value, str):
-                return date.fromisoformat(value)
+                return datetime.fromisoformat(value).date()
             case _:
                 return value
 

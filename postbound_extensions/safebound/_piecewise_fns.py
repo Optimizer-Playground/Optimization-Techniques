@@ -326,6 +326,12 @@ class PiecewiseConstantFn:
             p.breakable()
             p.text(line)
 
+    def __repr__(self) -> str:
+        return str(self)
+
+    def __str__(self) -> str:
+        return f"PCF({self.column})" if self.column else "PCF(<anonymous>)"
+
 
 class PiecewiseLinearFn:
     @staticmethod

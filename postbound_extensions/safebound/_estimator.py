@@ -5,7 +5,7 @@ from collections.abc import Iterable
 import postbound as pb
 
 from ._catalog import SafeBoundCatalog
-from ._fdsb import decompose_query, fdsb
+from ._fdsb import fdsb
 
 
 class SafeBoundEstimator(pb.CardinalityEstimator):
@@ -23,8 +23,7 @@ class SafeBoundEstimator(pb.CardinalityEstimator):
             raise ValueError("No valid subquery found")
 
         stats = self._catalog.retrieve_stats(subquery)
-        decomposition = decompose_query(query, statistics=stats)
-        return fdsb(decomposition)
+        return fdsb(subquery, statistics=stats)
 
     def describe(self) -> pb.util.jsondict:
         return {"name": "SafeBound", "catalog": self._catalog}

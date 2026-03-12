@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from collections.abc import Iterable
-from typing import Literal, Optional
+from collections.abc import Generator, Iterable, Sequence
+from dataclasses import dataclass
+from typing import overload
 
 import networkx as nx
 import numpy as np
@@ -77,13 +78,12 @@ class AlphaStep:
 
     def _inspect_internal(self) -> list[str]:
         padding = "  "
-        col_desc = ", ".join(str(col) for col in self.columns())
-        lines: list[str] = [f"ɑ step ({col_desc})"]
+        lines: list[str] = ["ɑ step"]
 
         for fn in self._fns:
             if isinstance(fn, PiecewiseConstantFn):
                 desc = f"PCF({fn.column})" if fn.column else "anonymous PCF"
-                lines.append(f"{padding}+- join with {desc}")
+                lines.append(f"{padding}+- {desc}")
                 continue
 
             if not isinstance(fn, (AlphaStep, BetaStep)):
@@ -126,39 +126,58 @@ class AlphaStep:
     def __eq__(self, other: object) -> bool:
         return isinstance(other, type(self)) and self._fns == other._fns
 
+    def __repr__(self) -> str:
+        components = ", ".join(repr(fn) for fn in self._fns)
+        return f"AlphaStep(relations=[{components}])"
+
+    def __str__(self) -> str:
+        components = ", ".join(str(fn) for fn in self._fns)
+        return f"AlphaStep({components})"
+
+
+def _split_star_joins(
+    star_joins: Iterable[FunctionLike],
+) -> tuple[PiecewiseConstantFn, Sequence[FunctionLike]]:
+    min_distinct = np.inf
+    smallest_proj: PiecewiseConstantFn | None = None
+    retained_joins: list[FunctionLike] = []
+    for candidate in star_joins:
+        if not isinstance(candidate, PiecewiseConstantFn):
+            retained_joins.append(candidate)
+            continue
+
+        if candidate.n_distinct < min_distinct:
+            min_distinct = candidate.n_distinct
+            smallest_proj = candidate
+        else:
+            retained_joins.append(candidate)
+
+    if smallest_proj is None:
+        raise ValueError(
+            f"At least one PiecewiseConstantFn required for a beta step: {star_joins}"
+        )
+    return smallest_proj, retained_joins
+
+
+@dataclass
+class DimensionJoin:
+    fact_pcf: PiecewiseConstantFn
+    dimension_pcf: FunctionLike
+
+    def columns(self) -> set[pb.ColumnReference]:
+        return self.fact_pcf.columns() | self.dimension_pcf.columns()
+
 
 class BetaStep:
     def __init__(
         self,
-        star_joins: Iterable[FunctionLike],
+        pcfs: Iterable[DimensionJoin],
         *,
-        projection: Optional[PiecewiseConstantFn] = None,
+        projection: PiecewiseConstantFn,
     ) -> None:
-        if projection is None:
-            min_distinct = np.inf
-            smallest_proj: PiecewiseConstantFn | None = None
-            retained_joins: list[FunctionLike] = []
-            for candidate in star_joins:
-                if not isinstance(candidate, PiecewiseConstantFn):
-                    retained_joins.append(candidate)
-                    continue
-
-                if candidate.n_distinct < min_distinct:
-                    min_distinct = candidate.n_distinct
-                    smallest_proj = candidate
-                else:
-                    retained_joins.append(candidate)
-
-            if smallest_proj is None:
-                raise ValueError(
-                    "At least one PiecewiseConstantFn required for a beta step!"
-                )
-            projection = smallest_proj
-            star_joins = retained_joins
-
         self._proj: PiecewiseConstantFn = projection
-        self._star_joins: tuple[FunctionLike, ...] = tuple(star_joins)
-        if len(self._star_joins) < 1:
+        self._dimension_joins = tuple(pcfs)
+        if len(self._dimension_joins) < 1:
             raise ValueError("At least one dimension join required for a beta step!")
 
     @property
@@ -167,15 +186,18 @@ class BetaStep:
 
     def columns(self) -> set[pb.ColumnReference]:
         return self._proj.columns() | pb.util.set_union(
-            star_join.columns() for star_join in self._star_joins
+            dim_join.columns() for dim_join in self._dimension_joins
         )
 
     def evaluate_at(self, vals: np.ndarray) -> np.ndarray:
         res = self._proj.evaluate_at(vals)
-        proj_freqs = self._proj.cumulative_at(vals)
-        for star_join in self._star_joins:
-            idx = star_join.invert_cumulative_at(proj_freqs)
-            res *= star_join.evaluate_at(idx)
+        cumulative = self._proj.cumulative_at(vals)
+
+        for join in self._dimension_joins:
+            fact_pcf, dim_pcf = join.fact_pcf, join.dimension_pcf
+            dimension_idx = fact_pcf.invert_cumulative_at(cumulative)
+            res *= dim_pcf.evaluate_at(dimension_idx)
+
         return res
 
     def cumulative_at(self, vals: np.ndarray) -> np.ndarray:
@@ -200,32 +222,39 @@ class BetaStep:
 
     def _inspect_internal(self) -> list[str]:
         padding = "  "
-        col_desc = ", ".join(str(col) for col in self.columns())
-        lines: list[str] = [f"β step ({col_desc})"]
+        lines: list[str] = []
 
         if self._proj.column:
-            lines.append(f"{padding}[project on {self._proj.column}]")
+            lines.append(f"β step on {self._proj.column}")
         else:
-            lines.append(f"{padding}[anonymous projection]")
+            lines.append("β step [anonymous projection]")
 
-        for star_join in self._star_joins:
-            if isinstance(star_join, PiecewiseConstantFn):
-                desc = (
-                    f"PCF({star_join.column})" if star_join.column else "anonymous PCF"
-                )
-                lines.append(f"{padding}+- join with {desc}")
-                continue
+        lines.append("")
 
-            if not isinstance(star_join, (AlphaStep, BetaStep)):
+        for dim_join in self._dimension_joins:
+            fact_pcf = dim_join.fact_pcf
+            if not isinstance(fact_pcf, PiecewiseConstantFn):
                 raise ValueError(
-                    f"Unknown function type {type(star_join).__name__}: {star_join}"
+                    "Expected PiecewiseConstantFn for fact side of dimension join, "
+                    f"got {type(fact_pcf)}"
                 )
 
-            nested_inspect = star_join._inspect_internal()
-            nested_inspect[0] = f"{padding} +- {nested_inspect[0]}"
-            for i in range(1, len(nested_inspect)):
-                nested_inspect[i] = f"{padding}    {nested_inspect[i]}"
-            lines.extend(nested_inspect)
+            lines.append(f"{padding}+- fact col {fact_pcf.column}::")
+            dim_pcf = dim_join.dimension_pcf
+            match dim_pcf:
+                case PiecewiseConstantFn():
+                    lines.append(f"{padding}{padding}{dim_pcf}")
+                case AlphaStep() | BetaStep():
+                    nested = dim_pcf._inspect_internal()
+                    nested = [f"{padding}{padding}{line}" for line in nested]
+                    lines.extend(nested)
+                case _:
+                    raise ValueError(
+                        "Expected PiecewiseConstantFn or step function for dimension side of "
+                        f"dimension join, got {type(dim_pcf)}"
+                    )
+
+            lines.append("")
 
         return lines
 
@@ -252,136 +281,141 @@ class BetaStep:
         return self.evaluate_at(vals)
 
     def __hash__(self) -> int:
-        return hash((self._proj, self._star_joins))
+        return hash((self._proj, self._dimension_joins))
 
     def __eq__(self, other: object) -> bool:
         return (
             isinstance(other, type(self))
             and self._proj == other._proj
-            and self._star_joins == other._star_joins
+            and self._dimension_joins == other._dimension_joins
         )
 
+    def __repr__(self) -> str:
+        components = ", ".join(repr(fn) for fn in self._dimension_joins)
+        return f"BetaStep(relations=[{components}], projection={repr(self._proj)})"
 
-def _generate_alpha(
+    def __str__(self) -> str:
+        components = ", ".join(str(fn) for fn in self._dimension_joins)
+        return f"BetaStep({components}) -> {self._proj}"
+
+
+@overload
+def _adj_flow(
+    join_graph: nx.Graph, node: int, *, source: pb.TableReference
+) -> Generator[pb.TableReference, None, None]: ...
+
+
+@overload
+def _adj_flow(
+    join_graph: nx.Graph, node: pb.TableReference, *, source: int
+) -> Generator[int, None, None]: ...
+
+
+def _adj_flow(
+    join_graph: nx.Graph,
+    node: int | pb.TableReference,
+    *,
+    source: int | pb.TableReference,
+) -> Generator[int | pb.TableReference, None, None]:
+    for neighbor in join_graph.adj[node]:
+        if neighbor == source:
+            continue
+        yield neighbor
+
+
+def _create_alpha_step(
     join_graph: nx.Graph,
     join: int,
     *,
+    source: pb.TableReference,
+    include_source: bool,
     statistics: dict[pb.ColumnReference, PiecewiseConstantFn],
-) -> tuple[AlphaStep | None, set]:
-    free_nodes = []
-    total_nodes = 0
-    for node, edge in join_graph.adj[join].items():
-        total_nodes += 1
-        if len(join_graph.adj[node]) == 1:
-            free_nodes.append((node, edge.get("join_col", node)))
-
-    if len(free_nodes) < 2 or len(free_nodes) < total_nodes - 1:
-        return None, set()
-
-    relations = [
-        node if join_col is None else statistics[join_col]
-        for node, join_col in free_nodes
-    ]
-    step = AlphaStep(relations)
-    return step, {node[0] for node in free_nodes}
-
-
-def _generate_beta(
-    join_graph: nx.Graph,
-    node: FunctionLike | pb.TableReference,
-    *,
-    statistics: dict[pb.ColumnReference, PiecewiseConstantFn],
-) -> tuple[BetaStep | None, set]:
-    projection: FunctionLike | None = None
-    star_joins: list[tuple[pb.TableReference | FunctionLike, FunctionLike]] = []
-    invalid_beta = False
-
-    for neighbor in join_graph.adj[node]:
-        if join_graph.degree[neighbor] > 1:
-            # Only the projection node is allowed to have degree
-            # greater 1 (because it connects to the rest of our graph)
-            # If we found a node with higher degree, it has to be our
-            # projection.
-            # But since each beta step only has exactly one projection,
-            # we can break as soon as we encouter another such node.
-            # In this case, the current node is not ready yet to be
-            # included in a beta step and needs to be re-visited in
-            # a later iteration. When that happens, the graph might
-            # have shrunk enough s.t. we can include the node.
-            if projection is not None:
-                invalid_beta = True
-                break
-            base_tab, edge = next(
-                (node, edge)
-                for node, edge in join_graph.adj[neighbor].items()
-                if node != neighbor
-            )
+) -> AlphaStep:
+    relations: list[FunctionLike] = []
+    for neighbor in _adj_flow(join_graph, join, source=source):
+        if join_graph.degree[neighbor] == 1:
+            edge = join_graph.edges[join, neighbor]
             join_col = edge["join_col"]
-            projection = statistics[join_col]
+            pcf = statistics[join_col]
+            relations.append(pcf)
             continue
 
-        node_info = join_graph.nodes[neighbor]
-        match node_info["node_type"]:
-            case "join":
-                # traditional star join table
-                base_tab, edge = next(
-                    (node, edge)
-                    for node, edge in join_graph.adj[neighbor].items()
-                    if node != neighbor
-                )
-                join_col = edge["join_col"]
-                star_joins.append((base_tab, statistics[join_col]))
-            case "alpha_step" | "beta_step":
-                star_joins.append((neighbor, neighbor))
-            case _:
-                assert False, f"Unexpected node type {node_info}"
+        beta_step = _create_beta_step(
+            join_graph, neighbor, project_on=join, statistics=statistics
+        )
+        relations.append(beta_step)
 
-    if invalid_beta or not star_joins:
-        return None, set()
+    if include_source:
+        source_edge = join_graph.edges[join, source]
+        join_col = source_edge["join_col"]
+        source_pcf = statistics[join_col]
+        relations.append(source_pcf)
 
-    step = BetaStep([star_join[1] for star_join in star_joins], projection=projection)
-    return step, {star_join[0] for star_join in star_joins}
+    return AlphaStep(relations)
 
 
-def _prune_danling_joins(join_graph: nx.Graph) -> None:
-    dangling = []
-    for node, data in join_graph.nodes(data=True):
-        if data["node_type"] != "join":
-            continue
-        degree = join_graph.degree[node]
-        if degree <= 1:
-            dangling.append(node)
-    join_graph.remove_nodes_from(dangling)
-
-
-def _restitch_graph(
+def _dispatch_on(
     join_graph: nx.Graph,
-    steps: dict[AlphaStep | BetaStep, set] | tuple[AlphaStep | BetaStep, set],
+    join: int,
     *,
-    step_kind: Literal["alpha", "beta"],
-) -> None:
-    if isinstance(steps, tuple):
-        steps = {steps[0]: steps[1]}
+    source: pb.TableReference,
+    statistics: dict[pb.ColumnReference, PiecewiseConstantFn],
+) -> FunctionLike:
+    deg = join_graph.degree[join]
 
-    node_type = "alpha_step" if step_kind.startswith("alpha") else "beta_step"
-    nodes_to_drop = pb.util.set_union(steps.values())
-    for step, joined_nodes in steps.items():
-        assert len(joined_nodes) >= 2
-        join_graph.add_node(step, node_type=node_type)
+    if deg > 2:
+        return _create_alpha_step(
+            join_graph, join, source=source, include_source=False, statistics=statistics
+        )
 
-        for node in joined_nodes:
-            neighbors = set(join_graph.adj[node])
-            neighbors -= nodes_to_drop
-            join_graph.add_edges_from((step, neighbor) for neighbor in neighbors)
-
-        join_graph.remove_nodes_from(joined_nodes)
-
-    _prune_danling_joins(join_graph)
+    assert deg == 2
+    target = next(_adj_flow(join_graph, join, source=source))
+    edge = join_graph.edges[join, target]
+    join_col = edge["join_col"]
+    return statistics[join_col]
 
 
-def decompose_query(
-    query: pb.SqlQuery, *, statistics: dict[pb.ColumnReference, PiecewiseConstantFn]
-) -> AlphaStep | BetaStep:
+def _create_beta_step(
+    join_graph: nx.Graph,
+    node: pb.TableReference,
+    *,
+    project_on: int,
+    statistics: dict[pb.ColumnReference, PiecewiseConstantFn],
+) -> BetaStep:
+    dimension_joins: list[DimensionJoin] = []
+    for join in _adj_flow(join_graph, node, source=project_on):
+        fact_edge = join_graph.edges[node, join]
+        join_col = fact_edge["join_col"]
+        fact_pcf = statistics[join_col]
+        dimension_pcf = _dispatch_on(
+            join_graph, join, source=node, statistics=statistics
+        )
+        dimension_join = DimensionJoin(fact_pcf, dimension_pcf)
+        dimension_joins.append(dimension_join)
+
+    proj_edge = join_graph.edges[node, project_on]
+    join_col = proj_edge["join_col"]
+    proj_pcf = statistics[join_col]
+    return BetaStep(dimension_joins, projection=proj_pcf)
+
+
+def _select_acyclic_root(join_graph) -> pb.TableReference:
+    return next(node for node in join_graph.nodes if join_graph.degree[node] == 1)
+
+
+def decompose_acyclic(
+    join_graph: nx.Graph,
+    root: pb.TableReference,
+    *,
+    statistics: dict[pb.ColumnReference, PiecewiseConstantFn],
+) -> AlphaStep:
+    join: int = next(iter(join_graph.adj[root]))
+    return _create_alpha_step(
+        join_graph, join, source=root, include_source=True, statistics=statistics
+    )
+
+
+def _fdsb_graph(query: pb.SqlQuery) -> nx.Graph:
     join_graph = nx.Graph()
     join_graph.add_nodes_from(
         (tab.drop_alias() for tab in query.tables()), node_type="base_table"
@@ -393,50 +427,38 @@ def decompose_query(
             (i, col.table.drop_alias(), {"join_col": col.drop_table_alias()})
             for col in eqc
         )
-
-    while len(join_graph) > 1:
-        # BetaStep is just to keep the type checker quiet
-        alpha_steps: dict[AlphaStep | BetaStep, set] = {}
-
-        for join, data in join_graph.nodes(data=True):
-            if data["node_type"] != "join":
-                continue
-
-            step, removed = _generate_alpha(join_graph, join, statistics=statistics)
-            if step is None:
-                # not suitable for an alpha step
-                continue
-
-            alpha_steps[step] = removed | {join}
-
-        _restitch_graph(join_graph, alpha_steps, step_kind="alpha")
-
-        beta_candidates = set(
-            node
-            for node, data in join_graph.nodes(data=True)
-            if data["node_type"] != join
-        )
-        beta_found = False
-        while beta_candidates:
-            table = beta_candidates.pop()
-            step, removed = _generate_beta(join_graph, table, statistics=statistics)
-            if step is None:
-                continue
-
-            _restitch_graph(join_graph, (step, removed), step_kind="beta")
-            beta_candidates.difference_update(removed)
-            beta_found = True
-
-        if not alpha_steps and not beta_found:
-            raise RuntimeError(
-                "No more alpha/beta steps found but join graph still has unprocessed tables. "
-                "This is a programming error. Please consider filing an issue on Github."
-            )
-
-    root = next(iter(join_graph.nodes()))
-    return root
+    return join_graph
 
 
-def fdsb(root: AlphaStep | BetaStep) -> pb.Cardinality:
-    card = root.cardinality()
-    return pb.Cardinality(card)
+def decompose_query(
+    query: pb.SqlQuery,
+    *,
+    statistics: dict[pb.ColumnReference, PiecewiseConstantFn],
+    verbose: bool | pb.util.Logger = False,
+) -> AlphaStep | BetaStep:
+    join_graph = _fdsb_graph(query)
+    if not nx.is_tree(join_graph):
+        raise ValueError(f"Decomposition only works for acyclic queries, not '{query}'")
+    root = _select_acyclic_root(join_graph)
+    return decompose_acyclic(join_graph, root, statistics=statistics)
+
+
+def fdsb(
+    query: pb.SqlQuery, *, statistics: dict[pb.ColumnReference, PiecewiseConstantFn]
+) -> pb.Cardinality:
+    join_graph = _fdsb_graph(query)
+
+    if nx.is_tree(join_graph):
+        root = _select_acyclic_root(join_graph)
+        decomposed = decompose_acyclic(join_graph, root, statistics=statistics)
+        cardinality = decomposed.cardinality()
+        return pb.Cardinality(cardinality)
+
+    best_bound = np.inf
+    for acyclic in nx.SpanningTreeIterator(join_graph):
+        root = _select_acyclic_root(acyclic)
+        decomposed = decompose_acyclic(acyclic, root, statistics=statistics)
+        cardinality = decomposed.cardinality()
+        best_bound = min(cardinality, best_bound)
+
+    return pb.Cardinality(best_bound)
