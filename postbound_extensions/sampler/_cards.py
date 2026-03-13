@@ -55,11 +55,13 @@ class PostgresSamplerCtl:
         *,
         n_workers: int,
         pg_connect: str,
+        allow_zero_tuples: bool = False,
         timeout_ms: Optional[float] = None,
         verbose: bool = False,
     ) -> None:
         self.done = threading.Event()
         self.timeout_ms = timeout_ms
+        self.allow_zero_tuples = allow_zero_tuples
 
         self._critical_guard = threading.Lock()
         self._out = out
@@ -164,6 +166,8 @@ def sampling_worker(query_sampler: QuerySampler, *, ctl: PostgresSamplerCtl) -> 
                 if result_set is None:
                     continue
                 cardinality = pb.Cardinality(result_set[0])
+                if cardinality == 0 and not ctl.allow_zero_tuples:
+                    continue
                 ctl.process_result(query, cardinality)
             except psycopg.errors.QueryCanceled:
                 # Timeout - do nothing, we just try again
