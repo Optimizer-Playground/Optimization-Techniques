@@ -1,4 +1,4 @@
-from ._cards import CardinalitySample, CardinalitySampler
+from ._cards import PostgresSamplerCtl
 from ._qgen import generate_query
 
-__all__ = ["CardinalitySample", "CardinalitySampler", "generate_query"]
+__all__ = ["PostgresSamplerCtl", "generate_query"]

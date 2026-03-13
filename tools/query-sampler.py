@@ -4,7 +4,6 @@ import functools
 import signal
 from pathlib import Path
 
-import pandas as pd
 import postbound as pb
 
 from postbound_extensions import sampler
@@ -25,7 +24,7 @@ Currently, the sampler is only implemented for PostgreSQL.
 infinite = False
 
 
-def shutdown(signum, frame, *, sampler_ctl: sampler.CardinalitySampler) -> None:
+def shutdown_pg(signum, frame, *, sampler_ctl: sampler.PostgresSamplerCtl) -> None:
     global infinite
     infinite = False
     sampler_ctl.shutdown()
@@ -132,20 +131,19 @@ def main() -> None:
 
     logger("Initializing sampler with", n_workers, "workers")
     timeout = args.timeout * 1000 if args.timeout else None
-    sampler_ctl = sampler.CardinalitySampler(
+    sampler_ctl = sampler.PostgresSamplerCtl(
         query_gen,
-        connect_string=pg_instance.connect_string,
+        out_file,
+        pg_connect=pg_instance.connect_string,
         timeout_ms=timeout,
         n_workers=n_workers,
         verbose=args.verbose,
     )
 
     out_file.parent.mkdir(parents=True, exist_ok=True)
-    if not out_file.is_file():
-        df = pd.DataFrame([], columns=sampler.CardinalitySample.csv_cols())  # type: ignore[call-arg]
-        df.to_csv(out_file, mode="w", index=False, header=True)
-
-    signal.signal(signal.SIGINT, functools.partial(shutdown, sampler_ctl=sampler_ctl))
+    signal.signal(
+        signal.SIGINT, functools.partial(shutdown_pg, sampler_ctl=sampler_ctl)
+    )
     atexit.register(sampler_ctl.shutdown)
 
     if args.infinite:
@@ -153,10 +151,10 @@ def main() -> None:
     else:
         logger("Starting sampling run")
 
-    sampler_ctl.sample(args.n_queries, stream_to=out_file)
+    sampler_ctl.sample(args.n_queries)
     while infinite:
         logger("Starting next sampling run")
-        sampler_ctl.sample(args.n_queries, stream_to=out_file)
+        sampler_ctl.sample(args.n_queries)
 
 
 if __name__ == "__main__":

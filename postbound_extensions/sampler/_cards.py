@@ -1,347 +1,176 @@
 from __future__ import annotations
 
-import queue
 import threading
-from collections.abc import Generator, Sequence
-from concurrent import futures
-from dataclasses import asdict, dataclass
-from datetime import datetime
+from collections.abc import Generator
 from pathlib import Path
-from typing import Literal, Optional
+from typing import Optional
 
 import pandas as pd
 import postbound as pb
 import psycopg
 from tqdm import tqdm
 
-type Handle = int
-type Status = Literal["ok", "timeout", "error"]
+type BackendHandle = int
 
 
-class ParallelLog:
-    def __init__(self, enabled: bool = True) -> None:
-        self._n_queries = 0
-        self._enabled = enabled
-        self._logger = pb.util.standard_logger(self._enabled)
-        self._critical_guard = threading.Semaphore()
+class QuerySampler:
+    def __init__(self, generator: Generator[pb.SqlQuery, None, None]) -> None:
+        self._critical_guard = threading.Lock()
+        self._generator = generator
+        self._generated_queries: set[pb.SqlQuery] = set()
 
-        self._progress_bar = None
-
-    @property
-    def n_queries(self) -> int:
-        return self._n_queries
-
-    @n_queries.setter
-    def n_queries(self, n_queries: int) -> None:
-        self._n_queries = n_queries
-        self._progress_bar = (
-            tqdm(total=n_queries, desc="Sample", unit="q") if self._enabled else None
-        )
-
-    def print(self, *args) -> None:
-        return self(*args)
-
-    def log(self, *args) -> None:
-        return self(*args)
-
-    def sample_acquired(self) -> None:
-        if not self._enabled or self._progress_bar is None:
-            return
-
+    def next_query(self) -> pb.SqlQuery:
         with self._critical_guard:
-            self._progress_bar.update()
+            while (query := next(self._generator)) in self._generated_queries:
+                continue
+            self._generated_queries.add(query)
+        return query
 
-    def __call__(self, *args) -> None:
+
+class _ParallelLog:
+    def __init__(self, enabled: bool) -> None:
+        self._enabled = enabled
+        self._critical_guard = threading.Lock()
+        self._tqdm = None
+
+    def restart(self, n_queries: int) -> None:
         if not self._enabled:
             return
-        prefix = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        thread = threading.current_thread()
-        with self._critical_guard:
-            self._logger(f"[{prefix}] [{thread.name}]", *args)
+        if self._tqdm is not None:
+            self._tqdm.close()
+        self._tqdm = tqdm(total=n_queries, unit="q", leave=True)
 
-
-@dataclass
-class CardinalitySample:
-    query: pb.SqlQuery
-    plan: pb.QueryPlan
-    cardinality: pb.Cardinality
-    runtime_ms: float
-
-    @staticmethod
-    def csv_cols() -> Sequence[str]:
-        return ["query", "plan", "cardinality", "runtime_ms"]
-
-    def __json__(self) -> pb.util.jsondict:
-        return asdict(self)
-
-
-class ConnectionPool:
-    def __init__(
-        self, connect_string: str, n_connections: int, log: ParallelLog
-    ) -> None:
-        self._connect_string = connect_string
-        self._log = log
-
-        self._critical_guard = threading.Semaphore()
-        self._connection_guard = threading.Semaphore(n_connections)
-        self._idle_connections: dict[Handle, psycopg.Connection] = {}
-        self._busy_connections: dict[Handle, psycopg.Connection] = {}
-        self._backend_pids: dict[Handle, int] = {}
-
-        for i in range(n_connections):
-            conn = psycopg.connect(self._connect_string)
-            self._backend_pids[i] = conn.info.backend_pid
-            self._idle_connections[i] = conn
-
-        self._connection_watchdog = psycopg.connect(self._connect_string)
-        self._shut_down = threading.Event()
-
-    def acquire(self) -> tuple[Handle, psycopg.Connection]:
-        if self._shut_down.is_set():
-            raise RuntimeError("Connection pool has been shut down")
-
-        self._connection_guard.acquire()  # wait until a connection is available
-
-        with self._critical_guard:
-            handle, conn = self._idle_connections.popitem()
-            self._busy_connections[handle] = conn
-
-        return handle, conn
-
-    def release(self, handle: Handle) -> None:
-        if self._shut_down.is_set():
+    def step(self) -> None:
+        if not self._enabled:
             return
-
-        with self._critical_guard:
-            conn = self._busy_connections.pop(handle, None)
-            if conn is None:
-                # the pool could have been shut down by the main process in the meantime
-                return
-            conn.rollback()
-            self._idle_connections[handle] = conn
-
-        self._connection_guard.release()  # signal that a new connection is available
-
-    def reset(self, handle: Handle) -> None:
-        if self._shut_down.is_set():
-            return
-
-        new_conn = psycopg.connect(self._connect_string)
-
-        with self._critical_guard:
-            current_conn = self._busy_connections.pop(handle, None)
-            if current_conn is None:
-                # the pool could have been shut down by the main process in the meantime
-                return
-
-            try:
-                current_conn.close()
-            except Exception:
-                pass
-
-            self._idle_connections[handle] = new_conn
-            self._backend_pids[handle] = new_conn.info.backend_pid
-
-        self._connection_guard.release()  # signal that a new connection is available
-
-    def shutdown(self, force: bool = False) -> None:
-        self._shut_down.set()
-
-        with self._critical_guard:
-            for conn in self._idle_connections.values():
-                try:
-                    conn.close()
-                except Exception:
-                    pass
-            self._idle_connections.clear()
-
-            if not force:
-                # make sure to keep this in sync with the normal exit
-                self._backend_pids.clear()
-                self._connection_watchdog.close()
-                return
-
-            for handle, conn in self._busy_connections.items():
-                self._cancel_connection(handle)
-                self._connection_guard.release()
-                try:
-                    conn.cancel_safe()
-                    conn.close()
-                except Exception:
-                    pass
-            self._busy_connections.clear()
-
-            # make sure to keep this in sync with the early exit
-            self._backend_pids.clear()
-            self._connection_watchdog.close()
-
-    def _cancel_connection(self, handle: Handle) -> None:
-        backend_pid = self._backend_pids[handle]
-        try:
-            with self._connection_watchdog.cursor() as cur:
-                cur.execute("SELECT pg_cancel_backend(%s)", (backend_pid,))
-        except Exception:
-            self._connection_watchdog.rollback()
+        assert self._tqdm is not None
+        self._tqdm.update()
 
 
-@dataclass
-class SamplingCtx:
-    queries: queue.Queue[pb.SqlQuery]
-    results: queue.Queue[CardinalitySample | None]
-    connections: ConnectionPool
-    done: threading.Event
-
-
-def execute_query(
-    query: pb.SqlQuery,
-    *,
-    connection_pool: ConnectionPool,
-    log: ParallelLog,
-    timeout_ms: Optional[float] = None,
-) -> tuple[Status, CardinalitySample | None]:
-    handle, conn = connection_pool.acquire()
-    prepared = pb.transform.as_explain_analyze(query)
-
-    with conn.cursor() as cursor:
-        if timeout_ms:
-            cursor.execute(f"SET statement_timeout TO '{timeout_ms}ms'")  # type: ignore[arg-type]
-
-        try:
-            cursor.execute(str(prepared))  # type: ignore[arg-type]
-            raw_plan = cursor.fetchone()[0]  # type: ignore[index] - if this errors we end up in the except block
-            parsed = pb.postgres.PostgresExplainPlan(raw_plan).as_qep()
-            cardinality = parsed.actual_cardinality
-            runtime_ms = parsed.execution_time * 1000
-            sample = CardinalitySample(query, parsed, cardinality, runtime_ms)
-            connection_pool.release(handle)
-            return "ok", sample
-        except psycopg.errors.QueryCanceled:
-            connection_pool.release(handle)
-            return "timeout", None
-        except Exception as e:
-            thread = threading.current_thread()
-            log(
-                thread.name,
-                ":: Query",
-                query,
-                "produced error",
-                type(e).__name__,
-                "-",
-                e,
-            )
-            connection_pool.reset(handle)
-            return "error", None
-
-
-class CardinalitySampler:
+class PostgresSamplerCtl:
     def __init__(
         self,
-        generator: Generator[pb.SqlQuery, None, None],
+        sampler: Generator[pb.SqlQuery, None, None],
+        out: Path,
         *,
-        connect_string: str,
         n_workers: int,
+        pg_connect: str,
         timeout_ms: Optional[float] = None,
         verbose: bool = False,
     ) -> None:
-        self._generator = generator
-        self._timeout_ms = timeout_ms
+        self.done = threading.Event()
+        self.timeout_ms = timeout_ms
+
+        self._critical_guard = threading.Lock()
+        self._out = out
+        self._log = _ParallelLog(verbose)
+
+        self._pg_backends: dict[BackendHandle, psycopg.Connection] = {}
+        self._pg_connect = pg_connect
+
+        self._sampler = QuerySampler(sampler)
+        self._n_generated = 0
+        self._n_requested = 0
+
         self._n_workers = n_workers
+        self._workers: list[threading.Thread] = []
 
-        self._verbose = verbose
-        self._log = ParallelLog(self._verbose)
+    def sample(self, n_queries: int) -> None:
+        self._n_generated = 0
+        self._n_requested = n_queries
+        self._log.restart(n_queries)
+        for i in range(self._n_workers):
+            worker = threading.Thread(
+                target=sampling_worker, args=(self._sampler,), kwargs=dict(ctl=self)
+            )
+            self._workers.append(worker)
+            worker.start()
+        self.done.wait()
 
-        self._connection_pool = ConnectionPool(
-            connect_string, n_connections=self._n_workers, log=self._log
-        )
-        self._done = threading.Event()
+    def process_result(self, query: pb.SqlQuery, cardinality: pb.Cardinality) -> None:
+        with self._critical_guard:
+            self._n_generated += 1
+            self._log.step()
 
-        self._worker_pool = futures.ThreadPoolExecutor(
-            max_workers=self._n_workers, thread_name_prefix="CardinalitySampler"
-        )
-        self._critical_guard = threading.Semaphore()
+            result_set = {"query": [query], "cardinality": [cardinality]}
+            df = pd.DataFrame(result_set)
+            pb.util.write_df(df, self._out, mode="a", header=not self._out.exists())
 
-        self._n_samples = 0
-        self._sampled_queries: set[pb.SqlQuery] = set()
-        self._samples: list[CardinalitySample] = []
-        self._out_file: Path | None = None
+            if self._n_generated >= self._n_requested:
+                self.done.set()
+                self._close_backends_nolock()
+                self._join_workers_nolock()
 
-    def sample(
-        self, n_queries: int, *, stream_to: Optional[Path] = None
-    ) -> list[CardinalitySample]:
-        self._n_queries = n_queries
-        self._log.n_queries = n_queries
-        self._out_file = stream_to
-        for query in range(self._n_queries):
-            self._enqueue_sampler()
+    def obtain_pg_backend(
+        self, prev_handle: Optional[BackendHandle] = None
+    ) -> tuple[BackendHandle, psycopg.Connection]:
+        if self.done.is_set():
+            return -1, None  # type: ignore
 
-        try:
-            self._done.wait()
-        except KeyboardInterrupt:
-            pass
-        return self._samples
+        with self._critical_guard:
+            conn = psycopg.connect(self._pg_connect)
+            handle = conn.info.backend_pid
+            self._pg_backends[handle] = conn
+            if prev_handle is None:
+                return handle, conn
 
-    def shutdown(self) -> None:
-        self._done.set()
-        # For shutdown, we need to close the worker pool before shutting down the connections.
-        # The reason is that the worker pool first tries to acquire() a connection from the pool
-        # If the connection pool is already shut down, acquire() hangs indefinitely because no
-        # more connections are available. By shutting down the worker pool first, active workers
-        # might run slightly longer until the connection is closed and execution fails. For now,
-        # this is acceptable.
-        self._worker_pool.shutdown(wait=False, cancel_futures=True)
-        self._connection_pool.shutdown(force=True)
+            prev_conn = self._pg_backends.pop(prev_handle, None)
+            if prev_conn is None:
+                return handle, conn
 
-    def _worker_callback(self, future: futures.Future) -> None:
-        if future.cancelled():
-            return
-
-        status, sample = future.result()
-
-        match status:
-            case "ok":
-                self._process_sample(sample)
-            case "timeout" | "error" if not self._done.is_set():
-                # we still need more samples, so create another one
-                self._enqueue_sampler()
-            case "timeout" | "error" if self._done.is_set():
-                # we did not obtain a valid sample, but we have enough data already
-                # no need to sample a new query
+            try:
+                prev_conn.close()
+            except Exception:
                 pass
 
-    def _process_sample(self, sample: CardinalitySample) -> None:
+        return handle, conn
+
+    def shutdown(self) -> None:
+        self.done.set()
         with self._critical_guard:
-            self._samples.append(sample)
-            self._stream_result(sample)
-            n_acquired = len(self._samples)
+            self._close_backends_nolock()
+            self._join_workers_nolock()
 
-        if n_acquired >= self._n_queries:
-            self._done.set()
+    def _join_workers_nolock(self) -> None:
+        for worker in self._workers:
+            worker.join()
+        self._workers.clear()
 
-        self._log.sample_acquired()
+    def _close_backends_nolock(self) -> None:
+        with psycopg.connect(self._pg_connect) as conn:
+            cur = conn.cursor()
+            for backend in self._pg_backends:
+                cur.execute("SELECT pg_cancel_backend(%s)", (backend,))
+            self._pg_backends.clear()
 
-    def _enqueue_sampler(self) -> None:
-        if self._done.is_set():
-            return
 
-        with self._critical_guard:
-            while (query := next(self._generator)) in self._sampled_queries:
+def sampling_worker(query_sampler: QuerySampler, *, ctl: PostgresSamplerCtl) -> None:
+    handle, conn = ctl.obtain_pg_backend()
+    while not ctl.done.is_set():
+        query = query_sampler.next_query()
+
+        # Sampling a new query can take quiet a bit of time, so we should re-check here if we
+        # have been cancelled in the meantime!
+        if ctl.done.is_set():
+            break
+
+        with conn.cursor() as cur:
+            if ctl.timeout_ms is not None:
+                cur.execute(f"SET LOCAL statement_timeout TO '{ctl.timeout_ms}ms'")  # type: ignore
+
+            try:
+                cur.execute(str(query))  # type: ignore
+                result_set = cur.fetchone()
+                if result_set is None:
+                    continue
+                cardinality = pb.Cardinality(result_set[0])
+                ctl.process_result(query, cardinality)
+            except psycopg.errors.QueryCanceled:
+                # Timeout - do nothing, we just try again
+                conn.rollback()
                 continue
-
-        if self._done.is_set():
-            return
-        future = self._worker_pool.submit(
-            execute_query,
-            query,
-            connection_pool=self._connection_pool,
-            log=self._log,
-            timeout_ms=self._timeout_ms,
-        )
-        future.add_done_callback(self._worker_callback)
-
-    def _stream_result(self, sample: CardinalitySample) -> None:
-        if self._out_file is None:
-            return
-
-        serialized = {key: pb.util.to_json(val) for key, val in asdict(sample).items()}
-        df = pd.DataFrame([serialized])
-        df.to_csv(self._out_file, mode="a", index=False, header=False)
+            except Exception:
+                # Something went wrong and our connection might be bricked. We obtain a new one
+                # just to be save
+                handle, conn = ctl.obtain_pg_backend(handle)
+                continue
