@@ -225,3 +225,8 @@ localtest*
 .query_cache*.json
 models/
 
+/tests/
+/queries/
+/postbound_extensions/fastgres/generated/
+/.idea
+requirements.txt
