@@ -311,7 +311,7 @@ def generate_query(
                 ):
                     where_parts.extend(children)
                 case _:
-                    where_parts.append(join_predicates)
+                    where_parts.append(predicates)
 
         where_clause = (
             pb.qal.Where(pb.qal.CompoundPredicate.create_and(where_parts))

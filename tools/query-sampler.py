@@ -1,5 +1,6 @@
 import argparse
 import atexit
+import functools
 import signal
 from pathlib import Path
 
@@ -21,8 +22,18 @@ Results are streamed to a CSV file.
 Currently, the sampler is only implemented for PostgreSQL.
 """
 
+infinite = False
+
+
+def shutdown(signum, frame, *, sampler_ctl: sampler.CardinalitySampler) -> None:
+    global infinite
+    infinite = False
+    sampler_ctl.shutdown()
+
 
 def main() -> None:
+    global infinite
+
     parser = argparse.ArgumentParser(
         description=description, formatter_class=argparse.RawDescriptionHelpFormatter
     )
@@ -101,6 +112,7 @@ def main() -> None:
     out_file: Path = args.out
     logger = pb.util.standard_logger(args.verbose)
     n_workers = args.jobs
+    infinite = args.infinite
     if args.connect_string:
         pg_instance = pb.postgres.connect(connect_string=args.connect_string)
     elif args.pg_connect:
@@ -133,7 +145,7 @@ def main() -> None:
         df = pd.DataFrame([], columns=sampler.CardinalitySample.csv_cols())  # type: ignore[call-arg]
         df.to_csv(out_file, mode="w", index=False, header=True)
 
-    signal.signal(signal.SIGINT, lambda *_: sampler_ctl.shutdown())
+    signal.signal(signal.SIGINT, functools.partial(shutdown, sampler_ctl=sampler_ctl))
     atexit.register(sampler_ctl.shutdown)
 
     if args.infinite:
@@ -142,7 +154,7 @@ def main() -> None:
         logger("Starting sampling run")
 
     sampler_ctl.sample(args.n_queries, stream_to=out_file)
-    while args.infinite:
+    while infinite:
         logger("Starting next sampling run")
         sampler_ctl.sample(args.n_queries, stream_to=out_file)
 
