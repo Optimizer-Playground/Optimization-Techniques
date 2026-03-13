@@ -1,6 +1,5 @@
 from ._catalog import *
 from ._compress import *
-from ._core import *
 from ._estimator import *
 from ._fdsb import *
 from ._piecewise_fns import *

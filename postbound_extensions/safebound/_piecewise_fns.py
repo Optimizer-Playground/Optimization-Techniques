@@ -1,11 +1,13 @@
 from __future__ import annotations
 
-from collections.abc import Iterable, Iterator
+import json
+from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass
 from typing import Optional, Protocol
 
 import numpy as np
 import postbound as pb
+from numpy.typing import NDArray
 
 
 class FunctionLike(Protocol):
@@ -25,6 +27,92 @@ class FunctionLike(Protocol):
     def __hash__(self) -> int: ...
 
     def __eq__(self, other: object) -> bool: ...
+
+
+class DegreeSequence:
+    @staticmethod
+    def from_mcv(
+        mcv: pb.db.MostCommonValues, *, column: Optional[pb.ColumnReference] = None
+    ) -> DegreeSequence:
+        return DegreeSequence(mcv.frequencies, column=column)
+
+    @staticmethod
+    def for_primary_key(
+        n_values: int, *, column: Optional[pb.ColumnReference] = None
+    ) -> DegreeSequence:
+        return DegreeSequence(np.ones(n_values), column=column)
+
+    def __init__(
+        self,
+        degrees: Iterable[int | pb.Cardinality] | NDArray[np.int_],
+        *,
+        column: Optional[pb.ColumnReference] = None,
+    ) -> None:
+        if not isinstance(degrees, np.ndarray):
+            degrees = [
+                int(deg)
+                for deg in degrees
+                if not isinstance(deg, pb.Cardinality) or deg.is_valid()
+            ]
+            degrees = np.asarray(degrees)
+        degrees = np.sort(degrees)[::-1]  # see https://stackoverflow.com/q/26984414
+        self._degrees: NDArray[np.int_] = np.array(degrees)
+        self._column = column
+
+    @property
+    def column(self) -> Optional[pb.ColumnReference]:
+        return self._column
+
+    @property
+    def max_deg(self) -> int:
+        return self._degrees[0]
+
+    @property
+    def min_deg(self) -> int:
+        return self._degrees[-1]
+
+    @property
+    def max_freq(self) -> int:
+        return self._degrees[0]
+
+    @property
+    def degrees(self) -> Sequence[int]:
+        return self._degrees.tolist()
+
+    @property
+    def distinct_values(self) -> int:
+        return len(self)
+
+    @property
+    def cardinality(self) -> int:
+        return int(np.sum(self._degrees))
+
+    def join_bound(self, other: DegreeSequence) -> int:
+        if len(self._degrees) != len(other._degrees):
+            raise ValueError(
+                "Degree sequences must have the same length for join bound calculation"
+            )
+        return int(self._degrees @ other._degrees)
+
+    def __len__(self) -> int:
+        return len(self._degrees)
+
+    def __getitem__(self, i) -> int:
+        return self._degrees[i]
+
+    def __le__(self, other: DegreeSequence) -> bool:
+        if len(self) != len(other):
+            raise ValueError(
+                "Degree sequences must have the same length for comparison"
+            )
+        return bool(np.min(other._degrees - self._degrees) >= 0)
+
+    def __repr__(self) -> str:
+        degrees = repr(self._degrees.tolist())
+        return f"DegreeSequence({degrees})"
+
+    def __str__(self) -> str:
+        return str(self._degrees.tolist())
 
 
 @dataclass
@@ -489,3 +577,13 @@ def align_functions(
     aligned_a = PiecewiseConstantFn(values_a, bounds_a, column=a.column)
     aligned_b = PiecewiseConstantFn(values_b, bounds_b, column=b.column)
     return aligned_a, aligned_b
+
+
+def load_pcf_json(json_data: dict | str) -> PiecewiseConstantFn:
+    if isinstance(json_data, str):
+        json_data = json.loads(json_data)
+
+    column = pb.parser.load_column_json(json_data["column"])
+    bounds = json_data["bounds"]
+    values = json_data["values"]
+    return PiecewiseConstantFn(values, bounds, column=column)

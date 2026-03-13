@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-
-from ._core import DegreeSequence
-from ._piecewise_fns import PiecewiseLinearFn, Segment
+from ._piecewise_fns import DegreeSequence, PiecewiseLinearFn, Segment
 
 
 def valid_compress(ds: DegreeSequence, *, accuracy: float) -> PiecewiseLinearFn:
