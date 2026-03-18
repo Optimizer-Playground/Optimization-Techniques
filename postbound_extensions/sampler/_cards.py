@@ -78,6 +78,7 @@ class PostgresSamplerCtl:
         self._workers: list[threading.Thread] = []
 
     def sample(self, n_queries: int) -> None:
+        self.done.clear()
         self._n_generated = 0
         self._n_requested = n_queries
         self._log.restart(n_queries)
