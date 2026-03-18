@@ -152,9 +152,11 @@ def main() -> None:
         logger("Starting sampling run")
 
     sampler_ctl.sample(args.n_queries)
+    n_generated = args.n_queries
     while infinite:
-        logger("Starting next sampling run")
+        logger("Starting next sampling run -", n_generated, "queries generated so far.")
         sampler_ctl.sample(args.n_queries)
+        n_generated += args.n_queries
 
 
 if __name__ == "__main__":
