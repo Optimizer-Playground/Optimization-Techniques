@@ -29,10 +29,12 @@ class BinarizedQep:
 
     @staticmethod
     def create_for(
-        plan: pb.QueryPlan, *, database: Optional[pb.Database] = None
+        plan: pb.QueryPlan,
+        *,
+        cache_state: DatabaseCacheState,
     ) -> BinarizedQep:
         if plan.is_scan():
-            cache_pct = _determine_cache_pct(plan, database)
+            cache_pct = cache_state.determine_cache_pct(plan)
             return BinarizedQep.scan(
                 plan.node_type,
                 cardinality=int(plan.estimated_cardinality),
@@ -43,10 +45,10 @@ class BinarizedQep:
         elif plan.is_join():
             assert plan.outer_child and plan.inner_child
             binarized_outer = BinarizedQep.create_for(
-                plan.outer_child, database=database
+                plan.outer_child, cache_state=cache_state
             )
             binarized_inner = BinarizedQep.create_for(
-                plan.inner_child, database=database
+                plan.inner_child, cache_state=cache_state
             )
             return BinarizedQep.pseudo_join(
                 plan.node_type,
@@ -60,7 +62,9 @@ class BinarizedQep:
         assert plan.input_node
 
         dummy_child = BinarizedQep.dummy()
-        binarized_input = BinarizedQep.create_for(plan.input_node, database=database)
+        binarized_input = BinarizedQep.create_for(
+            plan.input_node, cache_state=cache_state
+        )
         return BinarizedQep.pseudo_join(
             plan.node_type,
             binarized_input,
@@ -144,45 +148,56 @@ def inner_child(node: FeaturizedNode) -> Optional[FeaturizedNode]:
     return node.inner_child
 
 
-def _determine_cache_pct(
-    node: pb.QueryPlan, database: Optional[pb.Database] = None
-) -> float:
-    measures = node.measures
-    if measures.cache_hits is not None and measures.cache_misses is not None:
-        total_cache_accesses = measures.cache_hits + measures.cache_misses
-        if total_cache_accesses == 0:
-            return 1
+class DatabaseCacheState:
+    def __init__(self, database: pb.Database) -> None:
+        self._db = database
+        self._stats = self._db.statistics()
 
-        return measures.cache_hits / total_cache_accesses
+        if isinstance(self._db, pb.postgres.PostgresInterface):
+            self._cache_state = self._stats.buffer_state()
+        else:
+            self._cache_state = {}
 
-    if database is None or not isinstance(database, pb.postgres.PostgresInterface):
-        return 0
+    def determine_cache_pct(self, node: pb.QueryPlan) -> float:
+        measures = node.measures
 
-    assert node.base_table
-    match node.operator:
-        case pb.ScanOperator.SequentialScan:
-            rels = [node.base_table.full_name]
-        case pb.ScanOperator.IndexScan | pb.ScanOperator.IndexOnlyScan:
-            rels = [node.params.index, node.base_table.full_name]
-        case pb.ScanOperator.BitmapScan:
-            rel_set = set()
-            for child in node:
-                if child.base_table is not None:
-                    rel_set.add(child.base_table.full_name)
-                if child.params.index:
-                    rel_set.add(child.params.index)
-            rels = list(rel_set)
-        case _:
-            raise ValueError(f"Unsupported scan operator: {node.operator}")
+        if measures.cache_hits is not None and measures.cache_misses is not None:
+            total_cache_accesses = measures.cache_hits + measures.cache_misses
+            if total_cache_accesses == 0:
+                return 1
 
-    pct_sum = 0
-    stats = database.statistics()
-    for rel in rels:
-        total_pages = stats.n_pages(rel)
-        buffered_pages = stats.n_buffered(rel)
-        pct_sum += buffered_pages / total_pages
+            return measures.cache_hits / total_cache_accesses
 
-    return pct_sum / len(rels)
+        if not isinstance(self._db, pb.postgres.PostgresInterface):
+            return 0
+
+        assert node.base_table
+        match node.operator:
+            case pb.ScanOperator.SequentialScan:
+                rels = [node.base_table.full_name]
+            case pb.ScanOperator.IndexScan | pb.ScanOperator.IndexOnlyScan:
+                rels = [node.params.index, node.base_table.full_name]
+            case pb.ScanOperator.BitmapScan:
+                rel_set = set()
+                for child in node:
+                    if child.base_table is not None:
+                        rel_set.add(child.base_table.full_name)
+                    if child.params.index:
+                        rel_set.add(child.params.index)
+                rels = list(rel_set)
+            case _:
+                raise ValueError(f"Unsupported scan operator: {node.operator}")
+
+        pct_sum = 0
+        for rel in rels:
+            total_pages = self._stats.n_pages(rel)
+            buffered_pages = self._cache_state.get(rel, -1)
+            if buffered_pages == -1:
+                buffered_pages = self._stats.n_buffered(rel)
+                self._cache_state[rel] = buffered_pages
+            pct_sum += buffered_pages / total_pages
+
+        return pct_sum / len(rels)
 
 
 _PGNodeMap = {
@@ -247,11 +262,12 @@ class BaoFeaturizer:
             max_cost=max_cost,
             min_runtime_ms=1,
             max_runtime_ms=max_runtime_ms,
+            database=database,
         )
 
     @staticmethod
     def infer_from_sample(
-        sample: pd.DataFrame, *, plan_col: str = "query_plan"
+        sample: pd.DataFrame, *, database: pb.Database, plan_col: str = "query_plan"
     ) -> BaoFeaturizer:
         allowed_ops: set[str] = set()
         min_card, max_card = np.inf, 0
@@ -279,10 +295,11 @@ class BaoFeaturizer:
             max_cost=max_cost,
             min_runtime_ms=min_runtime,
             max_runtime_ms=max_runtime,
+            database=database,
         )
 
     @staticmethod
-    def pre_built(archive: Path | str) -> BaoFeaturizer:
+    def pre_built(archive: Path | str, *, database: pb.Database) -> BaoFeaturizer:
         with open(archive, "r") as f:
             catalog = json.load(f)
 
@@ -294,13 +311,14 @@ class BaoFeaturizer:
             max_cost=catalog["max_cost"],
             min_runtime_ms=catalog["min_runtime_ms"],
             max_runtime_ms=catalog["max_runtime_ms"],
+            database=database,
         )
 
     @staticmethod
     def load_or_build(archive: Path | str, *, database: pb.Database) -> BaoFeaturizer:
         archive = Path(archive)
         if archive.is_file():
-            return BaoFeaturizer.pre_built(archive)
+            return BaoFeaturizer.pre_built(archive, database=database)
 
         return BaoFeaturizer.online(database)
 
@@ -314,6 +332,7 @@ class BaoFeaturizer:
         max_cost: float,
         min_runtime_ms: float,
         max_runtime_ms: float,
+        database: pb.Database,
     ) -> None:
         allowed_ops = list(allowed_ops)
         if "__bao_null__" not in allowed_ops:
@@ -337,6 +356,12 @@ class BaoFeaturizer:
         self._runtime_pipeline.fit(
             np.asarray([self._min_runtime, self._max_runtime]).reshape(-1, 1)
         )
+
+        self._db = database
+
+    @property
+    def database(self) -> pb.Database:
+        return self._db
 
     @property
     def out_shape(self) -> int:
@@ -365,9 +390,12 @@ class BaoFeaturizer:
         self,
         plan: pb.QueryPlan,
         *,
-        database: Optional[pb.Database] = None,
+        cache_state: DatabaseCacheState | None = None,
     ) -> FeaturizedNode | tuple:
-        binarized = BinarizedQep.create_for(plan, database=database)
+        if cache_state is None:
+            cache_state = DatabaseCacheState(self._db)
+
+        binarized = BinarizedQep.create_for(plan, cache_state=cache_state)
         return self._featurize_qep(binarized)
 
     def encode_operator(self, node: BinarizedQep) -> np.ndarray:

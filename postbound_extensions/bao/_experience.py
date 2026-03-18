@@ -12,7 +12,7 @@ import postbound as pb
 import torch
 from torch.utils.data import Dataset
 
-from ._featurizer import BaoFeaturizer, FeaturizedNode
+from ._featurizer import BaoFeaturizer, DatabaseCacheState, FeaturizedNode
 
 
 @dataclass
@@ -146,7 +146,9 @@ class BaoExperience(Dataset[tuple[torch.Tensor, torch.Tensor, float]]):
         return len(self._storage)
 
     def __getitem__(self, index):
+        cache_state = DatabaseCacheState(self._featurizer._db)
+
         sample = self._storage[index]
-        featurized = self._featurizer.encode_plan(sample.plan)
+        featurized = self._featurizer.encode_plan(sample.plan, cache_state=cache_state)
         scaled_runtime = self._featurizer.transform_runtime([(sample.runtime_ms,)])
         return (featurized, scaled_runtime)

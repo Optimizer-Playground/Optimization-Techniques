@@ -13,7 +13,7 @@ from tqdm import tqdm
 
 from ..util import wrap_logger
 from ._experience import BaoExperience
-from ._featurizer import BaoFeaturizer
+from ._featurizer import BaoFeaturizer, DatabaseCacheState
 from ._model import BaoModel
 
 
@@ -438,7 +438,7 @@ class BaoOptimizer(pb.CompleteOptimizationAlgorithm):
         with open(archive, "r") as f:
             catalog = json.load(f)
 
-        featurizer = BaoFeaturizer.pre_built(catalog["featurizer"])
+        featurizer = BaoFeaturizer.pre_built(catalog["featurizer"], database=database)
         experience = BaoExperience.load(
             catalog["experience"]["catalog"], featurizer=featurizer
         )
@@ -542,11 +542,13 @@ class BaoOptimizer(pb.CompleteOptimizationAlgorithm):
         self._retrain = retrain
 
     def optimize_query(self, query: pb.SqlQuery) -> pb.QueryPlan:
+        cache_state = DatabaseCacheState(self._db)
         plans: list[pb.QueryPlan] = [
             self._generate_plan(query, hint_set) for hint_set in self._hint_sets
         ]
         featurized = [
-            self._featurizer.encode_plan(plan, database=self._db) for plan in plans
+            self._featurizer.encode_plan(plan, cache_state=cache_state)
+            for plan in plans
         ]
 
         predictions = self._tcnn(featurized)
@@ -556,7 +558,12 @@ class BaoOptimizer(pb.CompleteOptimizationAlgorithm):
         self._log(f"Selected arm {idxmin} ({hint_set}) for query {query}")
         return plans[idxmin]
 
-    def add_experience(self, plan: pb.QueryPlan, runtime_ms: float) -> None:
+    def add_experience(
+        self, plan: pb.QueryPlan, runtime_ms: float | None = None
+    ) -> None:
+        if runtime_ms is None:
+            runtime_ms = plan.execution_time * 1000
+
         self._experience.add(plan, runtime_ms)
         if not self._retrain or not self._experience.should_retrain():
             return
