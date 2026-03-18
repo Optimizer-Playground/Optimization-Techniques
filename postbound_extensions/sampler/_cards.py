@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import threading
+import traceback
 from collections.abc import Generator
 from pathlib import Path
 from typing import Optional
@@ -27,7 +28,7 @@ class QuerySampler:
         return query
 
 
-class _ParallelLog:
+class ParallelLog:
     def __init__(self, enabled: bool) -> None:
         self._enabled = enabled
         self._critical_guard = threading.Lock()
@@ -45,6 +46,17 @@ class _ParallelLog:
             return
         assert self._tqdm is not None
         self._tqdm.update()
+
+    def __call__(self, *args) -> None:
+        if not self._enabled:
+            return
+        assert self._tqdm is not None
+
+        msg = " ".join(str(arg) for arg in args)
+        thread_name = threading.current_thread().name
+        thread_id = threading.get_ident()
+        with self._critical_guard:
+            self._tqdm.write(f"[{thread_name}-{thread_id}] {msg}")
 
 
 class PostgresSamplerCtl:
@@ -65,7 +77,7 @@ class PostgresSamplerCtl:
 
         self._critical_guard = threading.Lock()
         self._out = out
-        self._log = _ParallelLog(verbose)
+        self._log = ParallelLog(verbose)
 
         self._pg_backends: dict[BackendHandle, psycopg.Connection] = {}
         self._pg_connect = pg_connect
@@ -77,32 +89,51 @@ class PostgresSamplerCtl:
         self._n_workers = n_workers
         self._workers: list[threading.Thread] = []
 
+    @property
+    def log(self) -> ParallelLog:
+        return self._log
+
     def sample(self, n_queries: int) -> None:
         self.done.clear()
         self._n_generated = 0
         self._n_requested = n_queries
         self._log.restart(n_queries)
+
         for i in range(self._n_workers):
             worker = threading.Thread(
-                target=sampling_worker, args=(self._sampler,), kwargs=dict(ctl=self)
+                target=sampling_worker,
+                args=(self._sampler,),
+                kwargs=dict(ctl=self),
+                name="SamplingWorker",
             )
             self._workers.append(worker)
             worker.start()
+
         self.done.wait()
+        self._close_backends_nolock()
+        self._join_workers_nolock()
 
-    def process_result(self, query: pb.SqlQuery, cardinality: pb.Cardinality) -> None:
+    def process_result(
+        self, query: pb.SqlQuery, plan: pb.postgres.PostgresExplainPlan
+    ) -> None:
         with self._critical_guard:
-            self._n_generated += 1
-            self._log.step()
+            if plan.root.true_cardinality == 0 and not self.allow_zero_tuples:
+                return
 
-            result_set = {"query": [query], "cardinality": [cardinality]}
+            result_set = {
+                "query": [query],
+                "plan": [plan],
+                "cardinality": [plan.root.true_cardinality],
+                "runtime_ms": [plan.root.execution_time],
+            }
             df = pd.DataFrame(result_set)
             pb.util.write_df(df, self._out, mode="a", header=not self._out.exists())
 
+            self._n_generated += 1
+            self._log.step()
+
             if self._n_generated >= self._n_requested:
                 self.done.set()
-                self._close_backends_nolock()
-                self._join_workers_nolock()
 
     def obtain_pg_backend(
         self, prev_handle: Optional[BackendHandle] = None
@@ -151,6 +182,8 @@ def sampling_worker(query_sampler: QuerySampler, *, ctl: PostgresSamplerCtl) -> 
     handle, conn = ctl.obtain_pg_backend()
     while not ctl.done.is_set():
         query = query_sampler.next_query()
+        query = pb.transform.as_star_query(query)
+        explain_query = pb.transform.as_explain_analyze(query)
 
         # Sampling a new query can take quiet a bit of time, so we should re-check here if we
         # have been cancelled in the meantime!
@@ -162,20 +195,21 @@ def sampling_worker(query_sampler: QuerySampler, *, ctl: PostgresSamplerCtl) -> 
                 cur.execute(f"SET LOCAL statement_timeout TO '{ctl.timeout_ms}ms'")  # type: ignore
 
             try:
-                cur.execute(str(query))  # type: ignore
+                cur.execute(str(explain_query))  # type: ignore
                 result_set = cur.fetchone()
                 if result_set is None:
                     continue
-                cardinality = pb.Cardinality(result_set[0])
-                if cardinality == 0 and not ctl.allow_zero_tuples:
-                    continue
-                ctl.process_result(query, cardinality)
+                ctl.process_result(
+                    query, pb.postgres.PostgresExplainPlan(result_set[0])
+                )
             except psycopg.errors.QueryCanceled:
                 # Timeout - do nothing, we just try again
                 conn.rollback()
                 continue
-            except Exception:
+            except Exception as e:
                 # Something went wrong and our connection might be bricked. We obtain a new one
                 # just to be save
+                stack_trace = traceback.format_exc()
+                ctl.log("Error:", e, "// Stack trace:", stack_trace, "\n")
                 handle, conn = ctl.obtain_pg_backend(handle)
                 continue
