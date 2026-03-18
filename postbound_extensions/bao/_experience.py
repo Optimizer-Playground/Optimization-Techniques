@@ -74,6 +74,7 @@ class BaoExperience(Dataset[tuple[torch.Tensor, torch.Tensor, float]]):
             self._storage.extend(existing_samples)
 
         self._new_samples = 0
+        self._cache_state: Optional[DatabaseCacheState] = None
 
     def add(
         self, plan: pb.QueryPlan | BaoSample, runtime_ms: Optional[float] = None
@@ -98,8 +99,12 @@ class BaoExperience(Dataset[tuple[torch.Tensor, torch.Tensor, float]]):
         return self._new_samples >= self._retrain_freq
 
     def samples(self) -> Dataset[tuple[torch.Tensor, torch.Tensor, float]]:
-        self._new_samples = 0
+        self._cache_state = DatabaseCacheState(self._featurizer._db)
         return self
+
+    def mark_retrained(self) -> None:
+        self._new_samples = 0
+        self._cache_state = None
 
     @overload
     def sample(self, *, primitive: Literal[True]) -> Optional[tuple]: ...
@@ -146,9 +151,9 @@ class BaoExperience(Dataset[tuple[torch.Tensor, torch.Tensor, float]]):
         return len(self._storage)
 
     def __getitem__(self, index):
-        cache_state = DatabaseCacheState(self._featurizer._db)
-
         sample = self._storage[index]
-        featurized = self._featurizer.encode_plan(sample.plan, cache_state=cache_state)
+        featurized = self._featurizer.encode_plan(
+            sample.plan, cache_state=self._cache_state
+        )
         scaled_runtime = self._featurizer.transform_runtime([(sample.runtime_ms,)])
         return (featurized, scaled_runtime)

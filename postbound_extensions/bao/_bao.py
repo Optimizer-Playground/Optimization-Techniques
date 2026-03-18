@@ -578,6 +578,7 @@ class BaoOptimizer(pb.CompleteOptimizationAlgorithm):
         self._log("Obtaining new model")
         self._tcnn = BaoModel(self._featurizer.out_shape)
         self._train(loader)
+        self._experience.mark_retrained()
 
     def calibrate(
         self,
@@ -623,6 +624,7 @@ class BaoOptimizer(pb.CompleteOptimizationAlgorithm):
             dataset, batch_size=16, shuffle=True, collate_fn=lambda xs: xs
         )  # default collation messes up the data types due to namedtuple - use our own dummy
         self._train(loader)
+        self._experience.mark_retrained()
 
     def store(self, archive_dir: Path | str) -> None:
         archive_dir = Path(archive_dir)
