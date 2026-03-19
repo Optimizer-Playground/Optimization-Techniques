@@ -254,11 +254,10 @@ def _build_join_map(
     return join_map
 
 
-def derive_catalog(
+def catalog_from_workload(
     workload: pb.Workload,
     verbose: bool | pb.util.Logger = False,
 ) -> CatalogSpec:
-    """Determines all join columns that need to be equality-conditioned, range-conditioned, etc."""
     logger = wrap_logger(verbose)
     spec = CatalogSpec.empty()
     visitor = _CatalogVisitor(spec, log=logger)
@@ -267,6 +266,52 @@ def derive_catalog(
         visitor.visit_query_predicates(query, join_map=join_map)
         join_cols = pb.util.set_union(pred.columns() for pred in query.joins())
         spec.unconditioned_cols |= {col.drop_table_alias() for col in join_cols}
+    return spec
+
+
+def catalog_from_schema(
+    schema: pb.db.DatabaseSchema, verbose: bool | pb.util.Logger = False
+) -> CatalogSpec:
+    logger = wrap_logger(verbose)
+    spec = CatalogSpec.empty()
+    for table in schema.tables():
+        equality_cols: set[pb.BoundColumnReference] = set()
+        range_cols: set[pb.BoundColumnReference] = set()
+        like_cols: set[pb.BoundColumnReference] = set()
+
+        key_cols: set[pb.BoundColumnReference] = set()
+        pk_col = schema.primary_key_column(table)
+        if pk_col is not None:
+            key_cols.add(pk_col)
+
+        for col in schema.columns(table):
+            if schema.foreign_keys_on(col):
+                key_cols.add(col)
+
+            dtype = schema.datatype(col)
+            match dtype:
+                case "integer" | "smallint" | "bigint":
+                    equality_cols.add(col)
+                    range_cols.add(col)
+                case "varchar" | "character varying" | "text":
+                    equality_cols.add(col)
+                    range_cols.add(col)
+                    like_cols.add(col)
+                case "timestamp with timezone" | "timestamp without timezone":
+                    equality_cols.add(col)
+                    range_cols.add(col)
+                case "date":
+                    equality_cols.add(col)
+                    range_cols.add(col)
+                case _:
+                    logger("Skipping column", col, "- unsupported data type:", dtype)
+
+        for key in key_cols:
+            spec.equality_cols[key] = equality_cols - {key}
+            spec.range_cols[key] = range_cols - {key}
+            spec.like_cols[key] = like_cols - {key}
+            spec.unconditioned_cols.add(key)
+
     return spec
 
 
@@ -580,24 +625,22 @@ class RangeConditionedPCF[T: _HistogramKey]:
             pcf += current_pcf
         return pcf
 
-    def get_range(self, lower: T, upper: T) -> PiecewiseConstantFn:
-        own_range = self._error_range(lower, upper)
+    def get_range(self, lower: T, upper: T) -> Optional[PiecewiseConstantFn]:
+        lo = bisect.bisect_right(self._bounds, lower)
+        hi = bisect.bisect_left(self._bounds, upper)
+        if lo != hi:
+            # no bucket that encompasses the range. Since all higher resolutions have a
+            # ... higher resolution ... and thus smaller buckets, they can also never subsume the
+            # entire bucket. Therefore, we can stop here.
+            return None
+
         if self._higher_res is None:
-            return self.pcf_from_buckets(own_range[1])
+            # we have no higher resolution child, but we already have a matching bucket, return it
+            # and be done with it
+            return self._buckets[lo]
 
-        higher_res = self._higher_res._error_range(lower, upper)
-        own_err, higher_err = own_range[0], higher_res[0]
-        if own_err <= higher_err:
-            return self.pcf_from_buckets(own_range[1])
-
-        # Instead of calling pcf_from_buckets() directly on higher_res,
-        # we intentionally delegate to get_range(). This allows the
-        # higher resolution histogram to compute an even better bound
-        # through its even higher resolution child.
-        # The downside is that we compute the error on the children
-        # twice, but since this is a rather cheap operation, we are fine
-        # with this for now.
-        return self._higher_res.get_range(lower, upper)
+        higher_bucket = self._higher_res.get_range(lower, upper)
+        return higher_bucket or self._buckets[lo]
 
     def get_less(self, value: T, *, inclusive: bool = False) -> PiecewiseConstantFn:
         own_err = self._error_less(value, inclusive=inclusive)
@@ -610,7 +653,13 @@ class RangeConditionedPCF[T: _HistogramKey]:
             final_idx = own_err.closest_bound + 1
             return self.pcf_from_buckets(slice(final_idx))
 
-        # See comment in get_range() for why we have to call get_less()
+        # Instead of calling pcf_from_buckets() directly on higher_res,
+        # we intentionally delegate to get_range(). This allows the
+        # higher resolution histogram to compute an even better bound
+        # through its even higher resolution child.
+        # The downside is that we compute the error on the children
+        # twice, but since this is a rather cheap operation, we are fine
+        # with this for now.
         return self._higher_res.get_less(value, inclusive=inclusive)
 
     def get_greater(self, value: T, *, inclusive: bool = False) -> PiecewiseConstantFn:
@@ -624,7 +673,7 @@ class RangeConditionedPCF[T: _HistogramKey]:
             init_idx = own_err.closest_bound
             return self.pcf_from_buckets(slice(init_idx, len(self._bounds)))
 
-        # See comment in get_range() for why we have to call get_greater()
+        # See comment in get_less() for why we have to call get_greater()
         return self._higher_res.get_greater(value, inclusive=inclusive)
 
     def _error_range(self, lower: T, upper: T) -> tuple[T, slice]:
@@ -1332,7 +1381,10 @@ class SafeBoundCatalog:
         spec: SafeBoundSpec = SafeBoundSpec.default(),
         verbose: bool | pb.util.Logger = False,
     ) -> SafeBoundCatalog:
-        pass
+        catalog_spec = catalog_from_schema(database.schema())
+        return SafeBoundCatalog.from_spec(
+            catalog_spec, stats_spec=spec, database=database, verbose=verbose
+        )
 
     @staticmethod
     def infer_from(
@@ -1342,31 +1394,44 @@ class SafeBoundCatalog:
         database: pb.Database,
         verbose: bool | pb.util.Logger = False,
     ) -> SafeBoundCatalog:
+        catalog_spec = catalog_from_workload(workload, verbose=False)
+        return SafeBoundCatalog.from_spec(
+            catalog_spec, stats_spec=spec, database=database, verbose=verbose
+        )
+
+    @staticmethod
+    def from_spec(
+        catalog_spec: CatalogSpec,
+        *,
+        stats_spec: SafeBoundSpec = SafeBoundSpec.default(),
+        database: pb.Database,
+        verbose: bool | pb.util.Logger = False,
+    ) -> SafeBoundCatalog:
         logger = wrap_logger(verbose)
-        catalog_spec = derive_catalog(workload, verbose=False)
+
         eq_pcfs_repo = build_equality_mcvs(
             catalog_spec,
-            mcv_size=spec.mcv_size,
-            accuracy=spec.accuracy,
+            mcv_size=stats_spec.mcv_size,
+            accuracy=stats_spec.accuracy,
             database=database,
             log=logger,
         )
         range_pcfs_repo = build_histograms(
             catalog_spec,
-            hierarchy_depth=spec.hist_hierarchy_depth,
-            accuracy=spec.accuracy,
+            hierarchy_depth=stats_spec.hist_hierarchy_depth,
+            accuracy=stats_spec.accuracy,
             database=database,
             log=logger,
         )
         like_pcfs_repo = build_3grams(
             catalog_spec,
-            mcv_size=spec.mcv_size,
-            accuracy=spec.accuracy,
+            mcv_size=stats_spec.mcv_size,
+            accuracy=stats_spec.accuracy,
             database=database,
             log=logger,
         )
         unconditioned_pcfs = build_unconditioned_pcfs(
-            catalog_spec, accuracy=spec.accuracy, database=database, log=logger
+            catalog_spec, accuracy=stats_spec.accuracy, database=database, log=logger
         )
         return SafeBoundCatalog(
             equality_pcfs=eq_pcfs_repo,
