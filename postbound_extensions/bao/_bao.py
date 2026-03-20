@@ -423,7 +423,7 @@ def default_hint_sets() -> list[pb.PhysicalOperatorAssignment]:
     return arms
 
 
-class BaoOptimizer(pb.CompleteOptimizationAlgorithm):
+class BaoOptimizer(pb.CompleteOptimizationAlgorithm, pb.PhysicalOperatorSelection):
     @staticmethod
     def pre_trained(
         archive: Path | str,
@@ -543,9 +543,7 @@ class BaoOptimizer(pb.CompleteOptimizationAlgorithm):
 
     def optimize_query(self, query: pb.SqlQuery) -> pb.QueryPlan:
         cache_state = DatabaseCacheState(self._db)
-        plans: list[pb.QueryPlan] = [
-            self._generate_plan(query, hint_set) for hint_set in self._hint_sets
-        ]
+        plans = [self._generate_plan(query, hint_set) for hint_set in self._hint_sets]
         featurized = [
             self._featurizer.encode_plan(plan, cache_state=cache_state)
             for plan in plans
@@ -557,6 +555,28 @@ class BaoOptimizer(pb.CompleteOptimizationAlgorithm):
         hint_set = _stringify_hint_set(self._hint_sets[idxmin])
         self._log(f"Selected arm {idxmin} ({hint_set}) for query {query}")
         return plans[idxmin]
+
+    def select_physical_operators(
+        self, query: pb.SqlQuery, join_order: Optional[pb.JoinTree]
+    ) -> pb.PhysicalOperatorAssignment:
+        cache_state = DatabaseCacheState(self._db)
+        plans = [
+            self._generate_plan(query, hint_set, join_order=join_order)
+            for hint_set in self._hint_sets
+        ]
+
+        featurized = [
+            self._featurizer.encode_plan(plan, cache_state=cache_state)
+            for plan in plans
+        ]
+        predictions = self._tcnn(featurized)
+
+        idxmin = int(torch.argmin(predictions).item())
+        hint_set = self._hint_sets[idxmin]
+        self._log(
+            f"Selected arm {idxmin} ({_stringify_hint_set(hint_set)}) for query {query}"
+        )
+        return hint_set
 
     def add_experience(
         self, plan: pb.QueryPlan, runtime_ms: float | None = None
@@ -669,10 +689,14 @@ class BaoOptimizer(pb.CompleteOptimizationAlgorithm):
         }
 
     def _generate_plan(
-        self, query: pb.SqlQuery, hint_set: pb.PhysicalOperatorAssignment
+        self,
+        query: pb.SqlQuery,
+        hint_set: pb.PhysicalOperatorAssignment,
+        *,
+        join_order: Optional[pb.JoinTree] = None,
     ) -> pb.QueryPlan:
         hinted_query = self._db.hinting().generate_hints(
-            query, physical_operators=hint_set
+            query, join_order=join_order, physical_operators=hint_set
         )
         return self._db.optimizer().query_plan(hinted_query)
 
