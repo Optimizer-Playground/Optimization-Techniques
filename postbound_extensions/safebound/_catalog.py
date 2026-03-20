@@ -901,7 +901,7 @@ def histogram_for_precision[T: _HistogramKey](
 
         lower_err = freq_per_bucket - total_freq
         cur_err = updated_freq - freq_per_bucket
-        if lower_err < cur_err:
+        if lower_err < cur_err and lower_bound != cur_val:
             # stop at the previous value, include the current value in the next bucket
             upper_bound = cur_val  # upper bound is exclusive
             total_freq = cur_freq
@@ -953,7 +953,7 @@ def build_histograms(
             )
 
             last_histogram: RangeConditionedPCF | None = None
-            for i in range(hierarchy_depth, 1, -1):
+            for i in range(hierarchy_depth, 0, -1):
                 # XXX: The current implementation is pretty inefficient:
                 # We essentially scan the entire distribution k times, summing up all the frequencies
                 # each and every time. Maybe we can use cumulative sums to eliminate some of this?
