@@ -1493,6 +1493,8 @@ class SafeBoundCatalog:
         verbose: bool | pb.util.Logger = False,
     ) -> SafeBoundCatalog:
         archive = Path(archive)
+        if archive.is_dir():
+            archive = archive / "safebound-catalog.json"
         if archive.is_file():
             return SafeBoundCatalog.load(archive, database=database)
 

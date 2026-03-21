@@ -46,6 +46,59 @@ a catalog has been persisted at the given location. If it has, it will be loaded
 catalog is created and stored.
 
 
+## Example
+
+```py
+#
+# Step 1: generic setup
+# 
+# As usual for PostBOUND, connect to our target database and load the workload
+import postbound as pb
+import postbound_extensions as pbx
+
+pg_instance = pb.postgres.connect(config_file=".pg-connect-stats.toml")
+stats = pb.workloads.stats()
+
+
+#
+# Step 2: build our catalog
+#
+# We use the same "hyperparameters" (mcv size, histogram depth, etc.)
+# as the original papers
+safebound_spec = pbx.safebound.SafeBoundSpec.default()
+
+# If no catalog exists, build a new one fine-tuned for the workload
+# otherwise, reload the existing catalog
+cat = pbx.safebound.SafeBoundCatalog.load_or_build(
+    "models/safebound/stats", database=pg_instance, workload=stats, spec=safebound_spec
+)
+
+
+#
+# Step 3: create the actual estimator
+# 
+safebound = pbx.safebound.SafeBoundEstimator(cat)
+
+
+#
+# Step 4: Evaluation
+#
+# We can already use this optimizer to calculate the bound of different queries:
+query = stats["q-10"]
+print(safebound.calculate_estimate(query, query.tables()))
+
+# Or we can run the PostBOUND benchmarking utilities
+pb.bench.execute_workload(
+    stats,
+    on=safebound,
+    query_preparation={"analyze": True, "prewarm": True},
+    name="safebound-test",
+    progressive_output="safebound-benchmark.parquet",
+    logger="tqdm"
+)
+```
+
+
 ## Deviations from the Original Paper
 
 The SafeBound implementation contains a faithful adaptation of the following features:
