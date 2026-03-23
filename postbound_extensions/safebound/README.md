@@ -51,7 +51,7 @@ catalog is created and stored.
 ```py
 #
 # Step 1: generic setup
-# 
+#
 # As usual for PostBOUND, connect to our target database and load the workload
 import postbound as pb
 import postbound_extensions as pbx
@@ -76,7 +76,7 @@ cat = pbx.safebound.SafeBoundCatalog.load_or_build(
 
 #
 # Step 3: create the actual estimator
-# 
+#
 safebound = pbx.safebound.SafeBoundEstimator(cat)
 
 
@@ -112,6 +112,9 @@ The SafeBound implementation contains a faithful adaptation of the following fea
 To get a running implementation of SafeBound, we developed our own query decomposition algorithm,
 since the original paper did not contain any information on how to do that. See the documentation
 of `decompose_acyclic` for a detailed rundown of the algorithm.
+
+We also added support for half-open range predicates. See the documentation of `RangeConditionedPCF`
+for details.
 
 At the same time, we currently do not support the following:
 

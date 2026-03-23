@@ -1,3 +1,143 @@
+"""SafeBound - An upper bound-driven cardinality estimator.
+
+SafeBound is an upper bound-based cardinality estimator (i.e. a "pessimistic optimizer") that uses
+degree sequences on join columns to calculate upper bounds on the size of intermediate results.
+To keep estimation and storage overhead manageable, SafeBound compresses degree sequences to short
+piecewise constant functions. It supports conditioning the degree sequences on join columns by
+pre-computing filter predicates.
+
+We implement SafeBound completely from scratch based on the original paper. Under the hood we use
+numpy to accelerate computations.
+
+
+High-level API
+---------------
+
+SafeBound implements the PostBOUND
+`CardinalityEstimator <https://postbound.readthedocs.io/en/latest/api/core/optimization-pipelines.html#postbound.CardinalityEstimator>`__
+interface. The `SafeBoundEstimator` acts as the central entrypoint. It requires a
+`SafeBoundCatalog` to function correctly. This catalog stores all individual (conditioned and
+unconditioned) piecewise constant functions. A catalog can be created either based on a workload,
+or inferred completely from the database. See its documentation for more details.
+
+In addition to catalog and estimator, the following functions capture important concepts of the
+original paper:
+
+- `DegreeSequence` and `PiecewiseConstantFunction` model the core data structures.
+- `decompose_acyclic` implements the query decomposition logic (see below).
+- `valid_compress` implements the compression algorithm from the paper to transform a degree
+  sequence into a piecewise constant function.
+- `fdsb` computes the upper bound for a query, given its decomposition as well as the relevant
+  PCFs (typically retrieved from the catalog).
+
+
+Storing SafeBound Catalogs
+--------------------------
+
+Since computing an entire SafeBound catalog from scratch involves issuing a large number of
+(somewhat complex) SQL queries, it is quite time consuming and we do not recommend doing it online.
+Instead, an existing catalog can be persisted as a JSON object using the `SafeBoundCatalog.store` method.
+Afterwards, the `SafeBoundCatalog.load` method allows to re-create the catalog.
+
+The generally recommended pattern is to use `SafeBoundCatalog.load_or_build`. It checks, whether
+a catalog has been persisted at the given location. If it has, it will be loaded. Otherwise, the
+catalog is created and stored.
+
+
+Example
+-------
+
+.. code:: python
+
+    #
+    # Step 1: generic setup
+    #
+    # As usual for PostBOUND, connect to our target database and load the workload
+    import postbound as pb
+    import postbound_extensions as pbx
+
+    pg_instance = pb.postgres.connect(config_file=".pg-connect-stats.toml")
+    stats = pb.workloads.stats()
+
+
+    #
+    # Step 2: build our catalog
+    #
+    # We use the same "hyperparameters" (mcv size, histogram depth, etc.)
+    # as the original papers
+    safebound_spec = pbx.safebound.SafeBoundSpec.default()
+
+    # If no catalog exists, build a new one fine-tuned for the workload
+    # otherwise, reload the existing catalog
+    cat = pbx.safebound.SafeBoundCatalog.load_or_build(
+        "models/safebound/stats", database=pg_instance, workload=stats, spec=safebound_spec
+    )
+
+
+    #
+    # Step 3: create the actual estimator
+    #
+    safebound = pbx.safebound.SafeBoundEstimator(cat)
+
+
+    #
+    # Step 4: Evaluation
+    #
+    # We can already use this optimizer to calculate the bound of different queries:
+    query = stats["q-10"]
+    print(safebound.calculate_estimate(query, query.tables()))
+
+    # Or we can run the PostBOUND benchmarking utilities
+    pb.bench.execute_workload(
+        stats,
+        on=safebound,
+        query_preparation={"analyze": True, "prewarm": True},
+        name="safebound-test",
+        progressive_output="safebound-benchmark.parquet",
+        logger="tqdm"
+    )
+
+
+Deviations from the Original Paper
+----------------------------------
+
+The SafeBound implementation contains a faithful adaptation of the following features:
+
+- Compression of degree sequences to piecewise constant functions
+- Computation of the upper bound using alpha steps and beta steps
+- Correlated degree sequences for equality predicates based on most-common values
+- Correlated degree sequences for range predicates using hierarchies of histograms
+- Correlated degree sequences for LIKE predicates based on most-common values
+
+To get a running implementation of SafeBound, we developed our own query decomposition algorithm,
+since the original paper did not contain any information on how to do that. See the documentation
+of `decompose_acyclic` for a detailed rundown of the algorithm.
+
+We also added support for half-open range predicates.
+
+At the same time, we currently do not support the following:
+
+- Variable MCV sizes and histogram depths
+- Optimizations (Section 4 of the paper), including
+  - Degree sequences on pre-computed primary key/foreign key joins
+  - Group compression of PCFs
+  - Bloom filters on MCV lists
+
+While group compression and bloom filtering "only" improve the resource consumption of SafeBound,
+pre-computed primary key/foreign key joins also increase the accuracy. We do not implement the first
+two because minimizing the resource consumption is currently not a primary goal of our
+implementation. Materializing primary key/foreign key joins is not implemented because this
+essentially constitutes a materialized view, which is an orthogonal optimization which is best
+treated at the schema level.
+
+
+References
+----------
+
+.. [Deeds2023] Kyle Deeds et al.: "SafeBound: A Practical System for Generating Cardinality Bounds"
+   SIGMOD 2023 https://doi.org/10.1145/3588907
+"""
+
 from ._catalog import (
     EqualityConditionedPCF,
     EqualityConditionsRepo,

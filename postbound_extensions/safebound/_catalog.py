@@ -49,6 +49,12 @@ class SafeBoundSpec:
     def default() -> SafeBoundSpec:
         """Use the "hyperparameters" from the original SafeBound paper.
 
+        The values are as follows:
+
+        - `accuracy` = 0.01
+        - `mcv_size` = 1000
+        - `hist_hierarchy_depth` = 7
+
         As a caveat, the original paper frequently mentions that they *typically* use a certain value
         (e.g. `hist_hierarchy_depth` = 7), or that they *generally* pick a values in a certain range
         (e.g. `mcv_size` in [1000, 5000]). In these cases, we use the smaller value or select the
@@ -59,6 +65,20 @@ class SafeBoundSpec:
 
 @dataclass
 class CatalogSpec:
+    """Specifies which (conditioned) PCFs the SafeBound catalog should contain.
+
+    - `equality_cols` map each join column to the set of filter columns for which the catalog should contain
+      equality-conditioned PCFs. These are build based on MCV lists on the filter columns.
+    - `range_cols` map each join column to the set of filter columns for which the catalog should contain
+      range-conditioned PCFs. These are build based on histograms on the filter columns.
+    - `like_cols` map each join column to the set of filter columns for which the catalog should contain
+      like-conditioned PCFs. These are build based on 3-gram lists on the filter columns.
+    - `unconditioned_cols` is the set of join columns for which the catalog should contain unconditioned PCFs. Typically, these
+      should contain all join columns, including those that also have conditioned PCFs.
+
+    Use `empty` to obtain a new catalog spec.
+    """
+
     equality_cols: dict[pb.BoundColumnReference, set[pb.BoundColumnReference]]
     range_cols: dict[pb.BoundColumnReference, set[pb.BoundColumnReference]]
     like_cols: dict[pb.BoundColumnReference, set[pb.BoundColumnReference]]
@@ -124,6 +144,8 @@ class CatalogSpec:
 
 
 class _CatalogVisitor(pb.qal.PredicateVisitor[None]):
+    """Internal utility to traverse the predicates of a query and collect the PCFs to build."""
+
     def __init__(self, spec: CatalogSpec, *, log: pb.util.Logger) -> None:
         self.spec = spec
         self._log = log
@@ -245,7 +267,7 @@ class _CatalogVisitor(pb.qal.PredicateVisitor[None]):
 def _build_join_map(
     query: pb.SqlQuery,
 ) -> dict[pb.TableReference, set[pb.ColumnReference]]:
-    """Maps each base table from the query to its columns that participate in joins."""
+    """Maps each base table of a query to its columns that participate in joins."""
     join_cols = pb.util.set_union(join.columns() for join in query.joins())
     join_map = collections.defaultdict(set)
     for col in join_cols:
@@ -258,6 +280,13 @@ def catalog_from_workload(
     workload: pb.Workload,
     verbose: bool | pb.util.Logger = False,
 ) -> CatalogSpec:
+    """Infers the conditioned PCFs to build based on the predicates of workload queries.
+
+    We collect all equality, range and *LIKE* predicates and add them to the catalog. Unconditioned PCFs are added for all
+    detected join columns.
+
+    Verbose output logs the detected PCFs.
+    """
     logger = wrap_logger(verbose)
     spec = CatalogSpec.empty()
     visitor = _CatalogVisitor(spec, log=logger)
@@ -272,6 +301,14 @@ def catalog_from_workload(
 def catalog_from_schema(
     schema: pb.db.DatabaseSchema, verbose: bool | pb.util.Logger = False
 ) -> CatalogSpec:
+    """Infers the conditioned PCFs to build based on the schema of the database.
+
+    All primary key and foreign key columns are used as join columns and receive an unconditioned PCF. For each other column,
+    we always add an equality-conditioned PCF. If the column is sortable (e.g. integers, timestamps, or text), we also use it
+    for range-conditioning. Lastly, if the column is text, we also use it for like-conditioning.
+
+    Verbose output logs the detected PCFs.
+    """
     logger = wrap_logger(verbose)
     spec = CatalogSpec.empty()
     for table in schema.tables():
@@ -287,6 +324,9 @@ def catalog_from_schema(
         for col in schema.columns(table):
             if schema.foreign_keys_on(col):
                 key_cols.add(col)
+
+            if schema.has_index(col):
+                continue
 
             dtype = schema.datatype(col)
             match dtype:
@@ -318,6 +358,7 @@ def catalog_from_schema(
 def fetch_raw_ds(
     column: pb.ColumnReference, *, database: pb.Database
 ) -> DegreeSequence:
+    """Loads an unconditioned and uncompressed degree sequence for a specific column from the database."""
     mcv_list = database.statistics().most_common_values(column, k=-1, emulated=True)
     return DegreeSequence.from_mcv(mcv_list, column=column)
 
@@ -327,8 +368,30 @@ def fetch_correlated_ds(
     *,
     on: pb.BoundColumnReference,
     database: pb.Database,
-    accuracy: float,
+    accuracy: float = 0.01,
 ) -> PiecewiseConstantFn:
+    """Loads a compressed degree sequence for a specific column that is conditioned on a predicate.
+
+    Parameters
+    ----------
+    predicate : pb.qal.AbstractPredicate
+        The predicate to use for conditioning. This predicate must reference the same table as the `on` column.
+    on : pb.BoundColumnReference
+        The column to load the degree sequence for.
+    database : pb.Database
+        The database to load the degree sequence from.
+    accuracy : float, optional
+        The accuracy parameter to use for compressing the degree sequence. This corresponds to the *c* parameter in the
+        original SafeBound paper. Defaults to 0.01, which is the value used in the paper as well.
+
+    Returns
+    -------
+    The compressed conditioned degree sequence.
+
+    See Also
+    --------
+    valid_compress : The compression algorithm used to compress the degree sequence.
+    """
     select_clause = pb.qal.Select.count_star()
     from_clause = pb.qal.From.create_for(on.table)
     where_clause = pb.qal.Where(predicate)
@@ -349,9 +412,15 @@ def fetch_correlated_ds(
     return piecewiese_linear.deriv()
 
 
-def fetch_column_values[T](
+def fetch_column_values(
     column: pb.BoundColumnReference, database: pb.Database, *, drop_null: bool = False
-) -> list[T]:
+) -> list:
+    """Loads all values of a column.
+
+    Columns are not filtered by any predicate, but NULL values can optionally be dropped. No ordering or duplicate elimination
+    is performed.
+
+    """
     select_clause = pb.qal.Select.create_for(column)
     from_clause = pb.qal.From.create_for(column.table)
     if drop_null:
@@ -403,6 +472,8 @@ class EqualityConditionedPCF[T]:
 
     The column that the PCF is conditioned on (i.e. the column containing the MCV values) is stored in `equality_col`.
     It is the client's responsibility to keep track of the join column that this PCF is associated with.
+
+    Use the `get` method to obtain the PCF for a specific value.
     """
 
     def __init__(
@@ -420,6 +491,7 @@ class EqualityConditionedPCF[T]:
         return self._col
 
     def get(self, key: T) -> PiecewiseConstantFn:
+        """Returns the PCF for the given key if it exists, otherwise returns the unconditioned PCF."""
         fn = self._functions.get(key)
         return fn or self._unconditioned
 
@@ -437,6 +509,10 @@ class EqualityConditionedPCF[T]:
 def load_eq_pcf_json(
     json_data: dict | str, *, database: pb.Database
 ) -> EqualityConditionedPCF:
+    """Reconstructs an equality-conditioned PCF from its JSON representation.
+
+    Access to the database is required to parse the column values based on their data type.
+    """
     if isinstance(json_data, str):
         json_data = json.loads(json_data)
 
@@ -453,11 +529,22 @@ def load_eq_pcf_json(
 
 
 class EqualityConditionsRepo:
+    """Maintains the equality-conditioned PCFs for a set of join columns.
+
+    Use the `lookup` method to obtain the PCF for a specific join column and filter value.
+
+    Parameters
+    ----------
+    join_pcfs : dict[pb.ColumnReference, Sequence[EqualityConditionedPCF]]
+        A mapping from join column to the equality-conditioned PCFs for that column. Each PCF should be conditioned on a
+        different filter column.
+    """
+
     def __init__(
         self,
         join_pcfs: dict[pb.ColumnReference, Sequence[EqualityConditionedPCF]],
     ) -> None:
-        self._functions = join_pcfs
+        self._functions = dict(join_pcfs)
 
     def lookup(
         self,
@@ -466,6 +553,12 @@ class EqualityConditionsRepo:
         filter_col: pb.ColumnReference,
         filter_val: Any,
     ) -> Optional[PiecewiseConstantFn]:
+        """Retrieves the PCF for a join column based on the condition `filter_col = filter_val`.
+
+        If the repository does not contain a PCF conditioned on the filter column, *None* is returned. However, if there is
+        a matching conditioned PCF, but it does not contain the filter value (e.g. because the value is not in the MCV list),
+        its unconditioned PCF is returned.
+        """
         candidates = self._functions.get(join_col)
         if candidates is None:
             return None
@@ -507,10 +600,33 @@ def build_equality_mcvs(
     spec: CatalogSpec,
     *,
     mcv_size: int,
-    accuracy: float,
+    accuracy: float = 0.01,
     database: pb.Database,
-    log: pb.util.Logger,
+    verbose: bool | pb.util.Logger = False,
 ) -> EqualityConditionsRepo:
+    """Fetches all equality-conditioned PCFs for the given catalog.
+
+    Parameters
+    ----------
+    spec : CatalogSpec
+        Specification that contains the join column/equality column pairs to build.
+    mcv_size : int
+        The number of entries for each MCV list. All entries in the MCV list are used to build separate conditioned PCFs, as
+        well as one additional "unconditioned" PCF that combines all non-MCV values.
+    accuracy : float
+        The accuracy to use when compressing the raw degree sequences into PCFs. This corresponds to the *c* parameter in the
+        original SafeBound paper. We default to 0.01, which is the value used in the paper as well.
+    database : pb.Database
+        The database to fetch the degree sequences from.
+    verbose : bool | pb.util.Logger, optional
+        Either a pre-defined logger, or a boolean that indicates whether to log the progress using a default logger.
+
+    Returns
+    -------
+    EqualityConditionsRepo
+        A repository that contains all specified PCFs.
+    """
+    log = wrap_logger(verbose)
     pcfs = collections.defaultdict(list)
 
     for join_col, filter_cols in spec.equality_cols.items():
@@ -555,6 +671,7 @@ def build_equality_mcvs(
 def load_eq_repo_json(
     json_data: dict | str, *, database: pb.Database
 ) -> EqualityConditionsRepo:
+    """Reconstructs an equality-conditioned PCF repository from its JSON representation."""
     if isinstance(json_data, str):
         json_data = json.loads(json_data)
 
@@ -584,6 +701,23 @@ class _RangeCheckRes:
 
 
 class RangeConditionedPCF[T: _HistogramKey]:
+    """Represents the Piecewise Constant Functions for range predicates over a (hierarchy of) histogram(s).
+
+    Each bucket in the histogram contains its own PCF. This PCF models the join column conditioned on the filter column
+    taking values in the bucket's range.
+
+    Optionally, each histogram can have a "higher resolution" child histogram that models the same join column conditioned on
+    the same filter column, but with a finer granularity (i.e. more buckets). This results in PCFs that over-estimate the
+    true frequencies by a smaller margin.
+
+    Use the `get_range`, `get_less` and `get_greater` methods to obtain the PCF for specific predicates.
+
+    Notes
+    -----
+    The original SafeBound paper does not specify how to handle half-open ranges (e.g. ``R.a < 42``), but only closed ranges
+    (e.g. ``R.a BETWEEN 24 AND 42``). Our implementation supports both. See the documentation of `get_less` for details.
+    """
+
     def __init__(
         self,
         buckets: Sequence[PiecewiseConstantFn],
@@ -614,6 +748,7 @@ class RangeConditionedPCF[T: _HistogramKey]:
         self._higher_res = value
 
     def pcf_from_buckets(self, rng: slice) -> PiecewiseConstantFn:
+        """Obtains a PCF by bucket indices. The resulting PCF is the sum of all buckets in the given range."""
         buckets = self._buckets[rng]
         if not buckets:
             raise IndexError("Slice does not contain any buckets: {rng}")
@@ -626,6 +761,14 @@ class RangeConditionedPCF[T: _HistogramKey]:
         return pcf
 
     def get_range(self, lower: T, upper: T) -> Optional[PiecewiseConstantFn]:
+        """Retrieves the PCF for a specific range of values.
+
+        A matching PCF must be enclosed by a single bucket of the histogram. If there exists no such bucket, *None* is
+        returned.
+
+        This function automatically traverses the histogram hierarchy to find the smallest bucket that encompasses the entire
+        range (and thus the PCF that over-estimates the true frequencies by the smallest margin).
+        """
         lo = bisect.bisect_right(self._bounds, lower)
         hi = bisect.bisect_left(self._bounds, upper)
         if lo != hi:
@@ -643,6 +786,31 @@ class RangeConditionedPCF[T: _HistogramKey]:
         return higher_bucket or self._buckets[lo]
 
     def get_less(self, value: T, *, inclusive: bool = False) -> PiecewiseConstantFn:
+        """Obtain the PCF for all values less than (or equal to) a given value.
+
+        Use the `inclusive` flag to distinguish between open and closed ranges (i.e. strict less-than vs. less-or-equal). But
+        see the detailed notes below!
+
+        Notes
+        -----
+        The original SafeBound paper did not specify how to obtain conditioned PCFs for half-open ranges. Our algorithm works
+        as follows: we first compute the distance of the closest (larger) bucket boundary to the given value. If we have a
+        higher resolution child, we also compute the distance on its buckets. If the distance on the current histogram is
+        smaller, we stay at the current resolution. Otherwise, we recurse into the child histogram.
+
+        Once we have decided on the resolution, we simply sum-up the PCFs of all buckets below and including the closest bucket
+        boundary.
+
+        Our implementation currently does not distinguish between open and closed intervals. This is due to limitations
+        of the histogram-based approach. If the value falls somewhere in the middle of a bucket, we can only default to the
+        entire bucket. Likewise, if the value falls exactly on a bucket boundary, we do not know what the first smaller value
+        is and thus have to default once again to the entire bucket (in case of an open interval). Lastly, for closed
+        intervals, we have to include the boundary value anyway and thus use the entire bucket. To circumvent this situation,
+        we would likely need to come up with an entirely different representation for range predicates. We argue that this
+        would no longer be a faithful adaptation of SafeBound. In case we come up with a better solution in the future, we
+        already include the `inclusive` flag in the method signature. This avoids breaking changes - even if this flag has no
+        effect for now.
+        """
         own_err = self._error_less(value, inclusive=inclusive)
         if self._higher_res is None:
             final_idx = own_err.closest_bound + 1
@@ -663,6 +831,15 @@ class RangeConditionedPCF[T: _HistogramKey]:
         return self._higher_res.get_less(value, inclusive=inclusive)
 
     def get_greater(self, value: T, *, inclusive: bool = False) -> PiecewiseConstantFn:
+        """Obtain the PCF for all values greater than (or equal to) a given value.
+
+        Use the `inclusive` flag to distinguish between open and closed ranges (i.e. strict greater-than vs. greater-or-equal).
+        But see the detailed notes below!
+
+        See Also
+        --------
+        get_less : for details on the underyling algorithm and the handling of open vs. closed intervals.
+        """
         own_err = self._error_greater(value, inclusive=inclusive)
         if self._higher_res is None:
             init_idx = own_err.closest_bound
@@ -717,6 +894,7 @@ class RangeConditionedPCF[T: _HistogramKey]:
 def load_range_pcf_json(
     json_data: dict | str, *, database: pb.Database
 ) -> RangeConditionedPCF:
+    """Reconstructs a range-conditioned PCF from its JSON representation."""
     if isinstance(json_data, str):
         json_data = json.loads(json_data)
 
@@ -1414,7 +1592,7 @@ class SafeBoundCatalog:
             mcv_size=stats_spec.mcv_size,
             accuracy=stats_spec.accuracy,
             database=database,
-            log=logger,
+            verbose=verbose,
         )
         range_pcfs_repo = build_histograms(
             catalog_spec,
