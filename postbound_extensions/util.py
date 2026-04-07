@@ -24,6 +24,21 @@ def distinct_values_query(col: pb.ColumnReference) -> pb.SqlQuery:
     )
 
 
+def min_max_values_query(col: pb.ColumnReference) -> pb.SqlQuery:
+    if (table := col.table) is None:
+        raise ValueError("Column must be bound to a table")
+
+    min_col = pb.qal.FunctionExpression.create_min(col)
+    max_col = pb.qal.FunctionExpression.create_max(col)
+    select_clause = pb.qal.Select.create_for([min_col, max_col])
+    from_clause = pb.qal.From.create_for(table)
+
+    return pb.qal.ImplicitSqlQuery(
+        select_clause=select_clause,
+        from_clause=from_clause,
+    )
+
+
 def wrap_logger(logger: bool | pb.util.Logger) -> pb.util.Logger:
     if isinstance(logger, bool):
         return pb.util.standard_logger(logger)

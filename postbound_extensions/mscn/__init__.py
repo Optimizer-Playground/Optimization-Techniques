@@ -15,8 +15,8 @@ THE SOFTWARE.
 
 from ._estimator import MscnEstimator
 from ._featurizer import FeaturizedQuery, MscnFeaturizer
+from ._misc import normalize_labels, qerror_loss, unnormalize_labels
 from ._model import SetConv
-from ._util import normalize_labels, qerror_loss, unnormalize_labels
 
 __all__ = [
     "FeaturizedQuery",

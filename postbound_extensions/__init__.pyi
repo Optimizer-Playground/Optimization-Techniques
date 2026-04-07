@@ -1,3 +1,13 @@
-from . import bao, mscn, safebound, sampler, tonic, ues, fastgres
+from . import bao, fastgres, mscn, preprocessing, safebound, sampler, tonic, ues, util
 
-__all__ = ["bao", "mscn", "ues", "tonic", "safebound", "sampler", "fastgres"]
+__all__ = [
+    "bao",
+    "fastgres",
+    "mscn",
+    "preprocessing",
+    "safebound",
+    "sampler",
+    "tonic",
+    "ues",
+    "util",
+]

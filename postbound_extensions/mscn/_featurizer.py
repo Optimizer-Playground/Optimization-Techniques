@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import itertools
 import json
-from collections.abc import Collection, Generator, Iterable
+from collections.abc import Collection, Generator, Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -194,12 +194,21 @@ class MscnFeaturizer:
     def pre_built(
         catalog_path: Path | str, verbose: bool | pb.util.Logger = False
     ) -> MscnFeaturizer:
+        logger = wrap_logger(verbose)
+
         with open(catalog_path, "r") as f:
+            logger("Loading pre-built MSCN featurizer from", catalog_path)
             catalog = json.load(f)
 
         schema_name = catalog["schema"]
+
+        logger("Parsing tables")
         tables = [pb.parser.load_table_json(t) for t in catalog.get("tables", [])]
+
+        logger("Parsing joins")
         joins = [pb.parser.load_predicate_json(j) for j in catalog.get("joins", [])]
+
+        logger("Parsing filters")
         filter_columns = [
             pb.parser.load_column_json(c) for c in catalog.get("filter_columns", [])
         ]
@@ -211,9 +220,11 @@ class MscnFeaturizer:
         for encoder_entry in catalog.get("column_encoders", []):
             col = pb.parser.load_column_json(encoder_entry["column"])
             assert col is not None and col.table is not None
+            logger("Loading encoder for column", col)
+
             dtype = encoder_entry["dtype"]
             archive_file = encoder_entry["archive_file"]
-            encoder = ColumnEncoder(col.name, col.table.full_name, dtype)
+            encoder = ColumnEncoder(col, dtype)
             encoder.load(Path(archive_file))
             column_encoders[col] = encoder
 
@@ -241,7 +252,7 @@ class MscnFeaturizer:
         catalog_path = Path(catalog_path)
         if catalog_path.exists():
             log("Loading pre-built MSCN featurizer from", catalog_path)
-            return MscnFeaturizer.pre_built(catalog_path)
+            return MscnFeaturizer.pre_built(catalog_path, verbose=verbose)
         log("MSCN featurizer not found. Building new one.")
         featurizer = MscnFeaturizer.online(database, verbose=verbose)
         log("Storing MSCN featurizer to", catalog_path)
@@ -363,6 +374,18 @@ class MscnFeaturizer:
         num_pad = self.n_tables - len(tables)
         return np.pad(enc, {0: (0, num_pad)})
 
+    def encode_tables_batch(
+        self, tables_batch: Iterable[Collection[pb.TableReference]]
+    ) -> tuple[np.ndarray, Sequence[int]]:
+        raw_tables: list[str] = []
+        batch_indexes: list[int] = []
+        for batch in tables_batch:
+            batch_indexes.append(len(batch))
+            raw_tables.extend(str(tab) for tab in batch)
+        tables_arr = np.asarray(raw_tables).reshape(-1, 1)
+        enc = self._tables_encoder.transform(tables_arr)
+        return enc, batch_indexes
+
     def encode_joins(self, joins: Collection[pb.qal.BinaryPredicate]) -> np.ndarray:
         if not joins:
             return np.zeros((self.n_joins, self.n_joins))
@@ -386,6 +409,31 @@ class MscnFeaturizer:
         num_pad = self.n_joins - len(joins)
         return np.pad(enc, {0: (0, num_pad)})
 
+    def encode_joins_batch(
+        self, joins_batch: Iterable[Collection[pb.qal.BinaryPredicate]]
+    ) -> tuple[np.ndarray, Sequence[int]]:
+        raw_joins: list[str] = []
+        batch_indexes: list[int] = []
+        for batch in joins_batch:
+            batch_indexes.append(len(batch))
+            for join in batch:
+                simplified = pb.qal.SimpleJoin(join)
+                key1, key2 = simplified.lhs, simplified.rhs
+
+                key1 = _normalize_column(key1, self._drop_table_aliases)
+                key2 = _normalize_column(key2, self._drop_table_aliases)
+                if key2 < key1:
+                    key1, key2 = key2, key1
+
+                normalized_join = pb.qal.as_predicate(
+                    key1, pb.qal.LogicalOperator.Equal, key2
+                )
+                raw_joins.append(str(normalized_join))
+
+        joins_arr = np.asarray(raw_joins).reshape(-1, 1)
+        enc = self._joins_encoder.transform(joins_arr)
+        return enc, batch_indexes
+
     def encode_filter_predicates(
         self, predicates: Collection[pb.qal.BinaryPredicate]
     ) -> np.ndarray:
@@ -397,30 +445,60 @@ class MscnFeaturizer:
         partial_enc = tuple[np.ndarray, np.ndarray, np.ndarray]
         vectors: dict[pb.ColumnReference, partial_enc] = {}
 
+        columns: list[pb.ColumnReference] = []
+        column_strings: list[str] = []
+        operators: list[str] = []
+        value_indexes: list[int] = []
+        encoder_batches: dict[pb.ColumnReference, list] = {}
+
         for pred in predicates:
             simplified = pb.qal.SimpleFilter(pred)
             col = _normalize_column(simplified.column, self._drop_table_aliases)
-            value_encoder = self._value_encoders[col]
 
-            column = self._columns_encoder.transform([[str(col)]])
-            operator = self._operator_encoder.transform([[simplified.operation.value]])
             assert simplified.operation not in [
                 pb.qal.LogicalOperator.Between,
                 pb.qal.LogicalOperator.In,
             ]
-            value = value_encoder.encode_single(simplified.value)
+            columns.append(col)
+            column_strings.append(str(col))
+            operators.append(simplified.operation.value)
+            if col in encoder_batches:
+                vals = encoder_batches[col]
+                val_idx = len(vals)
+                vals.append(simplified.value)
+                value_indexes.append(val_idx)
+            else:
+                encoder_batches[col] = [simplified.value]
+                value_indexes.append(0)
+
+        encoded_columns = self._columns_encoder.transform(
+            np.array(column_strings).reshape(-1, 1)
+        )
+        encoded_operators = self._operator_encoder.transform(
+            np.array(operators).reshape(-1, 1)
+        )
+        encoded_values = {
+            col: self._value_encoders[col].encode_batch(np.array(vals).reshape(-1, 1))
+            for col, vals in encoder_batches.items()
+        }
+
+        for i, col in enumerate(columns):
+            encoded_col = encoded_columns[i]
+            encoded_op = encoded_operators[i]
+            value_idx = value_indexes[i]
+            encoded_val = encoded_values[col][value_idx]
 
             existing_vector = vectors.get(col)
             if existing_vector is None:
-                vectors[col] = (column, operator, value)
+                vectors[col] = (encoded_col, encoded_op, encoded_val)
                 continue
 
             _, existing_operator, existing_value = existing_vector
-            combined_op = np.maximum(existing_operator, operator)
-            combined_value = np.concat([existing_value, value]).mean().reshape(-1, 1)
-            vectors[col] = (column, combined_op, combined_value)
+            combined_op = np.maximum(existing_operator, encoded_op)
+            combined_value = np.concat([existing_value, encoded_val]).mean().reshape(1)
+            vectors[col] = (encoded_col, combined_op, combined_value)
 
-        enc = np.concat([np.concat(v, axis=1) for v in vectors.values()])
+        enc = np.concat([np.concat(v) for v in vectors.values()])
         num_pad = self.n_columns - len(vectors)
         return np.pad(enc, {0: (0, num_pad)})
 

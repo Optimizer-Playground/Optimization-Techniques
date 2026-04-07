@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import json
 from collections.abc import Iterable
-from dataclasses import asdict
 from pathlib import Path
 from typing import Optional
 
@@ -41,12 +40,16 @@ class MscnEstimator(pb.CardinalityEstimator):
         database: Optional[pb.Database] = None,
         verbose: bool | pb.util.Logger = False,
     ) -> MscnEstimator:
+        logger = wrap_logger(verbose)
+
         with open(catalog_path, "r") as f:
+            logger("Loading pre-trained MSCN estimator from", catalog_path)
             catalog = json.load(f)
 
         database = database or pb.db.current_database()
         featurizer = MscnFeaturizer.pre_built(catalog_path, verbose=verbose)
 
+        logger("Loading MSCN model from", catalog["mscn_model"])
         model_file = Path(catalog["mscn_model"])
         model_program = torch.export.load(model_file)
         model = model_program.module()
@@ -66,6 +69,7 @@ class MscnEstimator(pb.CardinalityEstimator):
         database: Optional[pb.Database] = None,
         verbose: bool | pb.util.Logger = False,
     ) -> MscnEstimator:
+        logger = wrap_logger(verbose)
         catalog_path = Path(catalog_path)
         if catalog_path.exists():
             return MscnEstimator.pre_trained(catalog_path, verbose=verbose)
@@ -77,6 +81,7 @@ class MscnEstimator(pb.CardinalityEstimator):
         estimator = MscnEstimator(
             featurizer=featurizer, database=database, verbose=verbose
         )
+        logger("Training new MSCN estimator")
         estimator.train(samples)
         estimator.store(catalog_path)
         return estimator
@@ -152,10 +157,12 @@ class MscnEstimator(pb.CardinalityEstimator):
         self._log("Preparing training dataset")
         min_card = self.featurizer.norm_min_card
         max_card = self.featurizer.norm_max_card
+        self._log("Parsing queries")
         queries = samples[query_col].map(pb.parse_query)
+        self._log("Featurizing queries")
         featurized = self.featurizer.encode_batch(queries)
-        featurized_components = [asdict(featurized) for featurized in featurized]
-        training_df = pb.util.df.as_df(featurized_components)
+        training_df = pd.DataFrame(featurized)
+        self._log("Normalizing labels")
         training_df["label"] = normalize_labels(samples[label_col], min_card, max_card)
 
         training_data: torch.utils.data.Dataset = PandasDataset(training_df)
