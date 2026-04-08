@@ -95,6 +95,10 @@ class MscnEstimator(pb.CardinalityEstimator):
         verbose: bool | pb.util.Logger = False,
     ) -> None:
         super().__init__()
+        self._cuda = torch.cuda.is_available()
+        self._device = torch.device("cuda" if self._cuda else "cpu")
+        self._log = wrap_logger(verbose)
+
         self._database = database or pb.db.current_database()
         if featurizer is None:
             featurizer = MscnFeaturizer.online(self._database, verbose=verbose)
@@ -107,9 +111,12 @@ class MscnEstimator(pb.CardinalityEstimator):
             n_joins=self.featurizer.n_joins,
             verbose=verbose,
         )
+        if self._cuda:
+            self._log("Using CUDA for MSCN model")
+            self.model = self.model.cuda()
 
         self._sample_query: pb.SqlQuery | None = None
-        self._log = wrap_logger(verbose)
+
         self._verbose = verbose
 
     def calculate_estimate(
@@ -123,7 +130,7 @@ class MscnEstimator(pb.CardinalityEstimator):
             raise ValueError(f"Query fragment not found for query {query}")
         query_fragment = pb.transform.as_star_query(query_fragment)
 
-        featurized = self.featurizer.encode_single(query_fragment)
+        featurized = self.featurizer.encode_single(query_fragment).to(self._device)
 
         with torch.no_grad():
             output = self.model(
@@ -157,8 +164,12 @@ class MscnEstimator(pb.CardinalityEstimator):
         self._log("Preparing training dataset")
         min_card = self.featurizer.norm_min_card
         max_card = self.featurizer.norm_max_card
-        self._log("Parsing queries")
-        queries = samples[query_col].map(pb.parse_query)
+        if isinstance(samples[query_col].iloc[0], pb.SqlQuery):
+            queries = samples[query_col]
+        else:
+            self._log("Parsing queries")
+            queries = samples[query_col].map(pb.parse_query)
+
         self._log("Featurizing queries")
         featurized = self.featurizer.encode_batch(queries)
         training_df = pd.DataFrame(featurized)
@@ -176,8 +187,8 @@ class MscnEstimator(pb.CardinalityEstimator):
         for epoch in range(epochs):
             loss_total = 0.0
             for batch in data_loader:
-                features = batch[:-1]
-                labels = batch[-1]
+                features = self._move_features(batch[:-1])
+                labels = batch[-1].to(self._device, non_blocking=True)
                 optimizer.zero_grad()
                 outputs = self.model(*features)
                 loss = qerror_loss(outputs, labels.float(), min_card, max_card)
@@ -247,3 +258,6 @@ class MscnEstimator(pb.CardinalityEstimator):
 
     def describe(self) -> pb.util.jsondict:
         return {"name": "MSCN"}
+
+    def _move_features(self, features: list[torch.Tensor]) -> list[torch.Tensor]:
+        return [feature.to(self._device, non_blocking=True) for feature in features]

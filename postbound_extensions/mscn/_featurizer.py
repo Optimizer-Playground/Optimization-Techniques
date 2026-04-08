@@ -43,14 +43,14 @@ def _normalize_join_key(
 
 @dataclass
 class FeaturizedQuery:
-    tables: torch.FloatTensor
-    joins: torch.FloatTensor
-    predicates: torch.FloatTensor
-    tables_mask: torch.FloatTensor
-    joins_mask: torch.FloatTensor
-    predicates_mask: torch.FloatTensor
+    tables: torch.Tensor
+    joins: torch.Tensor
+    predicates: torch.Tensor
+    tables_mask: torch.Tensor
+    joins_mask: torch.Tensor
+    predicates_mask: torch.Tensor
 
-    def aslist(self) -> list[torch.FloatTensor]:
+    def aslist(self) -> list[torch.Tensor]:
         return [
             self.tables,
             self.joins,
@@ -59,6 +59,16 @@ class FeaturizedQuery:
             self.joins_mask,
             self.predicates_mask,
         ]
+
+    def to(self, device: torch.device) -> FeaturizedQuery:
+        return FeaturizedQuery(
+            tables=self.tables.to(device),
+            joins=self.joins.to(device),
+            predicates=self.predicates.to(device),
+            tables_mask=self.tables_mask.to(device),
+            joins_mask=self.joins_mask.to(device),
+            predicates_mask=self.predicates_mask.to(device),
+        )
 
 
 class MscnFeaturizer:
@@ -498,7 +508,7 @@ class MscnFeaturizer:
             combined_value = np.concat([existing_value, encoded_val]).mean().reshape(1)
             vectors[col] = (encoded_col, combined_op, combined_value)
 
-        enc = np.concat([np.concat(v) for v in vectors.values()])
+        enc = np.stack([np.concat(v) for v in vectors.values()])
         num_pad = self.n_columns - len(vectors)
         return np.pad(enc, {0: (0, num_pad)})
 
