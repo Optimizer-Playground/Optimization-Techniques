@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import itertools
 import json
+import warnings
 from collections.abc import Collection, Generator, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -39,6 +40,13 @@ def _normalize_join_key(
     if key2 < key1:
         key1, key2 = key2, key1
     return pb.qal.as_predicate(key1, pb.qal.LogicalOperator.Equal, key2)
+
+
+class FeaturizationWarning(UserWarning):
+    pass
+
+
+warnings.simplefilter("ignore", category=FeaturizationWarning)
 
 
 @dataclass
@@ -137,7 +145,7 @@ class MscnFeaturizer:
         comparison_operators: set[pb.qal.LogicalOperator] = set()
 
         for query in workload.queries():
-            tables.update(query.tables())
+            tables.update({tab.drop_alias() for tab in query.tables()})
 
             for join in query.joins():
                 simplified = pb.qal.SimpleJoin(join)
@@ -145,6 +153,13 @@ class MscnFeaturizer:
                 joins.add(normalized_join)
 
             for pred in query.filters():
+                if not pb.qal.SimpleFilter.can_wrap(pred):
+                    warnings.warn(
+                        f"Skipping unsupported predicate {pred}",
+                        category=FeaturizationWarning,
+                        stacklevel=2,
+                    )
+                    continue
                 simplified = pb.qal.SimpleFilter(pred)
                 col = _normalize_column(simplified.column, drop_table_aliases=True)
                 filter_columns.add(col)
@@ -469,13 +484,28 @@ class MscnFeaturizer:
         encoder_batches: dict[pb.ColumnReference, list] = {}
 
         for pred in predicates:
+            if not pb.qal.SimpleFilter.can_wrap(pred):
+                warnings.warn(
+                    f"Skipping unsupported predicate {pred}",
+                    category=FeaturizationWarning,
+                    stacklevel=2,
+                )
+                continue
+
             simplified = pb.qal.SimpleFilter(pred)
             col = _normalize_column(simplified.column, self._drop_table_aliases)
-
-            assert simplified.operation not in [
+            unsupported_ops = [
                 pb.qal.LogicalOperator.Between,
                 pb.qal.LogicalOperator.In,
             ]
+            if simplified.operation in unsupported_ops:
+                warnings.warn(
+                    f"Skipping unsupported predicate {pred}",
+                    category=FeaturizationWarning,
+                    stacklevel=2,
+                )
+                continue
+
             columns.append(col)
             column_strings.append(str(col))
             operators.append(simplified.operation.value)
