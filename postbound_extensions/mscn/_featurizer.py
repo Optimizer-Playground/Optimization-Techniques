@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import itertools
 import json
-from collections.abc import Collection, Generator, Iterable, Sequence
+from collections.abc import Collection, Generator, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -21,7 +21,7 @@ def _normalize_column(
     col: pb.ColumnReference, drop_table_aliases: bool
 ) -> pb.ColumnReference:
     if drop_table_aliases:
-        return pb.ColumnReference(col.name, col.table.drop_alias())
+        return col.drop_table_alias()
     return col
 
 
@@ -104,7 +104,7 @@ class MscnFeaturizer:
         cards.sort(reverse=True)
         outer_extent = np.prod(cards[:3])
 
-        column_encoders = {
+        column_encoders: Mapping[pb.ColumnReference, ColumnEncoder] = {
             col: ColumnEncoder.online(col, database=database, verbose=verbose)
             for col in columns
         }
@@ -256,6 +256,7 @@ class MscnFeaturizer:
         catalog_path: Path | str,
         *,
         database: pb.Database,
+        workload: Optional[pb.Workload] = None,
         verbose: bool | pb.util.Logger = False,
     ) -> MscnFeaturizer:
         log = wrap_logger(verbose)
@@ -264,7 +265,13 @@ class MscnFeaturizer:
             log("Loading pre-built MSCN featurizer from", catalog_path)
             return MscnFeaturizer.pre_built(catalog_path, verbose=verbose)
         log("MSCN featurizer not found. Building new one.")
-        featurizer = MscnFeaturizer.online(database, verbose=verbose)
+        featurizer = (
+            MscnFeaturizer.infer_from_workload(
+                workload, database=database, verbose=verbose
+            )
+            if workload
+            else MscnFeaturizer.online(database, verbose=verbose)
+        )
         log("Storing MSCN featurizer to", catalog_path)
         featurizer.store(catalog_path, encoder_dir=None)
         return featurizer
@@ -279,7 +286,7 @@ class MscnFeaturizer:
         *,
         min_card: pb.Cardinality,
         max_card: pb.Cardinality,
-        value_encoders: dict[pb.ColumnReference, ColumnEncoder],
+        value_encoders: Mapping[pb.ColumnReference, ColumnEncoder],
         drop_table_aliases: bool,
         verbose: bool | pb.util.Logger = False,
     ) -> None:

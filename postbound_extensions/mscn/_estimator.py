@@ -66,6 +66,7 @@ class MscnEstimator(pb.CardinalityEstimator):
         catalog_path: Path | str,
         *,
         samples: pd.DataFrame,
+        workload: Optional[pb.Workload] = None,
         database: Optional[pb.Database] = None,
         verbose: bool | pb.util.Logger = False,
     ) -> MscnEstimator:
@@ -76,7 +77,7 @@ class MscnEstimator(pb.CardinalityEstimator):
 
         database = database or pb.db.current_database()
         featurizer = MscnFeaturizer.load_or_build(
-            catalog_path, database=database, verbose=verbose
+            catalog_path, workload=workload, database=database, verbose=verbose
         )
         estimator = MscnEstimator(
             featurizer=featurizer, database=database, verbose=verbose
