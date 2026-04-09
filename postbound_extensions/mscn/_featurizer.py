@@ -173,7 +173,8 @@ class MscnFeaturizer:
 
         min_card = pb.Cardinality.of(min_card)
         max_card = pb.Cardinality.of(max_card)
-        min_card = pb.Cardinality.of(max(min_card, 0))
+        if min_card.is_unknown():
+            min_card = pb.Cardinality(0)
         if max_card.is_unknown():
             cards = [database.statistics().total_rows(tab) or 0 for tab in tables]
             cards.sort(reverse=True)
@@ -199,12 +200,37 @@ class MscnFeaturizer:
         *,
         query_col: str = "query",
         cardinality_col: str = "cardinality",
+        workload: Optional[pb.Workload] = None,
         database: Optional[pb.Database] = None,
         verbose: bool | pb.util.Logger = False,
     ) -> MscnFeaturizer:
+        logger = wrap_logger(verbose)
         df = pd.read_csv(df) if not isinstance(df, pd.DataFrame) else df
-        queries = df[query_col].map(pb.parse_query)
-        workload = pb.Workload({i: query for i, query in enumerate(queries, start=1)})
+        if isinstance(df[query_col].iloc[0], pb.SqlQuery):
+            queries = df[query_col]
+        else:
+            logger("Parsing training queries")
+            queries = df[query_col].map(pb.parse_query)
+
+        # If we have both a workload and a set of training samples, we need to be a bit careful:
+        # The MSCN featurization is very picky about allowed columns and tables due to the
+        # extensive usage of one-hot encodings. Therefore, we need to make sure that test workload
+        # and training samples use exactly the same set of columns. If we were to build the
+        # featurization over the samples, we would encouter an error as soon as an column that is
+        # only in the test set is encoutered and vice-versa.
+        # Therefore, we build the featurization over the union of train and test queries.
+
+        if workload is None:
+            workload = pb.Workload(
+                {i: query for i, query in enumerate(queries, start=1)}
+            )
+        else:
+            sample_queries: dict[str, pb.SqlQuery] = {
+                f"train_{i}": query for i, query in enumerate(queries, start=1)
+            }
+            sample_queries.update(workload)
+            workload = pb.Workload(sample_queries)
+
         min_card = df[cardinality_col].min()
         max_card = df[cardinality_col].max()
         return MscnFeaturizer.infer_from_workload(

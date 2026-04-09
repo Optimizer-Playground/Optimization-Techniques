@@ -26,7 +26,7 @@ import pandas as pd
 import postbound as pb
 import torch
 
-from ..util import PandasDataset, wrap_logger
+from ..util import PandasDataset, load_training_samples, wrap_logger
 from ._featurizer import MscnFeaturizer
 from ._misc import expand_dims, normalize_labels, qerror_loss, unnormalize_labels
 from ._model import SetConv
@@ -65,7 +65,7 @@ class MscnEstimator(pb.CardinalityEstimator):
     def load_or_build(
         catalog_path: Path | str,
         *,
-        samples: pd.DataFrame,
+        samples: pd.DataFrame | Path | str,
         workload: Optional[pb.Workload] = None,
         database: Optional[pb.Database] = None,
         verbose: bool | pb.util.Logger = False,
@@ -73,12 +73,21 @@ class MscnEstimator(pb.CardinalityEstimator):
         logger = wrap_logger(verbose)
         catalog_path = Path(catalog_path)
         if catalog_path.exists():
+            logger("Catalog exists, loading pre-trained MSCN model")
             return MscnEstimator.pre_trained(catalog_path, verbose=verbose)
 
+        logger("Catalog not found, training new MSCN model")
         database = database or pb.db.current_database()
-        featurizer = MscnFeaturizer.load_or_build(
-            catalog_path, workload=workload, database=database, verbose=verbose
+        samples = load_training_samples(samples, query_col="query", verbose=verbose)
+
+        # See comment in MscnFeaturizer.infer_from_samples() on why we have to use this
+        # strategy instead of calling infer_from_workload() or load_or_build()
+        logger("Determining MSCN features")
+        featurizer = MscnFeaturizer.infer_from_samples(
+            samples, workload=workload, database=database, verbose=verbose
         )
+        featurizer.store(catalog_path)
+
         estimator = MscnEstimator(
             featurizer=featurizer, database=database, verbose=verbose
         )
