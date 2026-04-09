@@ -423,7 +423,9 @@ def default_hint_sets() -> list[pb.PhysicalOperatorAssignment]:
     return arms
 
 
-class BaoOptimizer(pb.CompleteOptimizationAlgorithm, pb.PhysicalOperatorSelection):
+class BaoOptimizer(
+    pb.CompleteOptimizationAlgorithm, pb.PhysicalOperatorSelection, pb.CostModel
+):
     @staticmethod
     def pre_trained(
         archive: Path | str,
@@ -577,6 +579,12 @@ class BaoOptimizer(pb.CompleteOptimizationAlgorithm, pb.PhysicalOperatorSelectio
             f"Selected arm {idxmin} ({_stringify_hint_set(hint_set)}) for query {query}"
         )
         return hint_set
+
+    def estimate_cost(self, query: pb.SqlQuery, plan: pb.QueryPlan) -> pb.Cost:
+        cache_state = DatabaseCacheState(self._db)
+        featurized = self._featurizer.encode_plan(plan, cache_state=cache_state)
+        prediction = self._tcnn([featurized])
+        return prediction.item()
 
     def add_experience(
         self, plan: pb.QueryPlan, runtime_ms: float | None = None
