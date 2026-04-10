@@ -54,7 +54,7 @@ def normalize_labels(labels: Iterable[float]) -> tuple[np.ndarray, float, float]
 
 @overload
 def normalize_labels(
-    labels: Iterable[float], *, min_val: float, max_val: float
+    labels: Iterable[float], min_val: float, max_val: float
 ) -> np.ndarray: ...
 
 

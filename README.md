@@ -24,7 +24,7 @@ Optimizer prototypes are implemented using the [PostBOUND framework](https://git
   - [ ] documentation
 - [ ] MSCN
   - [x] baseline implementation
-  - [ ] documentation
+  - [x] documentation
 - [ ] BAO
   - [x] baseline implementation
   - [ ] documentation

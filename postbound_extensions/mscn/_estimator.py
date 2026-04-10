@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Iterable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
@@ -32,7 +33,90 @@ from ._misc import expand_dims, normalize_labels, qerror_loss, unnormalize_label
 from ._model import SetConv
 
 
+@dataclass
+class MscnHyperParams:
+    """Hyper parameters used for the model training.
+
+    By default, we use the same hyper parameters as the original MSCN paper. These are as follows:
+
+    - training epochs: 70
+    - learning rate: 0.001
+    - batch size: 16
+    """
+
+    epochs: int = 70
+    learning_rate: float = 0.001
+    batch_size: int = 16
+
+    @staticmethod
+    def default() -> MscnHyperParams:
+        return MscnHyperParams()
+
+    def __json__(self) -> pb.util.jsondict:
+        return {
+            "epochs": self.epochs,
+            "learning_rate": self.learning_rate,
+            "batch_size": self.batch_size,
+        }
+
+
 class MscnEstimator(pb.CardinalityEstimator):
+    """MSCN is a supervised learned cardinality estimator based on deep learning.
+
+    An MSCN model must be trained on a large corpus of (query, cardinality) pairs before it can be
+    used for estimation. Supply the samples using the `train` method.
+
+    A key component of the estimator is an appropriate featurization method for the queries.
+    The entire logic of this process is encapsulated in an `MscnFeaturizer`. The featurization
+    scheme can be inferred from multiple different data sources. See the documentation of
+    `MscnFeaturizer` for more details.
+
+    Creating a new estimator
+    ------------------------
+    A fresh estimator can be obtained by simply creating a new instance of this class. By default,
+    this will infer the featurization scheme from the database schema (see `MscnFeaturizer.online`).
+    This can be customized by providing a pre-built featurizer.
+
+    The `load_or_build` method provides a convenient entry point to avoid continuously re-training
+    a model: It tries to load the estimator from a specific file path. If it does not exist, it will
+    be created, trained, and stored at the desired location. Any subsequent calls to `load_or_build`
+    will then load the pre-trained model.
+
+    Parameters
+    ----------
+    model: Optional[SetConv]
+        The actual MSCN model to use. If not provided, a new MSCN instance with random weights
+        will be created.
+    featurizer: Optional[MscnFeaturizer]
+        The featurizer to use for encoding the queries. If not provided, it will be inferred from
+        the database schema.
+    database: Optional[pb.Database]
+        The target database to run the optimized queries on. This is only used for the
+        online-inference of the featurization scheme. If not provided, it will be loaded from the
+        database pool. It is an error to use the MSCN estimator without an active database
+        connection.
+    verbose: bool | pb.util.Logger
+        Whether to print verbose logs during the training and estimation process.
+
+    Attributes
+    ----------
+    model: SetConv
+        The underlying MSCN model used for estimation.
+    featurizer: MscnFeaturizer
+        The featurizer used for encoding the queries.
+
+    See Also
+    --------
+    MscnFeaturizer :
+        Our (adapted) query featurization scheme. It is based on the original MSCN paper but
+        extended to handle more complex database schemas.
+
+    References
+    ----------
+    .. Andreas Kipf et al.: "Learned Cardinalities: Estimating Correlated Joins with Deep Learning"
+       (CIDR 2019) https://vldb.org/cidrdb/papers/2019/p101-kipf-cidr19.pdf
+    """
+
     @staticmethod
     def pre_trained(
         catalog_path: Path | str,
@@ -40,25 +124,52 @@ class MscnEstimator(pb.CardinalityEstimator):
         database: Optional[pb.Database] = None,
         verbose: bool | pb.util.Logger = False,
     ) -> MscnEstimator:
+        """Loads an MSCN estimator from disk.
+
+        This is the inverse operation to `store`. Since `store` also takes care of persisting the
+        featurizer, it is loaded as part of this process. The `catalog_path` must point to a valid
+        JSON file containing the model info.
+
+        MSCN always requires an active database connection, even if this is only used for the
+        featurizer. Therefore, you either need to supply the database explicitly or ensure that
+        there is a default database in the database pool.
+
+        See Also
+        ---------
+        store : The inverse operation to this method. Persists an MSCN estimator to disk.
+        """
         logger = wrap_logger(verbose)
 
+        logger("Loading pre-trained MSCN estimator from", catalog_path)
         with open(catalog_path, "r") as f:
-            logger("Loading pre-trained MSCN estimator from", catalog_path)
             catalog = json.load(f)
 
         database = database or pb.db.current_database()
         featurizer = MscnFeaturizer.pre_built(catalog_path, verbose=verbose)
 
         logger("Loading MSCN model from", catalog["mscn_model"])
-        model_file = Path(catalog["mscn_model"])
-        model_program = torch.export.load(model_file)
-        model = model_program.module()
+        weights = torch.load(catalog["mscn_model"])
+        model = SetConv(
+            n_tables=featurizer.n_tables,
+            n_columns=featurizer.n_columns,
+            n_operators=featurizer.n_operators,
+            n_joins=featurizer.n_joins,
+            verbose=verbose,
+        )
+        model.load_state_dict(weights)
+
+        raw_hyper_params = catalog.get("hyper_parameters")
+        training_params = (
+            MscnHyperParams(**raw_hyper_params)
+            if raw_hyper_params is not None
+            else None
+        )
 
         estimator = MscnEstimator(
             model=model, featurizer=featurizer, database=database, verbose=verbose
         )
+        estimator._training_params = training_params
 
-        estimator._sample_query = pb.parse_query(catalog["export_query"])
         return estimator
 
     @staticmethod
@@ -68,8 +179,26 @@ class MscnEstimator(pb.CardinalityEstimator):
         samples: pd.DataFrame | Path | str,
         workload: Optional[pb.Workload] = None,
         database: Optional[pb.Database] = None,
+        training_params: MscnHyperParams = MscnHyperParams.default(),
         verbose: bool | pb.util.Logger = False,
     ) -> MscnEstimator:
+        """Integrated model training and storage procedure.
+
+        If an MSCN estimator has already been stored to `catalog_path`, it will simply be loaded.
+        Otherwise, a new model will be created and trained using the `samples` and according to the
+        `training_params`. The featurizer is inferred based on the samples and an optional
+        evaluation workload.
+
+        The `workload` is only used to fine-tune the featurizer. If it is not provided, the
+        featurization scheme will only be based on the training samples.
+
+        Once the model has been trained, it will be stored at `catalog_path` along with the
+        featurizer.
+
+        See Also
+        ---------
+        MscnFeaturizer.infer_from_samples : Inference logic for the featurizer
+        """
         logger = wrap_logger(verbose)
         catalog_path = Path(catalog_path)
         if catalog_path.exists():
@@ -86,20 +215,19 @@ class MscnEstimator(pb.CardinalityEstimator):
         featurizer = MscnFeaturizer.infer_from_samples(
             samples, workload=workload, database=database, verbose=verbose
         )
-        featurizer.store(catalog_path)
 
         estimator = MscnEstimator(
             featurizer=featurizer, database=database, verbose=verbose
         )
         logger("Training new MSCN estimator")
-        estimator.train(samples)
+        estimator.train(samples, hyper_params=training_params)
         estimator.store(catalog_path)
         return estimator
 
     def __init__(
         self,
         *,
-        model: Optional[SetConv | torch.fx.GraphModule] = None,
+        model: Optional[SetConv] = None,
         featurizer: Optional[MscnFeaturizer] = None,
         database: Optional[pb.Database] = None,
         verbose: bool | pb.util.Logger = False,
@@ -125,8 +253,7 @@ class MscnEstimator(pb.CardinalityEstimator):
             self._log("Using CUDA for MSCN model")
             self.model = self.model.cuda()
 
-        self._sample_query: pb.SqlQuery | None = None
-
+        self._training_params: MscnHyperParams | None = None
         self._verbose = verbose
 
     def calculate_estimate(
@@ -164,10 +291,32 @@ class MscnEstimator(pb.CardinalityEstimator):
         *,
         query_col: str = "query",
         label_col: str = "cardinality",
-        epochs: int = 70,
-        lr: float = 0.001,
-        batch_size: int = 16,
+        hyper_params: MscnHyperParams = MscnHyperParams.default(),
     ) -> None:
+        """Trains the MSCN model on a specific set of training samples.
+
+        If the model has already been trained, the additional samples will be used as a fine-tuning
+        step.
+
+        Parameters
+        ----------
+        samples: pd.DataFrame
+            The training samples to use for training the model. This must be a DataFrame containing
+            one column with the SQL queries and another column containing the cardinalities of those
+            queries. Additional columns are ignored. If the query column contains parsed PostBOUND
+            SQL queries, these will be used directly. Otherwise, queries will be parsed.
+        query_col: str
+            The name of the column containing the SQL queries. Default is "query".
+        label_col: str
+            The name of the column containing the cardinality labels. Default is "cardinality".
+        hyper_params: MscnHyperParams
+            The hyper parameters to use for training the model. By default, we use the same
+            hyper parameters as the original MSCN paper.
+
+        See Also
+        --------
+        MscnHyperParams
+        """
         if not len(samples):
             return
 
@@ -189,12 +338,16 @@ class MscnEstimator(pb.CardinalityEstimator):
         training_data: torch.utils.data.Dataset = PandasDataset(training_df)
 
         self.model.train()
-        optimizer = torch.optim.Adam(self.model.parameters(), lr=lr)
+        optimizer = torch.optim.Adam(
+            self.model.parameters(), lr=hyper_params.learning_rate
+        )
 
-        data_loader = torch.utils.data.DataLoader(training_data, batch_size=batch_size)
+        data_loader = torch.utils.data.DataLoader(
+            training_data, batch_size=hyper_params.batch_size
+        )
 
         self._log("Starting training")
-        for epoch in range(epochs):
+        for epoch in range(hyper_params.epochs):
             loss_total = 0.0
             for batch in data_loader:
                 features = self._move_features(batch[:-1])
@@ -206,11 +359,13 @@ class MscnEstimator(pb.CardinalityEstimator):
                 loss.backward()
                 optimizer.step()
 
-            epoch_str = str(epoch + 1).rjust(len(str(epochs)))
-            self._log(f"Epoch: {epoch_str} / {epochs} :: loss = {loss_total}")
+            epoch_str = str(epoch + 1).rjust(len(str(hyper_params.epochs)))
+            self._log(
+                f"Epoch: {epoch_str} / {hyper_params.epochs} :: loss = {loss_total}"
+            )
 
         self.model.eval()
-        self._sample_query = queries.iloc[0] if not queries.empty else None
+        self._training_params = hyper_params
 
     def store(
         self,
@@ -219,17 +374,39 @@ class MscnEstimator(pb.CardinalityEstimator):
         encoder_dir: Optional[Path | str] = None,
         model_file: Optional[Path | str] = None,
     ) -> Path:
-        if self._sample_query is None:
-            raise RuntimeError("Estimator must be trained before it can be stored")
+        """Persists model weights and featurization info at the specified location.
 
+        Parameters
+        ----------
+        catalog: Path | str
+            The path to the JSON file where the model info should be stored. If the file already
+            exists, it will be overwritten. If this is a directory, it will be augmented to
+            "mscn-catalog-{schema}.json", where {schema} is the name of the database schema.
+            The catalog will contain both model and featurization info.
+        encoder_dir: Optional[Path | str]
+            Directory where the featurizer should store its raw column encoders. By default, this
+            is the same directory as the one containing the catalog.
+        model_file: Optional[Path | str]
+            The path where the model weights should be stored. This defaults to "mscn-{schema}.pt"
+            and will be created in the same directory as the catalog.
+
+        See Also
+        --------
+        pre_trained : The inverse operation to this method. Loads an MSCN estimator from disk.
+        MscnFeaturizer.store : Export logic for the featurizer
+        """
+        schema = self._database.database_name()
         catalog = Path(catalog)
+        if catalog.is_dir():
+            catalog = catalog / f"mscn-catalog-{schema}.json"
+
         if encoder_dir is None:
             encoder_dir = catalog.parent
         else:
             encoder_dir = Path(encoder_dir)
+
         if model_file is None:
-            schema = self._database.database_name()
-            model_file = catalog.parent / f"mscn-{schema}.pt2"
+            model_file = catalog.parent / f"mscn-{schema}.pt"
         else:
             model_file = Path(model_file)
 
@@ -238,36 +415,24 @@ class MscnEstimator(pb.CardinalityEstimator):
 
         self.featurizer.store(catalog, encoder_dir=encoder_dir)
 
-        self._log("Creating exportable program for MSCN model")
-        sample_input = self.featurizer.encode_single(self._sample_query)
-
-        program = torch.export.export(
-            self.model,
-            (
-                expand_dims(sample_input.tables),
-                expand_dims(sample_input.joins),
-                expand_dims(sample_input.predicates),
-                expand_dims(sample_input.tables_mask),
-                expand_dims(sample_input.joins_mask),
-                expand_dims(sample_input.predicates_mask),
-            ),
-        )
-
         self._log("Storing MSCN model to", model_file)
-        torch.export.save(program, model_file)
+        weights = self.model.state_dict()
+        torch.save(weights, model_file)
 
         self._log("Finalizing catalog at", catalog)
         with open(catalog, "r+") as f:
             catalog = json.load(f)
             catalog["mscn_model"] = str(model_file)
-            catalog["export_query"] = str(self._sample_query)
+            catalog["hyper_parameters"] = (
+                self._training_params.__json__() if self._training_params else None
+            )
             f.seek(0)
             json.dump(catalog, f)
 
-        return model_file
+        return catalog
 
     def describe(self) -> pb.util.jsondict:
-        return {"name": "MSCN"}
+        return {"name": "MSCN", "hyperparameters": self._training_params}
 
     def _move_features(self, features: list[torch.Tensor]) -> list[torch.Tensor]:
         return [feature.to(self._device, non_blocking=True) for feature in features]
