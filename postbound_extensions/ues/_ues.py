@@ -1,8 +1,25 @@
-""""""
+"""UES join ordering algorithm and operator selection for PostBOUND
+
+Copyright (C) 2026 Rico Bergmann
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program.  If not, see <https://www.gnu.org/licenses/>.
+"""
 
 from __future__ import annotations
 
 import collections
+from collections.abc import Iterable
 from typing import Literal, Optional
 
 import postbound as pb
@@ -13,12 +30,49 @@ JoinKey = tuple[pb.ColumnReference, pb.ColumnReference]
 JoinPartners = set[JoinKey]
 
 
-class UESJoinOrdering(pb.JoinOrderOptimization):
+class UesJoinOrdering(pb.JoinOrderOptimization, pb.CardinalityEstimator):
+    """UES is a pessimistic join ordering algorithm that combines upper bounds with a greedy enumeration strategy.
+
+    UES does not need any advanced statistics. Instead, it relies on the target database and its statistics catalog to
+    obtain cardinality estimates for base tables and maximum frequencies for join columns. One requirement of UES is that
+    these estimates are as accurate as possible. Therefore, by default, we emulate perfect statistics via the PostBOUND API.
+    This behavior can be controlled via the `estimations` parameter.
+
+    In addition to the join ordering algorithm, we also allow the upper bounds calculated by UES to be used as cardinality
+    estimates. However, be aware that UES did not design these bounds as replacements for full cardinality estimates. Instead,
+    they are tailored to the needs of the join ordering algorithm. Therefore, using them as estimates outside of the join
+    ordering context goes beyond the original design of UES and results might not be particularly meaningful.
+    As a sidenote, we implement the cardinality estimation logic by internally calculating the corresponding join order.
+    Therefore, estimation time might be surprisingly high.
+
+    Parameters
+    ----------
+    database : Optional[pb.Database], optional
+        The database to obtain all statistics and schema information. If not provided, the database will be inferred from
+        PostBOUND's database pool.
+    estimations : Literal["native", "precise"], optional
+        How the statistics should be obtained. *precise* means that we emulate perfect statistics. Internally, this is achieved
+        by issuing actual SQL queries to obtain the true value for base table cardinalities and maximum frequencies. *native*
+        means that we use the estimates provided by the database's statistics catalog and cardinality estimator.
+        This will improve optimization performance by a lot, but the resulting join order might be worse due to inaccurate
+        estimates. Furthermore, be aware that the *native* option goes against the original design of UES and is not
+        recommended in an actual benchmarking scenario. The default is *precise*.
+
+    See Also
+    --------
+    UesOperators : The corresponding operator selection logic for UES.
+
+    References
+    ----------
+    Axel Hertzschuch et al.: Simplicity Done Right for Join Ordering (CIDR 2021)
+    https://vldb.org/cidrdb/papers/2021/cidr2021_paper01.pdf
+    """
+
     def __init__(
         self,
         *,
         database: Optional[pb.Database] = None,
-        estimations: Literal["native", "precise"] = "native",
+        estimations: Literal["native", "precise"] = "precise",
     ) -> None:
         self._database = database or pb.db.current_database()
 
@@ -26,8 +80,8 @@ class UESJoinOrdering(pb.JoinOrderOptimization):
         self._stats = self._database.statistics()
         self._stats.emulated = emulate_stats
 
-    def optimize_join_order(self, query: pb.SqlQuery) -> pb.JoinTree:
-        join_tree = pb.JoinTree()
+    def optimize_join_order(self, query: pb.SqlQuery) -> pb.JoinTree[pb.Cardinality]:
+        join_tree: pb.JoinTree[pb.Cardinality] = pb.JoinTree()
         expanding_tables, filtering_tables = self._determine_table_types(query)
         upper: dict[Intermediate, UpperBound] = {}
         max_freqs = self._init_max_freqs(query)
@@ -89,13 +143,13 @@ class UESJoinOrdering(pb.JoinOrderOptimization):
                         dangling_pks.append(pk_table)
                         continue
                     pk_fk_tree = pk_fk_tree.join_with(pk_table)
-                join_tree = join_tree.join_with(pk_fk_tree)
+                join_tree = join_tree.join_with(pk_fk_tree, annotation=best_bound)
                 for dangling_pk in dangling_pks:
-                    join_tree = join_tree.join_with(dangling_pk)
+                    join_tree = join_tree.join_with(dangling_pk, annotation=best_bound)
             else:
-                join_tree = join_tree.join_with(best_candidate)
+                join_tree = join_tree.join_with(best_candidate, annotation=best_bound)
                 for pk_table in available_pks:
-                    join_tree = join_tree.join_with(pk_table)
+                    join_tree = join_tree.join_with(pk_table, annotation=best_bound)
 
             upper[frozenset(join_tree.tables())] = best_bound
             for table in join_tree.tables():
@@ -118,6 +172,17 @@ class UESJoinOrdering(pb.JoinOrderOptimization):
             filtering_tables.difference_update(available_pks)
 
         return join_tree
+
+    def calculate_estimate(
+        self,
+        query: pb.SqlQuery,
+        intermediate: pb.TableReference | Iterable[pb.TableReference],
+    ) -> pb.Cardinality:
+        subquery = pb.transform.extract_query_fragment(query, intermediate)
+        if subquery is None:
+            return pb.Cardinality.unknown()
+        join_tree = self.optimize_join_order(subquery)
+        return join_tree.annotation
 
     def describe(self) -> pb.util.jsondict:
         return {"name": "UES", "type": "original"}
@@ -268,13 +333,13 @@ class UESJoinOrdering(pb.JoinOrderOptimization):
 
     def _max_freq(self, column: pb.ColumnReference) -> pb.Cardinality:
         assert column.table, "Unbound column"
-        mcv = self._database.statistics().most_common_values(column, k=1)[0]
+        mcv = self._stats.most_common_values(column, k=1)[0]
         if mcv:
             return pb.Cardinality(mcv[1])
 
         # No MCV - assume uniform distribution
-        total_card = self._database.statistics().total_rows(column.table)
-        distinct_count = self._database.statistics().distinct_values(column)
+        total_card = self._stats.total_rows(column.table)
+        distinct_count = self._stats.distinct_values(column)
         assert total_card is not None
 
         if not distinct_count:
@@ -282,7 +347,18 @@ class UESJoinOrdering(pb.JoinOrderOptimization):
         return pb.Cardinality(total_card // distinct_count)
 
 
-class UESOperators(pb.PhysicalOperatorSelection):
+class UesOperators(pb.PhysicalOperatorSelection):
+    """UES-specific selection of physical operators.
+
+    UES employs a very simple operator "selection" that essentially enforces all joins to be executed as hash joins.
+
+    See `UesJoinOrdering` for more details on the design of UES and the role of operator selection in the original paper.
+
+    See Also
+    --------
+    UesJoinOrdering : The corresponding join ordering logic for UES.
+    """
+
     def __init__(self, *, database: Optional[pb.Database] = None) -> None:
         self._database = database or pb.db.current_database()
 
