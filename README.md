@@ -16,13 +16,13 @@ Optimizer prototypes are implemented using the [PostBOUND framework](https://git
 
 ## Progress
 
-- [ ] UES
+- [x] UES
   - [x] baseline implementation
   - [x] documentation
-- [ ] TONIC
+- [x] TONIC
   - [x] baseline implementation
-  - [ ] documentation
-- [ ] MSCN
+  - [x] documentation
+- [x] MSCN
   - [x] baseline implementation
   - [x] documentation
 - [ ] BAO
@@ -34,7 +34,7 @@ Optimizer prototypes are implemented using the [PostBOUND framework](https://git
 - [ ] FASTgres
   - [x] baseline implementation
   - [ ] documentation
-- [ ] documentation
+- [ ] general documentation
 
 ## Installation
 

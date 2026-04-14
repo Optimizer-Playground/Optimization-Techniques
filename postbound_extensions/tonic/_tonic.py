@@ -1,9 +1,19 @@
-"""Implementation of the TONIC algorithm for learned operator selections [1]_.
+"""Implementation of the TONIC algorithm for learned operator selections.
 
-References
-----------
+Copyright (C) 2026 Rico Bergmann
 
-.. [1] A. Hertzschuch et al.: "Turbo-Charging SPJ Query Plans with Learned Physical Join Operator Selections.", VLDB'2022
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program.  If not, see <https://www.gnu.org/licenses/>.
 """
 
 from __future__ import annotations
@@ -14,6 +24,7 @@ import json
 import math
 import random
 from collections.abc import Iterable, Sequence
+from pathlib import Path
 from typing import Any, Optional
 
 import postbound as pb
@@ -121,7 +132,7 @@ def _tables_in_qeps_path(
     frozenset[pb.TableReference]
         All tables in the path
     """
-    tables = pb.util.set_union(identifier.tables() for identifier in qeps_path)
+    tables = pb.util.set_union(identifier.tables for identifier in qeps_path)
     return tables if isinstance(tables, frozenset) else frozenset(tables)
 
 
@@ -243,7 +254,7 @@ class QepsIdentifier:
         return table_str + filter_str
 
 
-class QEPsNode:
+class QepsNode:
     """Models the a join path with its learned operator costs.
 
     QEP-S nodes form a tree structure, with each branch corresponding to a different join path. Each node is identified by
@@ -289,7 +300,7 @@ class QEPsNode:
         gamma: float,
         *,
         identifier: Optional[QepsIdentifier] = None,
-        parent: Optional[QEPsNode] = None,
+        parent: Optional[QepsNode] = None,
     ) -> None:
         self.filter_aware = filter_aware
         self.gamma = gamma
@@ -297,12 +308,12 @@ class QEPsNode:
             float
         )
         self.child_nodes = pb.util.dicts.DynamicDefaultDict(self._init_qeps)
-        self._subquery_root: Optional[QEPsNode] = None  # only used for subquery nodes
+        self._subquery_root: Optional[QepsNode] = None  # only used for subquery nodes
         self._parent = parent
         self._identifier = identifier
 
     @property
-    def subquery_root(self) -> QEPsNode:
+    def subquery_root(self) -> QepsNode:
         """The subquery that starts at the current node.
 
         Accessing this property means that this node is a subquery root. All child nodes are joins that should be executed
@@ -316,7 +327,7 @@ class QEPsNode:
             The first table in the subquery.
         """
         if self._subquery_root is None:
-            self._subquery_root = QEPsNode(self.filter_aware, self.gamma)
+            self._subquery_root = QepsNode(self.filter_aware, self.gamma)
         return self._subquery_root
 
     def is_root_node(self) -> bool:
@@ -708,7 +719,7 @@ class QEPsNode:
         inspect_entries = [cost_str, subquery_str, child_str]
         return "\n".join(entry for entry in inspect_entries if entry)
 
-    def _init_qeps(self, identifier: QepsIdentifier) -> QEPsNode:
+    def _init_qeps(self, identifier: QepsIdentifier) -> QepsNode:
         """Generates a new QEP-S node with a specific identifier.
 
         The new node "inherits" configuration settings from the current node. This includes filter awareness and gamma value.
@@ -724,7 +735,7 @@ class QEPsNode:
         QepsNode
             The new node
         """
-        return QEPsNode(
+        return QepsNode(
             self.filter_aware, self.gamma, parent=self, identifier=identifier
         )
 
@@ -821,7 +832,7 @@ class QEPsNode:
         return f"{identifier} {costs}"
 
 
-class QEPSynopsis:
+class QepSynopsis:
     """The plan synopsis maintains a hierarchy of QEP-S nodes, starting at a single root node.
 
     Most of the methods this synopsis provides simply delegate to the root node.
@@ -837,7 +848,7 @@ class QEPSynopsis:
     """
 
     @staticmethod
-    def create(filter_aware: bool, gamma: float) -> QEPSynopsis:
+    def create(filter_aware: bool, gamma: float) -> QepSynopsis:
         """Generates a new synopsis with specific settings.
 
         Parameters
@@ -852,10 +863,10 @@ class QEPSynopsis:
         QEPSynopsis
             The synopsis
         """
-        root = QEPsNode(filter_aware, gamma)
-        return QEPSynopsis(root)
+        root = QepsNode(filter_aware, gamma)
+        return QepSynopsis(root)
 
-    def __init__(self, root: QEPsNode) -> None:
+    def __init__(self, root: QepsNode) -> None:
         self.root = root
 
     def recommend_operators(
@@ -931,7 +942,7 @@ class QEPSynopsis:
 
         This does not only include cost information, but also the tree structure itself.
         """
-        self.root = QEPsNode(self.root.filter_aware, self.root.gamma)
+        self.root = QepsNode(self.root.filter_aware, self.root.gamma)
 
     def inspect(self) -> str:
         """Provides a nice hierarchical representation of the QEP-S structure.
@@ -987,10 +998,10 @@ def _load_qeps_id_from_json(json_data: dict) -> QepsIdentifier:
 def _load_qeps_from_json(
     json_data: dict,
     qeps_id: Optional[QepsIdentifier],
-    parent: Optional[QEPsNode],
+    parent: Optional[QepsNode],
     filter_aware: bool,
     gamma: float,
-) -> QEPsNode:
+) -> QepsNode:
     """Creates a QEP-S node from its JSON representation.
 
     Parameters
@@ -1018,7 +1029,7 @@ def _load_qeps_from_json(
     KeyError
         If any of the child node encodings does not contain an actual node encoding
     """
-    node = QEPsNode(filter_aware, gamma, identifier=qeps_id, parent=parent)
+    node = QepsNode(filter_aware, gamma, identifier=qeps_id, parent=parent)
 
     cost_info = {
         pb.JoinOperator(operator_str): cost
@@ -1029,7 +1040,7 @@ def _load_qeps_from_json(
         if "subquery" in json_data
         else None
     )
-    children: dict[QepsIdentifier, QEPsNode] = {}
+    children: dict[QepsIdentifier, QepsNode] = {}
     for child_json in json_data.get("children", []):
         child_id = _load_qeps_id_from_json(child_json["identifier"])
         child_node = _load_qeps_from_json(
@@ -1045,10 +1056,10 @@ def _load_qeps_from_json(
 
 def make_qeps(
     path: Iterable[pb.TableReference],
-    root: Optional[QEPsNode] = None,
+    root: Optional[QepsNode] = None,
     *,
     gamma: float = 0.8,
-) -> QEPsNode:
+) -> QepsNode:
     """Generates a QEP-S for the given join path.
 
     Parameters
@@ -1066,7 +1077,7 @@ def make_qeps(
     QepsNode
         The QEP-S. The synopsis is not filter-aware.
     """
-    current_node = root if root is not None else QEPsNode(False, gamma)
+    current_node = root if root is not None else QepsNode(False, gamma)
     root = current_node
     for table in path:
         current_node = current_node.child_nodes[QepsIdentifier(table)]
@@ -1230,7 +1241,7 @@ class TonicOperatorSelection(pb.PhysicalOperatorSelection):
 
     @staticmethod
     def load_model(
-        filename: str,
+        archive: Path | str,
         database: Optional[pb.Database] = None,
         *,
         encoding: str = "utf-8",
@@ -1241,7 +1252,7 @@ class TonicOperatorSelection(pb.PhysicalOperatorSelection):
 
         Parameters
         ----------
-        filename : str
+        archive : Path | str
             The file that contains the JSON model
         database : Optional[pb.Database], optional
             The database that should be used for trainining the model. If omitted, the database is inferred from the
@@ -1255,7 +1266,7 @@ class TonicOperatorSelection(pb.PhysicalOperatorSelection):
             The TONIC model
         """
         json_data: dict = {}
-        with open(filename, "r", encoding=encoding) as json_file:
+        with open(archive, "r", encoding=encoding) as json_file:
             json_data = json.load(json_file)
 
         filter_aware = json_data.get("filter_aware", False)
@@ -1263,10 +1274,43 @@ class TonicOperatorSelection(pb.PhysicalOperatorSelection):
         qeps_root = _load_qeps_from_json(
             json_data["root"], None, None, filter_aware, gamma
         )
-        qeps = QEPSynopsis(qeps_root)
+        qeps = QepSynopsis(qeps_root)
 
         tonic_model = TonicOperatorSelection(filter_aware, gamma, database=database)
         tonic_model.qeps = qeps
+        return tonic_model
+
+    @staticmethod
+    def load_or_build(
+        archive: Path | str,
+        *,
+        filter_aware: bool = False,
+        gamma: float = 0.8,
+        sample_queries: Optional[Iterable[pb.SqlQuery]] = None,
+        sample_plans: Optional[dict[pb.SqlQuery, pb.QueryPlan]] = None,
+        database: Optional[pb.Database] = None,
+    ) -> TonicOperatorSelection:
+        """Loads a TONIC QEP-S model from disk if it exists, and builds a new model otherwise.
+
+        If the model is built from scratch, the `sample_queries` and `sample_plans` parameters can be used to pre-populate the
+        synopsis with cost information.
+        """
+
+        archive = Path(archive)
+        if archive.is_file():
+            return TonicOperatorSelection.load_model(archive, database=database)
+
+        tonic_model = TonicOperatorSelection(
+            filter_aware=filter_aware, gamma=gamma, database=database
+        )
+        if sample_queries is not None:
+            for query in sample_queries:
+                tonic_model.simulate_feedback(query)
+        if sample_plans is not None:
+            for query, plan in sample_plans.items():
+                tonic_model.integrate_cost(query, plan)
+
+        tonic_model.store(archive)
         return tonic_model
 
     def __init__(
@@ -1279,7 +1323,7 @@ class TonicOperatorSelection(pb.PhysicalOperatorSelection):
         super().__init__()
         self.filter_aware = filter_aware
         self.gamma = gamma
-        self.qeps = QEPSynopsis.create(filter_aware, gamma)
+        self.qeps = QepSynopsis.create(filter_aware, gamma)
         self._db = database if database else pb.db.current_database()
 
     def integrate_cost(
@@ -1287,8 +1331,9 @@ class TonicOperatorSelection(pb.PhysicalOperatorSelection):
     ) -> None:
         """Uses cost information from a query plan to update the QEP-S costs.
 
-        Notice that the costs stored in the query plan do not need to correspond to native costs. Instead, the costs can be
-        calculated using arbitrary cost models.
+        Costs are extracted based on the *estimated_cost* information in the query plan.
+        However, these costs do not need to correspond to native costs. Instead, the costs can be calculated using arbitrary
+        cost models.
 
         Parameters
         ----------
@@ -1298,6 +1343,10 @@ class TonicOperatorSelection(pb.PhysicalOperatorSelection):
             The query plan which contains the cost information. If this parameter is omitted, the native optimizer of the
             `database` will be queried to obtain the costs of the input query. Notice that is enables the integration of costs
             for arbitrary query plans by setting the hint block of the query.
+
+        See Also
+        --------
+        postbound.QueryPlan.with_estimates : updates the cost information in a query plan
         """
         query_plan = (
             self._db.optimizer().query_plan(query) if query_plan is None else query_plan
@@ -1404,6 +1453,19 @@ class TonicOperatorSelection(pb.PhysicalOperatorSelection):
         if not join_order or join_order.is_empty():
             join_order = self._obtain_native_join_order(query)
         return self.qeps.recommend_operators(query, join_order)
+
+    def store(self, archive: Path | str) -> None:
+        """Persists the current QEP-S model in a JSON file.
+
+        The file is encoded using the jsonize utility of the `pb.utility` module.
+
+        Parameters
+        ----------
+        archive : Path | str
+            The file to store the model in. If the file already exists, it is overwritten.
+        """
+        with open(archive, "w", encoding="utf-8") as f:
+            pb.util.to_json_dump(self, f)
 
     def describe(self) -> dict:
         return {"name": "tonic", "filter_aware": self.filter_aware, "gamma": self.gamma}
