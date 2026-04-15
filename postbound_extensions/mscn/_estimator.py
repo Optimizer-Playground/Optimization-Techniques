@@ -18,6 +18,7 @@ THE SOFTWARE.
 from __future__ import annotations
 
 import json
+import time
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
@@ -164,11 +165,13 @@ class MscnEstimator(pb.CardinalityEstimator):
             if raw_hyper_params is not None
             else None
         )
+        training_metrics = catalog.get("training_metrics", {})
 
         estimator = MscnEstimator(
             model=model, featurizer=featurizer, database=database, verbose=verbose
         )
         estimator._training_params = training_params
+        estimator._training_metrics = training_metrics
 
         return estimator
 
@@ -254,7 +257,13 @@ class MscnEstimator(pb.CardinalityEstimator):
             self.model = self.model.cuda()
 
         self._training_params: MscnHyperParams | None = None
+        self._training_metrics: dict = {"status": "untrained"}
         self._verbose = verbose
+
+    @property
+    def training_metrics(self) -> pb.train.TrainingMetrics:
+        """Get the training metrics of the last training run."""
+        return self._training_metrics
 
     def calculate_estimate(
         self,
@@ -285,6 +294,15 @@ class MscnEstimator(pb.CardinalityEstimator):
         estimated_value = normalized_output.item()
         return pb.Cardinality(estimated_value)
 
+    def fit_samples(self, samples: pb.train.TrainingData) -> pb.train.TrainingMetrics:
+        return self.train(samples.as_df())
+
+    def sample_spec(self) -> pb.train.TrainingSpec:
+        return pb.train.TrainingSpec(["query", "cardinality"])
+
+    def sample_fit_completed(self) -> bool:
+        return self._training_metrics.get("status") == "completed"
+
     def train(
         self,
         samples: pd.DataFrame,
@@ -292,7 +310,7 @@ class MscnEstimator(pb.CardinalityEstimator):
         query_col: str = "query",
         label_col: str = "cardinality",
         hyper_params: MscnHyperParams = MscnHyperParams.default(),
-    ) -> None:
+    ) -> pb.train.TrainingMetrics:
         """Trains the MSCN model on a specific set of training samples.
 
         If the model has already been trained, the additional samples will be used as a fine-tuning
@@ -318,9 +336,17 @@ class MscnEstimator(pb.CardinalityEstimator):
         MscnHyperParams
         """
         if not len(samples):
-            return
+            metrics: dict = {"status": "untrained"}
+            self._training_metrics = metrics
+            return metrics
 
         self._log("Preparing training dataset")
+        metrics: dict = {
+            "n_samples": len(samples),
+            "hyper_params": hyper_params,
+            "loss": [],
+        }
+
         min_card = self.featurizer.norm_min_card
         max_card = self.featurizer.norm_max_card
         if isinstance(samples[query_col].iloc[0], pb.SqlQuery):
@@ -343,10 +369,14 @@ class MscnEstimator(pb.CardinalityEstimator):
         )
 
         data_loader = torch.utils.data.DataLoader(
-            training_data, batch_size=hyper_params.batch_size
+            training_data,
+            batch_size=hyper_params.batch_size,
+            pin_memory=True,
         )
 
         self._log("Starting training")
+        start_time = time.perf_counter_ns()
+
         for epoch in range(hyper_params.epochs):
             loss_total = 0.0
             for batch in data_loader:
@@ -363,9 +393,18 @@ class MscnEstimator(pb.CardinalityEstimator):
             self._log(
                 f"Epoch: {epoch_str} / {hyper_params.epochs} :: loss = {loss_total}"
             )
+            metrics["loss"].append(loss_total)
 
-        self.model.eval()
+        end_time = time.perf_counter_ns()
+        elapsed_time = (end_time - start_time) / 1e9
+        metrics["training_time"] = elapsed_time
+        metrics["status"] = "completed"
+
         self._training_params = hyper_params
+        self._training_metrics = metrics
+        self.model.eval()
+
+        return metrics
 
     def store(
         self,
@@ -426,8 +465,9 @@ class MscnEstimator(pb.CardinalityEstimator):
             catalog["hyper_parameters"] = (
                 self._training_params.__json__() if self._training_params else None
             )
+            catalog["training_metrics"] = self._training_metrics
             f.seek(0)
-            json.dump(catalog, f)
+            pb.util.to_json_dump(catalog, f)
 
         return catalog
 
@@ -435,4 +475,9 @@ class MscnEstimator(pb.CardinalityEstimator):
         return {"name": "MSCN", "hyperparameters": self._training_params}
 
     def _move_features(self, features: list[torch.Tensor]) -> list[torch.Tensor]:
-        return [feature.to(self._device, non_blocking=True) for feature in features]
+        moved: list[torch.Tensor] = []
+        for feature in features:
+            feature = feature.to(self._device, non_blocking=True)
+            feature.requires_grad_(True)
+            moved.append(feature)
+        return moved

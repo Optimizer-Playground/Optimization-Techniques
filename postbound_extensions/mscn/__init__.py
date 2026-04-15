@@ -171,7 +171,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 """
 
-from ._estimator import MscnEstimator
+from ._estimator import MscnEstimator, MscnHyperParams
 from ._featurizer import FeaturizedQuery, MscnFeaturizer
 from ._misc import normalize_labels, qerror_loss, unnormalize_labels
 from ._model import SetConv
@@ -180,6 +180,7 @@ __all__ = [
     "FeaturizedQuery",
     "MscnEstimator",
     "MscnFeaturizer",
+    "MscnHyperParams",
     "SetConv",
     "normalize_labels",
     "qerror_loss",
