@@ -866,7 +866,7 @@ class BaoOptimizer(
         query_plan = self._db.optimizer().parse_plan(result.query_result)
         self.add_experience(query_plan, 1000 * result.execution_time)
 
-    def store(self, archive_dir: Path | str) -> None:
+    def store(self, archive_dir: Path | str) -> Path:
         """Persists an optimizer and all related data to disk.
 
         This will persist the selected hint sets, the featurizer, the TCNN weights and the samples
@@ -878,23 +878,32 @@ class BaoOptimizer(
             The directory where the optimizer and all related data will be stored. This directory
             should be exclusive to the current optimizer. If two optimizers share the same
             directory, they will overwrite each others data.
+
+        Returns
+        -------
+        Path
+            The path to the catalog file that should be passed to subsequent `pre_trained` calls to
+            load this optimizer.
         """
+
         archive_dir = Path(archive_dir)
         archive_dir.mkdir(parents=True, exist_ok=True)
+        schema = self._db.database_name()
+        catalog_path = archive_dir / f"catalog-{schema}.json"
 
-        featurizer_catalog = archive_dir / "featurizer.json"
+        featurizer_catalog = archive_dir / f"featurizer-{schema}.json"
         self._log("Exporting featurizer to", featurizer_catalog)
         self._featurizer.store(featurizer_catalog)
 
-        experience_catalog = archive_dir / "experience-catalog.json"
-        experience_store = archive_dir / "experience-store.parquet"
+        experience_catalog = archive_dir / f"experience-catalog-{schema}.json"
+        experience_store = archive_dir / f"experience-store-{schema}.parquet"
         self._log("Exporting experience to", experience_catalog)
         self._experience.store(
             experience_catalog,
             experience_path=experience_store,
         )
 
-        model_path = archive_dir / "tcnn.pt"
+        model_path = archive_dir / f"tcnn-{schema}.pt"
         self._log("Storing TCNN model to", model_path)
         weights = self._tcnn.state_dict()
         torch.save(weights, model_path)
@@ -910,8 +919,10 @@ class BaoOptimizer(
             "tcnn_model": model_path,
         }
         self._log("Creating catalog")
-        with open(archive_dir / "catalog.json", "w") as f:
+        with open(catalog_path, "w") as f:
             pb.util.to_json_dump(serialized, f)
+
+        return catalog_path
 
     def describe(self) -> pb.util.jsondict:
         return {
