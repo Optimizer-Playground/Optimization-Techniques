@@ -135,7 +135,8 @@ References
 ----------
 
 .. [Deeds2023] Kyle Deeds et al.: "SafeBound: A Practical System for Generating Cardinality Bounds"
-   SIGMOD 2023 https://doi.org/10.1145/3588907
+   SIGMOD 2023, https://doi.org/10.1145/3588907
+.. Reference Implementation: https://github.com/kylebd99/SafeBound
 """
 
 from ._catalog import (

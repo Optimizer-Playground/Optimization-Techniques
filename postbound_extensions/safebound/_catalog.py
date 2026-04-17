@@ -86,6 +86,7 @@ class CatalogSpec:
 
     @staticmethod
     def empty() -> CatalogSpec:
+        """Create a new spec without any PCFs."""
         return CatalogSpec(
             collections.defaultdict(set),
             collections.defaultdict(set),
@@ -553,7 +554,7 @@ class EqualityConditionsRepo:
         filter_col: pb.ColumnReference,
         filter_val: Any,
     ) -> Optional[PiecewiseConstantFn]:
-        """Retrieves the PCF for a join column based on the condition `filter_col = filter_val`.
+        """Retrieves the PCF for a join column based on the condition *filter_col = filter_val*.
 
         If the repository does not contain a PCF conditioned on the filter column, *None* is returned. However, if there is
         a matching conditioned PCF, but it does not contain the filter value (e.g. because the value is not in the MCV list),
@@ -741,6 +742,10 @@ class RangeConditionedPCF[T: _HistogramKey]:
 
     @property
     def higher_res(self) -> Optional[RangeConditionedPCF[T]]:
+        """Get the child histogram with more buckets.
+
+        If this is *None*, the current histogram has the highest resolution available on the column.
+        """
         return self._higher_res
 
     @higher_res.setter
@@ -915,6 +920,28 @@ def load_range_pcf_json(
 
 
 class RangeConditionsRepo:
+    """Maintains the range-conditioned PCFs for a set of join columns.
+
+    Depending on the current filter predicate, different lookup methods exist. Each method requires
+    the join column as well as the column being filtered. In addition, the filter value must be
+    supplied in a predicate-specific form. PCFs can be looked up using the following methods:
+
+    - `lookup_range`: for predicates of the form *filter_col BETWEEN lower AND upper*
+    - `lookup_less_equal`: for predicates of the form *filter_col <= bound*
+    - `lookup_strict_less`: for predicates of the form *filter_col < bound*
+    - `lookup_greater_equal`: for predicates of the form *filter_col >= bound*
+    - `lookup_strict_greater`: for predicates of the form *filter_col > bound*
+
+    While there exist different lookup methods for open and closed intervals, see the documentation
+    on `RangeConditionedPCF.get_less` for details on how we currently handle this distinction.
+
+    Parameters
+    ----------
+    join_pcfs : dict[pb.ColumnReference, Sequence[RangeConditionedPCF]]
+        A mapping from join column to the range-conditioned PCFs for that column. Each PCF should be
+        conditioned on a different filter column.
+    """
+
     def __init__(
         self, join_pcfs: dict[pb.ColumnReference, Sequence[RangeConditionedPCF]]
     ) -> None:
@@ -927,6 +954,14 @@ class RangeConditionsRepo:
         range_col: pb.ColumnReference,
         between: tuple[T, T],
     ) -> Optional[PiecewiseConstantFn]:
+        """Retrieves the PCF for a join column based on the condition *range_col BETWEEN lo AND hi*.
+
+        The range must be given as a tuple of the form *(lo, hi)*.
+
+        If the repository does not contain a PCF conditioned on the filter column, *None* is
+        returned. The same applies if none of the histograms in the hierarchy contains a bucket that
+        is large enough to encompass the entire range.
+        """
         candidates = self._join_pcfs.get(join_col)
         if candidates is None:
             return None
@@ -946,6 +981,15 @@ class RangeConditionsRepo:
     def lookup_less_equal[T](
         self, join_col: pb.ColumnReference, *, range_col: pb.ColumnReference, bound: T
     ) -> Optional[PiecewiseConstantFn]:
+        """Retrieves the PCF for a join column based on the condition *range_col <= bound*.
+
+        If the repository does not contain a PCF conditioned on the filter column, *None* is
+        returned. The same applies if none of the histograms in the hierarchy contains a bucket that
+        is large enough to encompass the entire range.
+
+        See the documentation on `RangeConditionedPCF.get_less` for details on how we currently
+        handle the distinction between open and closed intervals.
+        """
         candidates = self._join_pcfs.get(join_col)
         if candidates is None:
             return None
@@ -964,6 +1008,15 @@ class RangeConditionsRepo:
     def lookup_strict_less[T](
         self, join_col: pb.ColumnReference, *, range_col: pb.ColumnReference, bound: T
     ) -> Optional[PiecewiseConstantFn]:
+        """Retrieves the PCF for a join column based on the condition *range_col < bound*.
+
+        If the repository does not contain a PCF conditioned on the filter column, *None* is
+        returned. The same applies if none of the histograms in the hierarchy contains a bucket that
+        is large enough to encompass the entire range.
+
+        See the documentation on `RangeConditionedPCF.get_less` for details on how we currently
+        handle the distinction between open and closed intervals.
+        """
         candidates = self._join_pcfs.get(join_col)
         if candidates is None:
             return None
@@ -982,6 +1035,15 @@ class RangeConditionsRepo:
     def lookup_greater_equal[T](
         self, join_col: pb.ColumnReference, *, range_col: pb.ColumnReference, bound: T
     ) -> Optional[PiecewiseConstantFn]:
+        """Retrieves the PCF for a join column based on the condition *range_col >= bound*.
+
+        If the repository does not contain a PCF conditioned on the filter column, *None* is
+        returned. The same applies if none of the histograms in the hierarchy contains a bucket that
+        is large enough to encompass the entire range.
+
+        See the documentation on `RangeConditionedPCF.get_less` (sic!) for details on how we
+        currently handle the distinction between open and closed intervals.
+        """
         candidates = self._join_pcfs.get(join_col)
         if candidates is None:
             return None
@@ -1000,6 +1062,15 @@ class RangeConditionsRepo:
     def lookup_strict_greater[T](
         self, join_col: pb.ColumnReference, *, range_col: pb.ColumnReference, bound: T
     ) -> Optional[PiecewiseConstantFn]:
+        """Retrieves the PCF for a join column based on the condition *range_col > bound*.
+
+        If the repository does not contain a PCF conditioned on the filter column, *None* is
+        returned. The same applies if none of the histograms in the hierarchy contains a bucket that
+        is large enough to encompass the entire range.
+
+        See the documentation on `RangeConditionedPCF.get_less` (sic!) for details on how we
+        currently handle the distinction between open and closed intervals.
+        """
         candidates = self._join_pcfs.get(join_col)
         if candidates is None:
             return None
@@ -1049,6 +1120,34 @@ def histogram_for_precision[T: _HistogramKey](
     database: pb.Database,
     log: pb.util.Logger,
 ) -> RangeConditionedPCF[T]:
+    """Constructs a single histogram at a specific "precision" (i.e. number of buckets).
+
+    Parameters
+    ----------
+    range_distribution : list[tuple[T, int]]
+        An ordered list of (value, frequency) pairs for all distinct values in the filter column.
+    k : int
+        The "precision" to use. This corresponds exactly to the *k* parameter in the original
+        SafeBound paper. Therefore, the actual number of buckets in the histogram will be 2^k.
+    total_cardinality : int
+        The total number of rows in the join column's table. While this could be derived from the
+        range distribution, the histogram construction algorithm is typically called multiple times
+        for a given join column/range column pair. Therefore, we can save some compute time by
+        pre-calculating this value.
+    accuracy : float
+        The accuracy to use when compressing the raw degree sequences into PCFs. This corresponds to
+        the *c* parameter in the original SafeBound paper.
+    join_col : pb.BoundColumnReference
+        The join column that the resulting PCFs should be defined on. This is required to fetch the
+        correlated degree sequences from the database and to construct the resulting PCFs.
+    range_col : pb.BoundColumnReference
+        The filter column that the resulting PCFs should be conditioned on. This is required to
+        fetch the correlated degree sequences from the database and to construct the resulting PCFs.
+    database : pb.Database
+        The database to fetch the degree sequences from.
+    log : pb.util.Logger
+        A logger to log the progress of the histogram construction.
+    """
     if not range_distribution:
         raise ValueError("Cannot derive histograms for empty distribution")
 
@@ -1848,8 +1947,10 @@ class SafeBoundCatalog:
                 pb.util.to_json_dump(self, f)
             return
 
-        raw_dump = pb.util.to_json(self).encode("utf-8")
-        compressed_dump = lzma.compress(raw_dump)
+        raw_dump = pb.util.to_json(self)
+        if raw_dump is None:
+            raise RuntimeError("Failed to serialize catalog to JSON")
+        compressed_dump = lzma.compress(raw_dump.encode("utf-8"))
 
         with archive.open("wb") as f:
             f.write(compressed_dump)

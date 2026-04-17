@@ -378,7 +378,7 @@ class MscnFeaturizer:
         database: Optional[pb.Database] = None,
         verbose: bool | pb.util.Logger = False,
     ) -> MscnFeaturizer:
-        """Builsd a featurizer tailored to a specific set of training queries.
+        """Builds a featurizer tailored to a specific set of training queries.
 
         This featurization strategy is the middle-ground between the very specialized
         `infer_from_workload` strategy and the very general `online` strategy.

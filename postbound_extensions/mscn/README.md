@@ -93,7 +93,7 @@ pb.bench.execute_workload(
     workload,
     on=mscn,
     query_preparation={"analyze": True, "prewarm": True},
-    name="safebound-test",
+    name="mscn-test",
     progressive_output="mscn-benchmark.parquet",
     logger="tqdm"
 )
