@@ -1,3 +1,21 @@
+"""
+Bao Plan Featurization Logic
+    Created as part of the Optimization Techniques Project
+
+Copyright (C) 2026 Rico Bergmann
+
+This program is free software: you can redistribute it and/or modify it under the terms of the
+GNU General Public License as published by the Free Software Foundation, either version 3 of the
+License, or (at your option) any later version.
+
+This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without
+even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License along with this program. If not,
+see <https://www.gnu.org/licenses/>.
+"""
+
 from __future__ import annotations
 
 import collections
@@ -19,6 +37,33 @@ from sklearn.preprocessing import FunctionTransformer, MinMaxScaler, OneHotEncod
 
 @dataclass
 class BinarizedQep:
+    """A pre-processed query plan node that is suitable for featurization.
+
+    A binarized node is guaranteed to have exactly zero (for base scans) or two children (for joins
+    and other intermediate nodes). Intermediate nodes will typically have a dummy (i.e. all values 0)
+    inner child. The node contains exactly the information that will be fed into the featurizer.
+
+    Parameters
+    ----------
+    is_dummy: bool
+        Whether this node is a dummy node. Dummy nodes are used to binarize intermediate nodes that
+        would normally only have a single child.
+    node: str
+        The operator name of this node, e.g. "Seq Scan", "Hash Join", etc.
+    outer_child: Optional[BinarizedQep]
+        The outer child of this node. For scans, this will be None. For all other nodes, this will
+        be a proper BinarizedQep node (i.e. not a dummy).
+    inner_child: Optional[BinarizedQep]
+        The inner child of this node. For scans, this will be None. For joins, this will be a proper
+        BinarizedQep node (i.e. not a dummy). For intermediate nodes, this will be a dummy node.
+    cardinality: int
+        The estimated cardinality for this node. This is the raw estimate, not a scaled value.
+    cost: float
+        The estimated cost for this node. This is the raw estimate, not a scaled value.
+    cache_pct: float
+        The estimated cache percentage for this node.
+    """
+
     is_dummy: bool
     node: str
     outer_child: Optional[BinarizedQep]
@@ -33,6 +78,7 @@ class BinarizedQep:
         *,
         cache_state: DatabaseCacheState,
     ) -> BinarizedQep:
+        """Recursively transforms the plan node and all of its children into a binarized QEP."""
         if plan.is_scan():
             cache_pct = cache_state.determine_cache_pct(plan)
             return BinarizedQep.scan(
@@ -78,6 +124,7 @@ class BinarizedQep:
     def scan(
         node: str, *, cardinality: int, cost: float, cache_pct: float
     ) -> BinarizedQep:
+        """Transforms the scan node into its binarized equivalent."""
         return BinarizedQep(False, node, None, None, cardinality, cost, cache_pct)
 
     @staticmethod
@@ -90,10 +137,12 @@ class BinarizedQep:
         cost: float,
         cache_pct: float,
     ) -> BinarizedQep:
+        """Creates a binarized node for the given join."""
         return BinarizedQep(False, node, outer_child, inner_child, cardinality, cost, 0)
 
     @staticmethod
     def dummy() -> BinarizedQep:
+        """Creates a dummy binarized node."""
         return BinarizedQep(True, "", None, None, -1, -1, 0)
 
     def outer(self) -> Optional[BinarizedQep]:
@@ -153,7 +202,7 @@ class DatabaseCacheState:
         self._db = database
         self._stats = self._db.statistics()
 
-        if isinstance(self._db, pb.postgres.PostgresInterface):
+        if isinstance(self._stats, pb.postgres.PostgresStatisticsInterface):
             self._cache_state = self._stats.buffer_state()
         else:
             self._cache_state = {}
@@ -215,10 +264,52 @@ _PGNodeMap = {
 
 
 class BaoFeaturizer:
+    """The featurizer is used to transform query plans into their corresponding feature vectors.
+
+    In addition to the plan featurization, we also use the featurizer to store normalization data,
+    specifically regarding the predicted plan runtimes.
+
+    Bao uses a featurization scheme that is independent of a particular database instance/schema.
+    However, the featurization can still benefit from prior knowledge about the target workload,
+    because this allows to generate smaller feature vectors and to use better min-max normalization
+    ranges.
+    Accordingly, we provide two different methods to create new featurization instances:
+
+    - `online` creates a featurizer exclusively based on the database, i.e. without any leaks from
+      the target workload. While this is arguably the most realistic setting, the resulting feature
+      vectors will be the most difficult to learn.
+    - `infer_from_samples` creates a featurizer tailored to a specific test workload.
+
+    The original Bao paper did not specify, how their featurization is created. So choose whichever
+    strategy works best for you.
+
+    Once a featurization has been created, use `encode_plan` to transform query plans into their
+    corresponding feature vectors. The other ``encode_XYZ`` methods handle the different sub-steps
+    of the featurization process. Usually, there is no need to call these explicitly.
+
+    An existing featurization can be persisted using the `store` method. As a convenience function,
+    the `load_or_build` function will load a previously stored featurization. If it does not exist,
+    it will be created and stored.
+    """
+
     @staticmethod
     def online(
         database: pb.Database, *, max_runtime_ms: float = 1000 * 60 * 60
     ) -> BaoFeaturizer:
+        """Infers the featurization from the database.
+
+        This featurization strategy trades off high generality for potentially larger
+        (and thus more sparse) feature vectors.
+
+        Notes
+        -----
+        We use the following rules to determine the featurization parameters: All node types that
+        appear as valid Postgres operators are included in the operator encoding. The maximum
+        cardinality and cost are derived by planning an SQL query and obtaining the corresponding
+        estimates from the target database. The query performs a cross product between the three
+        largest tables in the schema.
+        The maximum runtime can be specified by the user. As a default, we use one hour.
+        """
         operators = pb.postgres.PostgresExplainNode.all_node_types()
 
         top_tables = queue.PriorityQueue(maxsize=3)
@@ -269,13 +360,40 @@ class BaoFeaturizer:
     def infer_from_sample(
         sample: pd.DataFrame, *, database: pb.Database, plan_col: str = "query_plan"
     ) -> BaoFeaturizer:
+        """Builds a featurizer tailored to a specific set of training samples.
+
+        This featurization strategy trades off generality for smaller (and thus less sparse) feature
+        vectors.
+
+        Parameters
+        ----------
+        sample: pd.DataFrame
+            The training samples. The query plans should be proper `pb.QueryPlan` instances. If they
+            are not, they are parsed under the assumption that they were obtained from the same
+            database system as the target database.
+        database: pb.Database
+            The target database
+        plan_col: str
+            The column in the `sample` DataFrame that contains the query plans
+
+        Notes
+        -----
+        We use the following rules to obtain the featurization parameters: The operator encoding
+        includes all operators that appear in the sample plans. The maximum cardinality, cost, and
+        runtime all also retrieved directly from the query plans. Therefore, all contained plans
+        should be valid EXPLAIN ANALYZE plans.
+        """
+        if not isinstance(sample[plan_col].iloc[0], pb.QueryPlan):
+            plans = sample[plan_col].map(database.optimizer().parse_plan)
+        else:
+            plans = sample[plan_col]
+
         allowed_ops: set[str] = set()
         min_card, max_card = np.inf, 0
         min_cost, max_cost = np.inf, 0
         min_runtime, max_runtime = np.inf, 0
 
-        for plan in sample[plan_col]:
-            assert isinstance(plan, pb.QueryPlan)
+        for plan in plans:
             for node in plan:
                 allowed_ops.add(node.node_type)
                 min_card = min(min_card, node.estimated_cardinality)
@@ -300,6 +418,12 @@ class BaoFeaturizer:
 
     @staticmethod
     def pre_built(archive: Path | str, *, database: pb.Database) -> BaoFeaturizer:
+        """Loads a previously built featurization from disk.
+
+        See Also
+        --------
+        store : inverse method to persist a featurization to disk
+        """
         with open(archive, "r") as f:
             catalog = json.load(f)
 
@@ -316,6 +440,11 @@ class BaoFeaturizer:
 
     @staticmethod
     def load_or_build(archive: Path | str, *, database: pb.Database) -> BaoFeaturizer:
+        """Integrated inference and storage procedure.
+
+        If the featurization has already been stored to `archive`, it will simply be loaded.
+        Otherwise, it will be inferred using `online`.
+        """
         archive = Path(archive)
         if archive.is_file():
             return BaoFeaturizer.pre_built(archive, database=database)
@@ -361,10 +490,12 @@ class BaoFeaturizer:
 
     @property
     def database(self) -> pb.Database:
+        """Get the current target database"""
         return self._db
 
     @property
     def out_shape(self) -> int:
+        """Get the number of elements each node-level vector will have."""
         return (
             len(self._op_enc.categories_[0])
             + 1  # card enc
@@ -373,6 +504,7 @@ class BaoFeaturizer:
         )
 
     def encode(self, node: BinarizedQep) -> np.ndarray:
+        """Transforms a specific pre-processed node into its feature representation."""
         op_enc = self.encode_operator(node)
         card_enc = self.encode_cardinality(node)
         cost_enc = self.encode_cost(node)
@@ -392,6 +524,10 @@ class BaoFeaturizer:
         *,
         cache_state: DatabaseCacheState | None = None,
     ) -> FeaturizedNode | tuple:
+        """Transforms a raw PostBOUND query plan into its feature representation.
+
+        If the cache state is not explicitly given, it will be inferred from the target database.
+        """
         if cache_state is None:
             cache_state = DatabaseCacheState(self._db)
 
@@ -399,12 +535,14 @@ class BaoFeaturizer:
         return self._featurize_qep(binarized)
 
     def encode_operator(self, node: BinarizedQep) -> np.ndarray:
+        """Applies the operator one-hot encoding to the node."""
         operator = "__bao_null__" if node.is_dummy else node.node
         operator = _PGNodeMap.get(operator, operator)
         enc = self._op_enc.transform([(operator,)])
         return enc[0]
 
     def encode_cardinality(self, node: BinarizedQep) -> np.ndarray:
+        """Min-max scales the cardinality estimate of the node."""
         if node.is_dummy:
             return np.zeros(1)
         scaled = np.log(node.cardinality + 1) - self._min_card
@@ -412,6 +550,7 @@ class BaoFeaturizer:
         return np.asarray([scaled])
 
     def encode_cost(self, node: BinarizedQep) -> np.ndarray:
+        """Min-max scales the cost estimate of the node."""
         if node.is_dummy:
             return np.zeros(1)
         scaled = np.log(node.cost + 1) - self._min_cost
@@ -419,19 +558,32 @@ class BaoFeaturizer:
         return np.asarray([scaled])
 
     def encode_cache_pct(self, node: BinarizedQep) -> np.ndarray:
+        """Transforms the cache percentage of the node.
+
+        Since the cache percentage is already a number in [0, 1], we don't need to do anything for
+        normal nodes. Dummies still have to be processed accordingly.
+        Nevertheless, this function primarily exists to have a uniform encoding pattern for the
+        different attributes of a node, not because we apply any fancy featurization logic.
+        """
         if node.is_dummy:
             return np.zeros(1)
         return np.asarray([node.cache_pct])
 
     def transform_runtime(self, runtime) -> np.ndarray:
+        """Scales a raw runtime measurement."""
         return self._runtime_pipeline.transform(runtime)
 
     def inverse_transform_runtime(self, scaled):
+        """Undos the runtime scaling."""
         return self._runtime_pipeline.inverse_transform(scaled)
 
-    def store(self, path: Path | str) -> None:
-        path = Path(path)
-        path.parent.mkdir(parents=True, exist_ok=True)
+    def store(self, archive: Path | str) -> None:
+        """Persists the featurization info at the specified location.
+
+        The `archive` is assumed to be JSON file.
+        """
+        archive = Path(archive)
+        archive.parent.mkdir(parents=True, exist_ok=True)
 
         serialized = {
             "allowed_ops": self._allowed_ops,
@@ -442,7 +594,7 @@ class BaoFeaturizer:
             "max_runtime_ms": self._max_runtime,
             "min_runtime_ms": self._min_runtime,
         }
-        with open(path, "w") as f:
+        with open(archive, "w") as f:
             json.dump(serialized, f)
 
     def _featurize_qep(self, node: BinarizedQep | None) -> FeaturizedNode:

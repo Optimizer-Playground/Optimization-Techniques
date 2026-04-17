@@ -6,6 +6,12 @@ from ._util import prepare_trees
 
 
 class BaoModel(torch.nn.Module):
+    """The Bao cost model.
+
+    We commonly refer to this as *the* TCNN, even though it is actually a sequential model
+    consisting of multiple layers (including tree convolutions).
+    """
+
     def __init__(self, in_channels: int) -> None:
         super(BaoModel, self).__init__()
 
