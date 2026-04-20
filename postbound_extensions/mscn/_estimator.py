@@ -40,14 +40,14 @@ class MscnHyperParams:
 
     By default, we use the same hyper parameters as the original MSCN paper. These are as follows:
 
-    - training epochs: 70
-    - learning rate: 0.001
-    - batch size: 16
+    - training epochs: 100
+    - learning rate: 0.0001
+    - batch size: 1024
     """
 
-    epochs: int = 70
-    learning_rate: float = 0.001
-    batch_size: int = 16
+    epochs: int = 100
+    learning_rate: float = 0.0001
+    batch_size: int = 1024
 
     @staticmethod
     def default() -> MscnHyperParams:
