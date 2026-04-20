@@ -63,7 +63,8 @@ def main() -> None:
         "--min-filters",
         type=int,
         default=1,
-        help="Generate queries with at least this many filter predicates. Filter columns are selected randomly with replacement. "
+        help="Generate queries with at least this many filter predicates. "
+        "Filter columns are selected randomly with replacement. "
         "Default: 1",
     )
     parser.add_argument(
@@ -73,11 +74,19 @@ def main() -> None:
         help="Generate queries with at most this many filter predicates. Default: 5",
     )
     parser.add_argument(
+        "--like",
+        type=str,
+        help="Generate queries with similar join/filter predicates like the given workload. "
+        "The workload can be given as a directory with the raw queries, "
+        "or as one of the built-in workloads (job, stats, job-light, job-complex, stack).",
+    )
+    parser.add_argument(
         "--jobs",
         "-j",
         type=int,
         default=1,
-        help="Generate samples in parallel with --jobs many workers. Note that this affects the runtime measurements of the execution plans. "
+        help="Generate samples in parallel with --jobs many workers. "
+        "Note that this affects the runtime measurements of the execution plans. "
         "Default: 1 (sequential execution)",
     )
     parser.add_argument(
@@ -99,7 +108,8 @@ def main() -> None:
         "--timeout",
         "-t",
         type=int,
-        help="Cancel queries that run for longer than --timeout (full) seconds. By default, queries run until completion.",
+        help="Cancel queries that run for longer than --timeout (full) seconds. "
+        "By default, queries run until completion.",
     )
     parser.add_argument(
         "--verbose", "-v", action="store_true", help="Print log messages."
@@ -119,9 +129,19 @@ def main() -> None:
     else:
         parser.error("Either --pg-connect or --connect-string must be given.")
 
+    if args.like in ("job", "stats", "job-light", "job-complex", "stack"):
+        logger("Generating queries similar to", args.like)
+        workload = pb.workloads.fetch_workload(args.like)
+    elif args.like:
+        logger("Generating queries similar to workload at", args.like)
+        workload = pb.workloads.read_workload(args.like)
+    else:
+        workload = None
+
     logger("Initializing query generator")
     query_gen = sampler.generate_query(
         pg_instance,
+        similar_to=workload,
         count_star=False,
         min_tables=args.min_tables,
         max_tables=args.max_tables,

@@ -2,186 +2,530 @@
 
 from __future__ import annotations
 
+import collections
+import itertools
 import random
-from collections.abc import Generator
-from typing import Optional
+from collections.abc import Generator, Iterable, Mapping, Sequence
+from typing import Literal, Optional
 
 import networkx as nx
 import postbound as pb
 
 
-def _generate_join_predicates(
-    tables: list[pb.TableReference], *, schema: nx.DiGraph
-) -> pb.qal.AbstractPredicate:
-    """Generates equi-join predicates for specific tables.
-
-    Between each pair of tables, a join predicate is generated if there is a foreign key relationship between the two tables.
-
-    Parameters
-    ----------
-    tables : list[TableReference]
-        The tables to join.
-    schema : nx.DiGraph
-        Graph for the entire schema. It must contain node for all `tables`, but can contain more nodes.
-
-    Returns
-    -------
-    AbstractPredicate
-        A compound predicate that represents all foreign key joins between the tables. Notice that if there are partitions in
-        the schema, the predicate will not span all partitions, leading to cross products between some tables.
-
-    Raises
-    ------
-    ValueError
-        If no foreign key edges are found between the tables.
-    """
-    predicates: list[pb.qal.AbstractPredicate] = []
-
-    for i, outer_tab in enumerate(tables):
-        # Make sure to check each pair of tables only once
-        for inner_tab in tables[i + 1 :]:
-            # Since we are working with a directed graph, we need to check for both FK reference "directions"
-            fk_edge = schema.get_edge_data(outer_tab, inner_tab)
-            if not fk_edge:
-                fk_edge = schema.get_edge_data(inner_tab, outer_tab)
-            if not fk_edge:
-                continue
-
-            candidate_keys: list[pb.db.ForeignKeyRef] = fk_edge["foreign_keys"]
-            selected_key = random.choice(candidate_keys)
-            source_col, target_col = selected_key.referenced_col, selected_key.fk_col
-            join_predicate = pb.qal.as_predicate(
-                source_col, pb.qal.LogicalOperator.Equal, target_col
-            )
-            predicates.append(join_predicate)
-
-    if not predicates:
-        raise ValueError(
-            f"Found no suitable edges in the schema graph for tables {tables}."
-        )
-    return pb.qal.CompoundPredicate.create_and(predicates)
-
-
-def _generate_filter(
-    column: pb.ColumnReference, *, target_db: pb.Database
-) -> Optional[pb.qal.AbstractPredicate]:
-    """Generates a random filter predicate for a specific column.
-
-    The predicate will be a simple binary predicate using one of the following operators: equality, inequality, greater than,
-    or less than. The comparison value is randomly selected from the set of distinct values for the column.
-
-    Parameters
-    ----------
-    column : ColumnReference
-        The column to filter.
-    target_db : Database
-        The database that contains all allowed values for the column.
-
-    Returns
-    -------
-    Optional[AbstractPredicate]
-        A random filter predicate on the column. If no candidate values are found in the database, *None* is returned.
-
-    """
-
-    # TODO: for text columns we should also generate LIKE predicates
-    candidate_operators = [
-        pb.qal.LogicalOperator.Equal,
-        pb.qal.LogicalOperator.NotEqual,
-        pb.qal.LogicalOperator.Greater,
-        pb.qal.LogicalOperator.Less,
+def _like_op(op: pb.qal.LogicalOperator) -> bool:
+    return op in [
+        pb.qal.LogicalOperator.Like,
+        pb.qal.LogicalOperator.NotLike,
+        pb.qal.LogicalOperator.ILike,
+        pb.qal.LogicalOperator.NotILike,
     ]
 
-    # We need to compute the unique values for the column
-    # For Postgres, we can use the TABLESAMPLE clause to reduce the number of rows to materialize by a large number.
-    # For all other databases, we need to compute the entire result set.
-    # In either case, we should never cache the results of this query, even if this might be way more efficient for continuous
-    # sampling of queries. The reason is that the number of distinct values can be huge and we don't want to overload the cache
-    estimated_n_rows = target_db.statistics().total_rows(column.table, emulated=False)
-    if isinstance(target_db, pb.postgres.PostgresInterface) and estimated_n_rows > 1000:
-        distinct_template = (
-            """SELECT DISTINCT {col} FROM {tab} TABLESAMPLE BERNOULLI(1)"""
+
+def _text_col(dtype: str) -> bool:
+    return dtype in ["text", "varchar", "char", "character varying"]
+
+
+class _ColSpec:
+    @staticmethod
+    def full(
+        column: pb.BoundColumnReference,
+        *,
+        database: pb.Database,
+        operators: Optional[Sequence[pb.qal.LogicalOperator]] = None,
+    ) -> _ColSpec:
+        dtype = database.schema().datatype(column)
+        is_text = _text_col(dtype)
+        operators = operators or [
+            pb.qal.LogicalOperator.Equal,
+            pb.qal.LogicalOperator.Greater,
+            pb.qal.LogicalOperator.GreaterEqual,
+            pb.qal.LogicalOperator.Less,
+            pb.qal.LogicalOperator.LessEqual,
+            pb.qal.LogicalOperator.Like,
+        ]
+        if not is_text:
+            operators = [op for op in operators if not _like_op(op)]
+
+        return _ColSpec(
+            column=column,
+            is_text=is_text,
+            allowed_ops=operators,
+            value_selection="sample",
+            values=[],
         )
+
+    def __init__(
+        self,
+        column: pb.BoundColumnReference,
+        is_text: bool,
+        allowed_ops: Iterable[pb.qal.LogicalOperator],
+        value_selection: Literal["pick", "range", "sample"],
+        values: list,
+    ):
+        self._column = column
+        self._is_text = is_text
+        self._allowed_ops = list(allowed_ops)
+        self._value_selection = value_selection
+        self._values = values
+
+    @property
+    def column(self) -> pb.BoundColumnReference:
+        return self._column
+
+    @property
+    def is_text(self) -> bool:
+        return self._is_text
+
+    @property
+    def allowed_ops(self) -> Sequence[pb.qal.LogicalOperator]:
+        return self._allowed_ops
+
+    @property
+    def value_selection(self) -> Literal["pick", "range", "sample"]:
+        return self._value_selection
+
+    @property
+    def values(self) -> list:
+        return self._values
+
+    def add_op(self, op: pb.qal.LogicalOperator) -> None:
+        if not self.is_text and _like_op(op):
+            return
+        if op not in self._allowed_ops:
+            self._allowed_ops.append(op)
+
+
+class _TableSpec:
+    @staticmethod
+    def full(
+        table: pb.TableReference,
+        *,
+        database: pb.Database,
+        operators: Optional[Sequence[pb.qal.LogicalOperator]] = None,
+    ) -> _TableSpec:
+        filter_cols: Mapping[pb.ColumnReference, _ColSpec] = {}
+        tab_info = database.schema()[table]
+        for col_info in tab_info.columns:
+            if col_info.indexed:
+                continue
+            filter_cols[col_info.column] = _ColSpec.full(
+                col_info.column, database=database, operators=operators
+            )
+        return _TableSpec(table=table, filter_columns=filter_cols)
+
+    @staticmethod
+    def empty(table: pb.TableReference) -> _TableSpec:
+        return _TableSpec(table=table, filter_columns={})
+
+    def __init__(
+        self,
+        table: pb.TableReference,
+        filter_columns: Mapping[pb.ColumnReference, _ColSpec],
+    ):
+        self.table = table
+        self.filter_columns = dict(filter_columns)
+
+    def columns(self) -> list[pb.ColumnReference]:
+        return list(self.filter_columns.keys())
+
+
+class _PredicateCollector(pb.qal.PredicateVisitor[None]):
+    def __init__(self):
+        self.column_filters: Mapping[
+            pb.BoundColumnReference, set[pb.qal.LogicalOperator]
+        ] = collections.defaultdict(set)
+        self.joins: set[tuple[pb.BoundColumnReference, pb.BoundColumnReference]] = set()
+        self.filter_weights: collections.Counter[pb.BoundColumnReference] = (
+            collections.Counter()
+        )
+
+    def visit_binary_predicate(self, predicate: pb.qal.BinaryPredicate) -> None:
+        if predicate.is_filter():
+            self._visit_binary_filter(predicate)
+        elif predicate.is_join():
+            self._visit_binary_join(predicate)
+        else:
+            raise RuntimeError()
+
+    def visit_between_predicate(self, predicate: pb.qal.BetweenPredicate) -> None:
+        columns = predicate.columns()
+        if len(columns) != 1:
+            return
+        col = pb.util.simplify(columns)
+        if not pb.ColumnReference.assert_bound(col):
+            return
+        col = col.drop_table_alias()
+
+        # We don't include BETWEEN predicates, because our sampling logic can
+        # currently only select single values for the filter columns
+        self.column_filters[col].update(
+            [
+                pb.qal.LogicalOperator.LessEqual,
+                pb.qal.LogicalOperator.GreaterEqual,
+            ]
+        )
+        self.filter_weights[col] += 1
+
+    def visit_in_predicate(self, predicate: pb.qal.InPredicate) -> None:
+        columns = predicate.columns()
+        if len(columns) != 1:
+            return
+        col = pb.util.simplify(columns)
+        if not pb.ColumnReference.assert_bound(col):
+            return
+        col = col.drop_table_alias()
+
+        # Similar to BETWEEN predicates, we don't include the actual IN predicate,
+        # because our sampling logic can currently only select single values for the
+        # filter columns. Instead, we treat IN predicates as equality predicates on the column.
+        self.column_filters[col].add(pb.qal.LogicalOperator.Equal)
+        self.filter_weights[col] += 1
+
+    def visit_unary_predicate(self, predicate: pb.qal.UnaryPredicate) -> None:
+        return
+
+    def visit_not_predicate(
+        self,
+        predicate: pb.qal.CompoundPredicate,
+        child_predicate: pb.qal.AbstractPredicate,
+    ) -> None:
+        return child_predicate.accept_visitor(self)
+
+    def visit_or_predicate(
+        self,
+        predicate: pb.qal.CompoundPredicate,
+        components: Sequence[pb.qal.AbstractPredicate],
+    ) -> None:
+        for component in components:
+            component.accept_visitor(self)
+
+    def visit_and_predicate(
+        self,
+        predicate: pb.qal.CompoundPredicate,
+        components: Sequence[pb.qal.AbstractPredicate],
+    ) -> None:
+        for component in components:
+            component.accept_visitor(self)
+
+    def _visit_binary_filter(self, predicate: pb.qal.BinaryPredicate) -> None:
+        if not isinstance(predicate.operation, pb.qal.LogicalOperator):
+            return
+        columns = predicate.columns()
+        if len(columns) != 1:
+            return
+        col = pb.util.simplify(columns)
+        if not pb.ColumnReference.assert_bound(col):
+            return
+
+        col = col.drop_table_alias()
+        self.column_filters[col].add(predicate.operation)
+        self.filter_weights[col] += 1
+
+    def _visit_binary_join(self, predicate: pb.qal.BinaryPredicate) -> None:
+        columns = predicate.columns()
+        if len(columns) != 2:
+            return
+        col1, col2 = columns
+        if (  #
+            not pb.ColumnReference.assert_bound(col1)  #
+            or not pb.ColumnReference.assert_bound(col2)
+        ):
+            return
+        if col2 < col1:
+            col1, col2 = col2, col1
+        col1 = col1.drop_table_alias()
+        col2 = col2.drop_table_alias()
+        self.joins.add((col1, col2))
+
+
+class _SampleSpec:
+    @staticmethod
+    def full(
+        database: pb.Database,
+        *,
+        ignore_tables: Optional[set[pb.TableReference]] = None,
+        operators: Optional[Sequence[pb.qal.LogicalOperator]] = None,
+    ) -> _SampleSpec:
+        schema = database.schema()
+        ignore_tables = ignore_tables or set()
+        tables = {
+            tab: _TableSpec.full(tab, database=database, operators=operators)
+            for tab in schema.tables()
+            if tab not in ignore_tables and not tab.full_name.startswith("pg_")
+        }
+        columns = pb.util.flatten(spec.columns() for spec in tables.values())
+        filter_weights = {col: 1 for col in columns}
+
+        schema_graph = schema.as_graph()
+        join_graph = nx.Graph()
+        for _, _, data in schema_graph.edges(data=True):
+            fkeys: Sequence[pb.db.ForeignKeyRef] = data["foreign_keys"]
+            for fkey in fkeys:
+                fk_col, ref_col = fkey.fk_col, fkey.referenced_col
+                join_graph.add_edge(
+                    fk_col.table,
+                    ref_col.table,
+                    join_columns={fk_col.table: fk_col, ref_col.table: ref_col},
+                )
+
+        min_tables = 1
+        max_tables = len(tables)
+        min_filters = 0
+        max_filters = len(columns)
+
+        return _SampleSpec(
+            tables=tables,
+            filter_weights=filter_weights,
+            joins=join_graph,
+            min_tables=min_tables,
+            max_tables=max_tables,
+            min_filters=min_filters,
+            max_filters=max_filters,
+        )
+
+    @staticmethod
+    def derive_from_workload(
+        workload: pb.Workload, *, database: pb.Database
+    ) -> _SampleSpec:
+        predicate_collector = _PredicateCollector()
+        tables: set[pb.TableReference] = set()
+        min_tables, max_tables = float("inf"), 0
+        min_filters, max_filters = float("inf"), 0
+        for query in workload.queries():
+            predicate_collector.visit_query_predicates(query)
+            tables.update(tab.drop_alias() for tab in query.tables())
+
+            min_tables = min(min_tables, len(query.tables()))
+            max_tables = max(max_tables, len(query.tables()))
+            n_filters = len(query.filters())
+            min_filters = min(min_filters, n_filters)
+            max_filters = max(max_filters, n_filters)
+
+        join_graph = nx.Graph()
+        for col1, col2 in predicate_collector.joins:
+            join_graph.add_edge(
+                col1.table,
+                col2.table,
+                join_columns={col1.table: col1, col2.table: col2},
+            )
+
+        col_specs: dict[pb.TableReference, set[_ColSpec]] = collections.defaultdict(set)
+        for column, ops in predicate_collector.column_filters.items():
+            tab = column.table
+            dtype = database.schema().datatype(column)
+            col_specs[tab].add(_ColSpec(column, _text_col(dtype), ops, "sample", []))
+
+        table_specs: dict[pb.TableReference, _TableSpec] = {}
+        for tab in tables:
+            cols = col_specs.get(tab, set())
+            if not cols:
+                table_specs[tab] = _TableSpec.empty(tab)
+                continue
+
+            filter_columns = {col.column: col for col in cols}
+            table_specs[tab] = _TableSpec(table=tab, filter_columns=filter_columns)
+
+        return _SampleSpec(
+            tables=table_specs,
+            filter_weights=predicate_collector.filter_weights,
+            joins=join_graph,
+            min_tables=min_tables,
+            max_tables=max_tables,
+            min_filters=min_filters,
+            max_filters=max_filters,
+        )
+
+    def __init__(
+        self,
+        tables: Mapping[pb.TableReference, _TableSpec],
+        filter_weights: Mapping[pb.ColumnReference, int],
+        joins: nx.Graph,
+        min_tables: int,
+        max_tables: int,
+        min_filters: int,
+        max_filters: int,
+    ) -> None:
+        self.tables = dict(tables)
+        self.filter_weights = dict(filter_weights)
+        self.joins = joins
+        self.min_tables = min_tables
+        self.max_tables = max_tables
+        self.min_filters = min_filters
+        self.max_filters = max_filters
+
+    @property
+    def n_tables(self) -> int:
+        return len(self.tables)
+
+    @property
+    def n_filter_columns(self) -> int:
+        return sum(len(tab_spec.filter_columns) for tab_spec in self.tables.values())
+
+    def cols_on(
+        self, tables: Sequence[pb.TableReference]
+    ) -> Sequence[pb.ColumnReference]:
+        return pb.util.flatten(self.tables[tab].filter_columns.keys() for tab in tables)
+
+    def __getitem__(self, key: pb.ColumnReference) -> _ColSpec:
+        if not pb.ColumnReference.assert_bound(key):
+            raise KeyError(f"Column reference {key} is not bound.")
+        table_spec = self.tables.get(key.table)
+        if not table_spec:
+            raise KeyError(f"Table {key.table} not found in sample spec.")
+        col_spec = table_spec.filter_columns.get(key)
+        if not col_spec:
+            raise KeyError(f"Column {key} is not a filter column.")
+        return col_spec
+
+
+def _draw_tables(spec: _SampleSpec, n: int) -> Sequence[pb.TableReference]:
+    tables: list[pb.TableReference] = []
+    for tab in pb.util.nx.nx_random_walk(spec.joins):
+        tables.append(tab)
+        if len(tables) >= n:
+            break
+    return [] if len(tables) < n else tables
+
+
+def _draw_filter_cols(
+    tables: Sequence[pb.TableReference],
+    n: int,
+    *,
+    spec: _SampleSpec,
+) -> Sequence[pb.ColumnReference]:
+    cols = pb.util.flatten(spec.tables[tab].columns() for tab in tables)
+    total_weight = 0
+    col_weights: dict[pb.ColumnReference, float] = {}
+    for col in cols:
+        weight = spec.filter_weights.get(col, 1)
+        col_weights[col] = weight
+        total_weight += weight
+    col_weights = {col: weight / total_weight for col, weight in col_weights.items()}
+    return random.choices(cols, k=n, weights=list(col_weights.values()))
+
+
+def _draw_filter_value(
+    col: _ColSpec,
+    operator: pb.qal.LogicalOperator,
+    *,
+    database: pb.Database,
+    retries: int = 3,
+):
+    col_name, tab_name = col.column.name, col.column.table.full_name
+
+    # Postgres and DuckDB provide specialized sampling facilities. Use them if possible.
+    if isinstance(database, pb.postgres.PostgresInterface):
+        # even though the BERNOUILLI sampling method would be "more uniform", we opt for SYSTEM sampling due to its much
+        # lower execution time.
+        query_template = f"SELECT DISTINCT {col_name} FROM {tab_name} TABLESAMPLE SYSTEM(1) WHERE {col_name} IS NOT NULL"
+    elif isinstance(database, pb.duckdb.DuckDBInterface):
+        query_template = f"SELECT DISTINCT {col_name} FROM {tab_name} WHERE {col_name} IS NOT NULL USING SAMPLE 1 ROWS"
     else:
-        distinct_template = """SELECT DISTINCT {col} FROM {tab}"""
+        query_template = (
+            f"SELECT DISTINCT {col_name} FROM {tab_name} WHERE {col_name} IS NOT NULL"
+        )
 
-    candidate_values = target_db.execute_query(
-        distinct_template.format(col=column.name, tab=column.table.full_name),
-        cache_enabled=False,
-    )
-    if not candidate_values:
+    result_set = database.execute_query(query_template, cache_enabled=False, raw=True)
+    assert result_set is not None
+    if not result_set and retries == 0:
         return None
-    candidate_values = pb.util.enlist(candidate_values)
+    elif not result_set:
+        return _draw_filter_value(col, operator, database=database, retries=retries - 1)
 
-    selected_value = random.choice(candidate_values)
-    selected_operator = random.choice(candidate_operators)
-    filter_predicate = pb.qal.as_predicate(column, selected_operator, selected_value)
-    return filter_predicate
+    candidate_values = [row[0] for row in result_set]
+    value = random.choice(candidate_values)
+
+    if _like_op(operator) and col.is_text:
+        value = f"%{value}%"
+
+    return value
 
 
-def _is_numeric(data_type: str) -> bool:
-    """Checks, whether a data type is numeric."""
-    return data_type in {
-        "integer",
-        "smallint",
-        "bigint",
-        "date",
-        "double precision",
-        "real",
-        "numeric",
-        "decimal",
-    } or data_type.startswith("time")
+def _draw_filter_pred(
+    col: _ColSpec, *, database: pb.Database
+) -> Optional[pb.qal.AbstractPredicate]:
+    operator = random.choice(col.allowed_ops)
+
+    match col.value_selection:
+        case "pick":
+            value = random.choice(col.values)
+        case "range":
+            value = random.uniform(min(col.values), max(col.values))
+        case "sample":
+            value = _draw_filter_value(col, operator, database=database)
+
+    if value is None:
+        return None
+
+    return pb.qal.as_predicate(col.column, operator, value)
+
+
+def _generate_join_predicates(
+    tables: Sequence[pb.TableReference], *, schema: nx.Graph
+) -> Sequence[pb.qal.AbstractPredicate]:
+    joins: list[pb.qal.AbstractPredicate] = []
+    for tab1, tab2 in itertools.combinations(tables, 2):
+        if not schema.has_edge(tab1, tab2):
+            continue
+        join_info = schema.get_edge_data(tab1, tab2)
+        col1 = join_info["join_columns"][tab1]
+        col2 = join_info["join_columns"][tab2]
+        joins.append(pb.qal.as_predicate(col1, "=", col2))
+    return joins
 
 
 def generate_query(
     target_db: Optional[pb.Database],
     *,
-    count_star: bool = False,
+    similar_to: Optional[pb.Workload] = None,
     ignore_tables: Optional[set[pb.TableReference]] = None,
     min_tables: Optional[int] = None,
     max_tables: Optional[int] = None,
     min_filters: Optional[int] = None,
     max_filters: Optional[int] = None,
-    filter_key_columns: bool = True,
-    numeric_filters: bool = False,
+    count_star: bool = False,
 ) -> Generator[pb.SqlQuery, None, None]:
     """A simple randomized query generator.
 
-    The generator selects a random subset of (connected) tables from the schema graph of the target database and builds a
-    random number of random filter predicates on the columns of the selected tables.
+    The sampler operates in one of two modes: If a workload is provided via the `similar_to`, the generated queries are
+    made with similar filters as the queries in the workload. Otherwise, all columns are equally likely to be filtered.
+    Note that the second case introduces a bias towards tables that have more columns.
 
     The generator will yield new queries until the user stops requesting them, there is no termination condition.
 
     Parameters
     ----------
     target_db : Optional[Database]
-        The database from which queries should be generated. The database is important for two main use-cases:
-
-        1. The schema graph is used to select a (connected) subset of tables
-        2. The column values are used to generate filter predicates
-
-        If no database is provided, the current database from the database pool is used.
-
-    count_star : bool, optional
-        Whether the resulting queries should contain a *COUNT(\\*)* instead of a plain * *SELECT* clause
+        The database from which queries should be generated.
+        If no workload is provided, the available joins are inferred based on the primary key/foreign key relationships in the
+        schema. Likewise, the sampler will use all non-key columns as potential filter columns.
+        If the database is not specified, it is inferred from PostBOUND's database pool.
+    similar_to : Optional[Workload], optional
+        If provided, the generated queries will be made to be similar to the workload queries. Specifically, this means the
+        following:
+        - Only joins that have been observed in the workload are used
+        - Only columns that have been used as filter columns are used as filter columns for the generated queries
+        - The probability of a column being used as a filter column is proportional to the number of times it has been used
+          as a filter column in the workload queries
     ignore_tables : Optional[set[TableReference]], optional
         An optional set of tables that should never be contained in the generated queries. For Postgres databases, internal
-        *pg_XXX* tables are ignored automatically.
+        *pg_XXX* tables are ignored automatically. This parameter is only used if no workload is provided.
     min_tables : Optional[int], optional
         The minimum number of tables that should be contained in each query. Default is 1.
+        If a sample workload is provided and this parameter is not set, it is inferred from the samples.
     max_tables : Optional[int], optional
         The maximum number of tables that should be contained in each query. Default is the number of tables in the schema
         graph (minus the ignored tables).
+        If a sample workload is provided and this parameter is not set, it is inferred from the samples.
     min_filters : Optional[int], optional
         The minimum number of filter predicates that should be contained in each query. Default is 0.
+        If a sample workload is provided and this parameter is not set, it is inferred from the samples.
     max_filters : Optional[int], optional
         The maximum number of filter predicates that should be contained in each query. By default, each column from the
         selected tables can be filtered.
-    filter_key_columns : bool, optional
-        Whether primary key/foreign key columns should be considered for filtering. This is enabled by default.
-    numeric_filters : bool, optional
-        Whether only numeric columns should be considered for filtering (i.e. integer, float or time columns). This is disabled
-        by default.
+        If a sample workload is provided and this parameter is not set, it is inferred from the samples.
+    count_star : bool, optional
+        Whether the resulting queries should contain a *COUNT(\\*)* instead of a plain *SELECT \\** clause
 
     Yields
     ------
@@ -191,133 +535,54 @@ def generate_query(
     Examples
     --------
     >>> qgen = generate_query(some_database)
-    >>> next(qgen)
+    >>> queries = [next(qgen) for _ in range(5)]
     """
 
     target_db = target_db or pb.db.current_database()
-    db_schema = target_db.schema()
-
-    #
-    # Our sampling algorithm is acutally pretty straightforward:
-    #
-    # 1. We select a random number of tables
-    # 2. We select a random number of columns to filter from the selected tables
-    # 3. We generate the join predicates between the tables
-    # 4. We generate random filter predicates for the selected columns
-    # 5. We build the query
-    #
-    # The hardest part (and the part that takes up the most LOCs), is making sure that we always select from the correct
-    # subset.
-    #
-
-    schema_graph = db_schema.as_graph()
-    if ignore_tables:
-        nodes_to_remove = [node for node in schema_graph.nodes if node in ignore_tables]
-        schema_graph.remove_nodes_from(nodes_to_remove)
-    if isinstance(target_db, pb.postgres.PostgresInterface):
-        nodes_to_remove = [
-            node for node in schema_graph.nodes if node.full_name.startswith("pg_")
-        ]
-        schema_graph.remove_nodes_from(nodes_to_remove)
-
-    min_tables = min_tables or 1
-    if not min_tables:
-        raise ValueError("min_tables must be at least 1")
-    max_tables = max_tables or len(schema_graph.nodes)
-    max_tables = min(max_tables, len(schema_graph.nodes))
-    if max_tables < min_tables:
-        raise ValueError(
-            f"max_tables must be at least as large as min_tables. Got {max_tables} (max) and {min_tables} (min)."
-        )
-
-    filter_columns = pb.util.flatten(
-        cols for __, cols in schema_graph.nodes(data="columns")
+    spec = (
+        _SampleSpec.derive_from_workload(similar_to, database=target_db)
+        if similar_to
+        else _SampleSpec.full(target_db, ignore_tables=ignore_tables)
     )
-    min_filters = min_filters or 0
-    max_filters = max_filters or len(filter_columns)
+
+    min_tables = min_tables or spec.min_tables
+    max_tables = max_tables or spec.max_tables
+    min_filters = min_filters or spec.min_filters
+    max_filters = max_filters or spec.max_filters
 
     select_clause = pb.qal.Select.count_star() if count_star else pb.qal.Select.star()
 
-    # We generate new queries until the user asks us to stop.
     while True:
         n_tables = random.randint(min_tables, max_tables)
-
-        # We ensure that we always generate a connected join graph by performing a random walk through the schema graph.
-        # This way, we can terminate the walk at any point if we have visited enough tables.
-        table_walk = pb.util.nx.nx_random_walk(schema_graph.to_undirected())
-        joined_tables: list[pb.TableReference] = [
-            next(table_walk) for _ in range(n_tables)
-        ]
-
-        available_columns: list[pb.ColumnReference] = pb.util.flatten(
-            [
-                cols
-                for tab, cols in schema_graph.nodes(data="columns")
-                if tab in set(joined_tables)
-            ]
-        )
-        if not filter_key_columns:
-            available_columns = [
-                col
-                for col in available_columns
-                if not db_schema.is_primary_key(col)
-                and not db_schema.foreign_keys_on(col)
-            ]
-        if numeric_filters:
-            available_columns = [
-                col
-                for col in available_columns
-                if _is_numeric(schema_graph.nodes[col.table]["data_type"][col])
-            ]
-
-        from_clause = pb.qal.ImplicitFromClause.create_for(joined_tables)
-        join_predicates = (
-            _generate_join_predicates(joined_tables, schema=schema_graph)
-            if n_tables > 1
-            else None
-        )
-
-        current_max_filters = min(max_filters, len(available_columns))
-        if current_max_filters <= min_filters:
-            # too few columns available, let's just try again
+        tables = _draw_tables(spec, n_tables)
+        if not tables:
             continue
-        else:
-            n_filters = random.randint(min_filters, current_max_filters)
 
-        if n_filters > 0 and available_columns:
-            cols_to_filter = random.choices(available_columns, k=n_filters)
-            individual_filters = [
-                _generate_filter(col, target_db=target_db) for col in cols_to_filter
-            ]
-            individual_filters = [
-                pred for pred in individual_filters if pred is not None
-            ]
-            filter_predicates = (
-                pb.qal.CompoundPredicate.create_and(individual_filters)
-                if individual_filters
-                else None
-            )
-        else:
-            filter_predicates = None
-
-        # This is just a bit of optimization to avoid useless nesting inside the WHERE clause
-        where_parts: list[pb.qal.AbstractPredicate] = []
-        for predicates in (join_predicates, filter_predicates):
-            match predicates:
-                case None:
-                    pass
-                case pb.qal.CompoundPredicate(op, children) if (
-                    op == pb.qal.CompoundOperator.And
-                ):
-                    where_parts.extend(children)
-                case _:
-                    where_parts.append(predicates)
-
-        where_clause = (
-            pb.qal.Where(pb.qal.CompoundPredicate.create_and(where_parts))
-            if where_parts
-            else None
+        n_filters = random.randint(
+            min_filters, min(max_filters, len(spec.cols_on(tables)))
         )
+        filter_cols = _draw_filter_cols(tables, n_filters, spec=spec)
+        filter_preds = [
+            _draw_filter_pred(spec[col], database=target_db) for col in filter_cols
+        ]
+        if any(pred is None for pred in filter_preds):
+            continue
 
-        query = pb.qal.build_query([select_clause, from_clause, where_clause])
+        predicates = []
+        if n_tables > 1:
+            predicates.extend(_generate_join_predicates(tables, schema=spec.joins))
+        if filter_preds:
+            predicates.extend(filter_preds)
+
+        if predicates:
+            where_clause = pb.qal.Where(pb.qal.CompoundPredicate.create_and(predicates))
+        else:
+            where_clause = None
+
+        from_clause = pb.qal.ImplicitFromClause.create_for(tables)
+        query = pb.qal.ImplicitSqlQuery(
+            select_clause=select_clause,
+            from_clause=from_clause,
+            where_clause=where_clause,
+        )
         yield query
