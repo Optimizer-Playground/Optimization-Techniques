@@ -6,10 +6,12 @@ import collections
 import itertools
 import random
 from collections.abc import Generator, Iterable, Mapping, Sequence
-from typing import Literal, Optional
+from typing import Any, Literal, Optional
 
 import networkx as nx
 import postbound as pb
+
+_NullOps = [pb.qal.LogicalOperator.Is, pb.qal.LogicalOperator.IsNot]
 
 
 def _like_op(op: pb.qal.LogicalOperator) -> bool:
@@ -394,6 +396,8 @@ def _draw_filter_cols(
     spec: _SampleSpec,
 ) -> Sequence[pb.ColumnReference]:
     cols = pb.util.flatten(spec.tables[tab].columns() for tab in tables)
+    if not cols:
+        return []
     total_weight = 0
     col_weights: dict[pb.ColumnReference, float] = {}
     for col in cols:
@@ -410,35 +414,37 @@ def _draw_filter_value(
     *,
     database: pb.Database,
     retries: int = 3,
-):
+) -> tuple[bool, Any]:
     col_name, tab_name = col.column.name, col.column.table.full_name
 
     # Postgres and DuckDB provide specialized sampling facilities. Use them if possible.
     if isinstance(database, pb.postgres.PostgresInterface):
         # even though the BERNOUILLI sampling method would be "more uniform", we opt for SYSTEM sampling due to its much
         # lower execution time.
-        query_template = f"SELECT DISTINCT {col_name} FROM {tab_name} TABLESAMPLE SYSTEM(1) WHERE {col_name} IS NOT NULL"
-    elif isinstance(database, pb.duckdb.DuckDBInterface):
-        query_template = f"SELECT DISTINCT {col_name} FROM {tab_name} WHERE {col_name} IS NOT NULL USING SAMPLE 1 ROWS"
-    else:
         query_template = (
-            f"SELECT DISTINCT {col_name} FROM {tab_name} WHERE {col_name} IS NOT NULL"
+            f"SELECT DISTINCT {col_name} FROM {tab_name} TABLESAMPLE SYSTEM(1)"
         )
+    elif isinstance(database, pb.duckdb.DuckDBInterface):
+        query_template = (
+            f"SELECT DISTINCT {col_name} FROM {tab_name} USING SAMPLE 1 ROWS"
+        )
+    else:
+        query_template = f"SELECT DISTINCT {col_name} FROM {tab_name}"
 
     result_set = database.execute_query(query_template, cache_enabled=False, raw=True)
     assert result_set is not None
     if not result_set and retries == 0:
-        return None
+        return (False, None)
     elif not result_set:
         return _draw_filter_value(col, operator, database=database, retries=retries - 1)
 
     candidate_values = [row[0] for row in result_set]
     value = random.choice(candidate_values)
 
-    if _like_op(operator) and col.is_text:
+    if _like_op(operator) and col.is_text and value is not None:
         value = f"%{value}%"
 
-    return value
+    return (True, value)
 
 
 def _draw_filter_pred(
@@ -446,16 +452,34 @@ def _draw_filter_pred(
 ) -> Optional[pb.qal.AbstractPredicate]:
     operator = random.choice(col.allowed_ops)
 
+    # LIKE operators can only be applied to text columns.
+    while not col.is_text and _like_op(operator):
+        operator = random.choice(col.allowed_ops)
+
     match col.value_selection:
         case "pick":
             value = random.choice(col.values)
+            success = True
         case "range":
             value = random.uniform(min(col.values), max(col.values))
+            success = True
         case "sample":
-            value = _draw_filter_value(col, operator, database=database)
+            success, value = _draw_filter_value(col, operator, database=database)
 
-    if value is None:
+    if not success:
         return None
+
+    # If we have sampled a NULL value, we cannot use an arbitrary operator in our predicate.
+    # Instead, we need to select one of the NULL-specific operators (IS or IS NOT).
+    if value is None and operator not in _NullOps:
+        allowed_null_ops = [op for op in col.allowed_ops if op in _NullOps]
+        if not allowed_null_ops:
+            return None
+        operator = random.choice(allowed_null_ops)
+
+    # Conversely, if we have sampled a non-NULL value, we cannot use NULL-specific operators.
+    while value is not None and operator in _NullOps:
+        operator = random.choice(col.allowed_ops)
 
     return pb.qal.as_predicate(col.column, operator, value)
 
@@ -562,6 +586,9 @@ def generate_query(
             min_filters, min(max_filters, len(spec.cols_on(tables)))
         )
         filter_cols = _draw_filter_cols(tables, n_filters, spec=spec)
+        if n_filters != len(filter_cols):
+            continue
+
         filter_preds = [
             _draw_filter_pred(spec[col], database=target_db) for col in filter_cols
         ]
