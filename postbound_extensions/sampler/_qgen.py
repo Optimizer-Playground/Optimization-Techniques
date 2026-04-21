@@ -483,6 +483,11 @@ def _draw_filter_pred(
     while value is not None and operator in _NullOps:
         operator = random.choice(col.allowed_ops)
 
+    if value == "*":
+        # as_predicate() would turn * into a StarExpression, not into a literal star.
+        # To avoid this, we need to manually cast to the literal here.
+        value = pb.qal.StaticValueExpression("*")
+
     return pb.qal.as_predicate(col.column, operator, value)
 
 
