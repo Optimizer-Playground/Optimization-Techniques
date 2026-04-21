@@ -363,7 +363,7 @@ class _SampleSpec:
     def n_filter_columns(self) -> int:
         return sum(len(tab_spec.filter_columns) for tab_spec in self.tables.values())
 
-    def cols_on(
+    def filterable_cols_on(
         self, tables: Sequence[pb.TableReference]
     ) -> Sequence[pb.ColumnReference]:
         return pb.util.flatten(self.tables[tab].filter_columns.keys() for tab in tables)
@@ -395,17 +395,19 @@ def _draw_filter_cols(
     *,
     spec: _SampleSpec,
 ) -> Sequence[pb.ColumnReference]:
-    cols = pb.util.flatten(spec.tables[tab].columns() for tab in tables)
+    cols = spec.filterable_cols_on(tables)
     if not cols:
         return []
+
     total_weight = 0
-    col_weights: dict[pb.ColumnReference, float] = {}
+    abs_weights: dict[pb.ColumnReference, float] = {}
     for col in cols:
         weight = spec.filter_weights.get(col, 1)
-        col_weights[col] = weight
+        abs_weights[col] = weight
         total_weight += weight
-    col_weights = {col: weight / total_weight for col, weight in col_weights.items()}
-    return random.choices(cols, k=n, weights=list(col_weights.values()))
+
+    rel_weights = {col: weight / total_weight for col, weight in abs_weights.items()}
+    return random.choices(cols, k=n, weights=list(rel_weights.values()))
 
 
 def _draw_filter_value(
@@ -582,9 +584,16 @@ def generate_query(
         if not tables:
             continue
 
-        n_filters = random.randint(
-            min_filters, min(max_filters, len(spec.cols_on(tables)))
-        )
+        max_available_filters = min(max_filters, len(spec.filterable_cols_on(tables)))
+        if min_filters < max_available_filters:
+            n_filters = random.randint(min_filters, max_available_filters)
+        elif min_filters == max_available_filters:
+            n_filters = min_filters
+        else:
+            # The selected tables don't have enough filterable columns to satisfy the minimum filter requirement.
+            # We need to redraw tables.
+            continue
+
         filter_cols = _draw_filter_cols(tables, n_filters, spec=spec)
         if n_filters != len(filter_cols):
             continue
