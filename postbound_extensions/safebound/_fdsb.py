@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Generator, Iterable, Sequence
+from collections.abc import Generator, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import overload
 
@@ -329,7 +329,7 @@ def _create_alpha_step(
     *,
     source: pb.TableReference,
     include_source: bool,
-    statistics: dict[pb.ColumnReference, PiecewiseConstantFn],
+    statistics: Mapping[pb.ColumnReference, PiecewiseConstantFn],
 ) -> AlphaStep:
     relations: list[FunctionLike] = []
     for neighbor in _adj_flow(join_graph, join, source=source):
@@ -359,7 +359,7 @@ def _dispatch_on(
     join: int,
     *,
     source: pb.TableReference,
-    statistics: dict[pb.ColumnReference, PiecewiseConstantFn],
+    statistics: Mapping[pb.ColumnReference, PiecewiseConstantFn],
 ) -> FunctionLike:
     deg = join_graph.degree[join]
 
@@ -380,7 +380,7 @@ def _create_beta_step(
     node: pb.TableReference,
     *,
     project_on: int,
-    statistics: dict[pb.ColumnReference, PiecewiseConstantFn],
+    statistics: Mapping[pb.ColumnReference, PiecewiseConstantFn],
 ) -> BetaStep:
     dimension_joins: list[DimensionJoin] = []
     for join in _adj_flow(join_graph, node, source=project_on):
@@ -407,7 +407,7 @@ def decompose_acyclic(
     join_graph: nx.Graph,
     root: pb.TableReference,
     *,
-    statistics: dict[pb.ColumnReference, PiecewiseConstantFn],
+    statistics: Mapping[pb.ColumnReference, PiecewiseConstantFn],
 ) -> AlphaStep:
     join: int = next(iter(join_graph.adj[root]))
     return _create_alpha_step(
@@ -433,7 +433,7 @@ def _fdsb_graph(query: pb.SqlQuery) -> nx.Graph:
 def decompose_query(
     query: pb.SqlQuery,
     *,
-    statistics: dict[pb.ColumnReference, PiecewiseConstantFn],
+    statistics: Mapping[pb.ColumnReference, PiecewiseConstantFn],
     verbose: bool | pb.util.Logger = False,
 ) -> AlphaStep | BetaStep:
     join_graph = _fdsb_graph(query)
@@ -444,7 +444,7 @@ def decompose_query(
 
 
 def fdsb(
-    query: pb.SqlQuery, *, statistics: dict[pb.ColumnReference, PiecewiseConstantFn]
+    query: pb.SqlQuery, *, statistics: Mapping[pb.ColumnReference, PiecewiseConstantFn]
 ) -> pb.Cardinality:
     join_graph = _fdsb_graph(query)
 

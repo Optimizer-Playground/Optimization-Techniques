@@ -4,6 +4,12 @@ from ._piecewise_fns import DegreeSequence, PiecewiseLinearFn, Segment
 
 
 def valid_compress(ds: DegreeSequence, *, accuracy: float) -> PiecewiseLinearFn:
+    """Compresses a raw degree sequence into a piecewise linear function.
+
+    This is basically a 1:1 mapping of the *ValidCompress* algorithm from the original SafeBound
+    paper. The `accuracy` controls how much error/overestimation is allowed in the resulting
+    segements. It corresponds to the *c* parameter from the paper.
+    """
     selfjoin_bound = ds.join_bound(ds)
     err_threshold = accuracy * selfjoin_bound
 
