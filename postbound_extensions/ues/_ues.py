@@ -74,6 +74,7 @@ class UesJoinOrdering(pb.JoinOrderOptimization, pb.CardinalityEstimator):
         database: Optional[pb.Database] = None,
         estimations: Literal["native", "precise"] = "precise",
     ) -> None:
+        super().__init__()
         self._database = database or pb.db.current_database()
 
         emulate_stats = estimations == "precise"
@@ -97,7 +98,9 @@ class UesJoinOrdering(pb.JoinOrderOptimization, pb.CardinalityEstimator):
 
             if not join_tree:
                 best_initial = pb.util.argmin(upper)
-                join_tree = pb.JoinTree(base_table=pb.util.simplify(best_initial))
+                initial_table = pb.util.simplify(best_initial)
+                join_tree = pb.JoinTree(base_table=initial_table)
+                expanding_tables.remove(initial_table)
                 continue
 
             best_bound = UpperBound.infinite()
@@ -288,15 +291,15 @@ class UesJoinOrdering(pb.JoinOrderOptimization, pb.CardinalityEstimator):
         query: pb.SqlQuery,
     ) -> dict[pb.TableReference, JoinPartners]:
         partners: dict[pb.TableReference, JoinPartners] = collections.defaultdict(set)
-        for table in free_tables:
-            join_predicates = query.joins_between(table, bound_tables)
+        for free_tab in free_tables:
+            join_predicates = query.joins_between(free_tab, bound_tables)
             if not join_predicates:
                 continue
 
             for join_pred in join_predicates.base_predicates():
                 # This only works under the assumption that we either have a simple binary join, or a conjunction of such
 
-                free_key = join_pred.join_partners_of(table)
+                free_key = join_pred.join_partners_of(free_tab)
                 assert len(free_key) == 1
                 free_key = pb.util.simplify(free_key)
                 assert free_key.table, "Unbound candidate"
@@ -305,7 +308,7 @@ class UesJoinOrdering(pb.JoinOrderOptimization, pb.CardinalityEstimator):
                 assert len(bound_key) == 1
                 bound_key = pb.util.simplify(bound_key)
 
-                partners[table].add((free_key, bound_key))
+                partners[free_tab].add((free_key, bound_key))
 
         return partners
 
@@ -360,6 +363,7 @@ class UesOperators(pb.PhysicalOperatorSelection):
     """
 
     def __init__(self, *, database: Optional[pb.Database] = None) -> None:
+        super().__init__()
         self._database = database or pb.db.current_database()
 
     def select_physical_operators(
