@@ -182,6 +182,7 @@ from ._fdsb import (
 )
 from ._piecewise_fns import (
     DegreeSequence,
+    FunctionLike,
     PiecewiseConstantFn,
     PiecewiseLinearFn,
     Segment,
@@ -196,6 +197,7 @@ __all__ = [
     "DimensionJoin",
     "EqualityConditionedPCF",
     "EqualityConditionsRepo",
+    "FunctionLike",
     "LikeConditionedPCF",
     "LikeConditionsRepo",
     "PiecewiseConstantFn",

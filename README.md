@@ -28,9 +28,9 @@ Optimizer prototypes are implemented using the [PostBOUND framework](https://git
 - [x] BAO
   - [x] baseline implementation
   - [x] documentation
-- [ ] SafeBound
+- [x] SafeBound
   - [x] baseline implementation
-  - [ ] documentation
+  - [x] documentation
 - [ ] FASTgres
   - [x] baseline implementation
   - [ ] documentation
