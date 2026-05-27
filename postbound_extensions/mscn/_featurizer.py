@@ -865,6 +865,18 @@ class MscnFeaturizer:
                 encoder_batches[col] = [simplified.value]
                 value_indexes.append(0)
 
+        if not columns:
+            # We iterated over all predicates and did not find a single one that is supported by
+            # MSCN. Stop.
+            #
+            # XXX: This can happen if our query only contains a BETWEEN or an IN filter. While
+            # MSCN does not specify how these should be handled, many related approaches support
+            # them (e.g. by using the average value). Should we implement something similar?
+
+            # tensor structure: (column one-hot | operator one-hot | value encoding) x predicates
+            n_features = self.n_columns + len(self._operators) + 1
+            return np.zeros((self.n_columns, n_features))
+
         # Step 2: invoke the actual encoders
 
         encoded_columns = self._columns_encoder.transform(
