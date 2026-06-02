@@ -1,7 +1,11 @@
 """PostBOUND Extensions - A curated collection of novel ideas in query optimization."""
 
 import lazy_loader
+from importlib.metadata import PackageNotFoundError, version
 
 __getattr__, __dir__, __all__ = lazy_loader.attach_stub(__name__, __file__)
 
-__version__ = "0.1.0-dev"
+try:
+    __version__ = version("Optimizer-Playground")
+except PackageNotFoundError:
+    __version__ = "<development>"

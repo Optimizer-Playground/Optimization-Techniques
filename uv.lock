@@ -1414,8 +1414,8 @@ wheels = [
 ]
 
 [[package]]
-name = "optimization-techniques"
-version = "0.1.0.dev0"
+name = "optimizer-playground"
+version = "0.1.0.dev1"
 source = { virtual = "." }
 dependencies = [
     { name = "lazy-loader" },
