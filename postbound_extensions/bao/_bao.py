@@ -559,7 +559,9 @@ class BaoOptimizer(
         with open(archive, "r") as f:
             catalog = json.load(f)
 
-        featurizer = BaoFeaturizer.pre_built(catalog["featurizer"], database=database)
+        featurizer = BaoFeaturizer.pre_built(
+            catalog["featurizer"], database=database
+        )
         experience = BaoExperience.load(
             catalog["experience"]["catalog"], featurizer=featurizer
         )
@@ -622,7 +624,9 @@ class BaoOptimizer(
 
         if archive.is_file():
             log(f"Detected existing BAO model at {archive}. Re-loading.")
-            return BaoOptimizer.pre_trained(archive, database=database, verbose=verbose)
+            return BaoOptimizer.pre_trained(
+                archive, database=database, verbose=verbose
+            )
 
         log(f"No BAO model found at {archive}. Creating a new one.")
         bao = BaoOptimizer(
@@ -658,7 +662,9 @@ class BaoOptimizer(
         super().__init__()
         self._db = target_db
         self._hint_sets = (
-            list(hint_sets) if hint_sets is not None else default_hint_sets()
+            list(hint_sets)
+            if hint_sets is not None
+            else default_hint_sets()[:5]
         )
         self._featurizer = featurizer or BaoFeaturizer.online(self._db)
         self._experience = experience or BaoExperience(
@@ -688,7 +694,9 @@ class BaoOptimizer(
 
     def optimize_query(self, query: pb.SqlQuery) -> pb.QueryPlan:
         cache_state = DatabaseCacheState(self._db)
-        plans = [self._generate_plan(query, hint_set) for hint_set in self._hint_sets]
+        plans = [
+            self._generate_plan(query, hint_set) for hint_set in self._hint_sets
+        ]
         featurized = [
             self._featurizer.encode_plan(plan, cache_state=cache_state)
             for plan in plans
@@ -823,12 +831,16 @@ class BaoOptimizer(
         )
 
         if timeout_ms and not isinstance(self._db, pb.db.TimeoutSupport):
-            raise ValueError("Target database system does not provide timeout support.")
+            raise ValueError(
+                "Target database system does not provide timeout support."
+            )
 
         if timeout_ms:
             assert isinstance(self._db, pb.db.TimeoutSupport)
             timeout = 1000 * timeout_ms if timeout_ms else None
-            executor = functools.partial(self._db.execute_with_timeout, timeout=timeout)
+            executor = functools.partial(
+                self._db.execute_with_timeout, timeout=timeout
+            )
         else:
             executor = functools.partial(self._db.execute_query, raw=True)
 
@@ -983,6 +995,8 @@ class BaoOptimizer(
                 optimizer.step()
 
             epoch_str = str(epoch + 1).rjust(len(str(self._epochs)))
-            self._log(f"Epoch: {epoch_str} / {self._epochs} :: loss = {loss_total}")
+            self._log(
+                f"Epoch: {epoch_str} / {self._epochs} :: loss = {loss_total}"
+            )
 
         self._tcnn.eval()
