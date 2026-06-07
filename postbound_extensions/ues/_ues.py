@@ -19,6 +19,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 from __future__ import annotations
 
 import collections
+import warnings
 from collections.abc import Iterable
 from typing import Literal, Optional
 
@@ -81,7 +82,9 @@ class UesJoinOrdering(pb.JoinOrderOptimization, pb.CardinalityEstimator):
         self._stats = self._database.statistics()
         self._stats.emulated = emulate_stats
 
-    def optimize_join_order(self, query: pb.SqlQuery) -> pb.JoinTree[pb.Cardinality]:
+    def optimize_join_order(
+        self, query: pb.SqlQuery
+    ) -> pb.JoinTree[pb.Cardinality] | None:
         join_tree: pb.JoinTree[pb.Cardinality] = pb.JoinTree()
         expanding_tables, filtering_tables = self._determine_table_types(query)
         upper: dict[Intermediate, UpperBound] = {}
@@ -174,6 +177,14 @@ class UesJoinOrdering(pb.JoinOrderOptimization, pb.CardinalityEstimator):
             expanding_tables.remove(best_candidate)
             filtering_tables.difference_update(available_pks)
 
+        remaining_tables = query.tables() - join_tree.tables()
+        if remaining_tables:
+            warnings.warn(
+                f"Query {query} has unprocessed tables left: {remaining_tables}. "
+                "Not returning a join order."
+            )
+            return None
+
         return join_tree
 
     def calculate_estimate(
@@ -185,6 +196,8 @@ class UesJoinOrdering(pb.JoinOrderOptimization, pb.CardinalityEstimator):
         if subquery is None:
             return pb.Cardinality.unknown()
         join_tree = self.optimize_join_order(subquery)
+        if not join_tree:
+            return pb.Cardinality.unknown()
         return join_tree.annotation
 
     def describe(self) -> pb.util.jsondict:
