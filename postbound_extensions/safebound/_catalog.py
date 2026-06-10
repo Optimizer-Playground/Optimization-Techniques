@@ -1523,16 +1523,18 @@ class LikeConditionedPCF:
         automatically split into 3-grams.
         If one of those 3-grams is not contained in the MCV list, the unconditioned PCF is used.
         """
-        current_pcf: PiecewiseConstantFn | None = None
+        result_pcf: PiecewiseConstantFn | None = None
         for gram in trigrams(key):
-            pcf = self._grams.get(gram, self._unconditioned)
+            pcf = self._grams.get(gram)
+            if pcf is None:
+                continue
 
-            if current_pcf is None:
-                current_pcf = pcf
+            if result_pcf is None:
+                result_pcf = pcf
             else:
-                current_pcf = current_pcf.min_with(pcf)
+                result_pcf = result_pcf.min_with(pcf)
 
-        return current_pcf or self._unconditioned
+        return result_pcf or self._unconditioned
 
     def __json__(self) -> pb.util.jsondict:
         return {
@@ -1815,6 +1817,7 @@ def build_frequent_trigrams(
     sql = pb.qal.as_query(
         outer_cte, outer_select, outer_from, outer_where, outer_grouping
     )
+    print(pb.qal.format_quick(sql))
     result_set = database.execute_query(sql, raw=True)
     assert result_set is not None
 
