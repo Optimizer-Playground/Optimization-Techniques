@@ -2539,7 +2539,6 @@ class SafeBoundCatalog:
         for join_col in join_cols:
             assert pb.ColumnReference.assert_bound(join_col)
             filter_preds = query.filters_for(join_col.table)
-            join_col = join_col.drop_table_alias()
             if not filter_preds:
                 unconditioned_cols.append(join_col)
                 continue

@@ -626,17 +626,15 @@ def fdsb_graph(query: pb.SqlQuery) -> nx.Graph:
     """
     join_graph = nx.Graph()
     join_graph.add_nodes_from(
-        (tab.drop_alias() for tab in query.tables()), node_type="base_table"
+        (tab for tab in query.tables()),
+        node_type="base_table",
     )
 
     for i, eqc in enumerate(
         pb.qal.determine_join_equivalence_classes(query.joins())
     ):
         join_graph.add_node(i, node_type="join")
-        join_graph.add_edges_from(
-            (i, col.table.drop_alias(), {"join_col": col.drop_table_alias()})
-            for col in eqc
-        )
+        join_graph.add_edges_from((i, col, {"join_col": col}) for col in eqc)
     return join_graph
 
 
