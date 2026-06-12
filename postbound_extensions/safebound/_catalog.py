@@ -6,7 +6,7 @@ import json
 import lzma
 from collections.abc import Generator, Iterable, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Optional, Protocol
 
@@ -748,8 +748,10 @@ def build_equality_mcvs(
 
             for val in mcv.values[:mcv_size]:
                 operator = "is" if val is None else "="
-                val = pb.qal.StaticValueExpression("*") if val == "*" else val
-                pred = pb.qal.as_predicate(filter_col, operator, val)
+                wrapped_val = (
+                    pb.qal.StaticValueExpression("*") if val == "*" else val
+                )
+                pred = pb.qal.as_predicate(filter_col, operator, wrapped_val)
                 log(f"Building conditioned PCF for {join_col} on {pred}")
                 pcf = fetch_correlated_ds(
                     pred, on=join_col, accuracy=accuracy, database=database
@@ -2351,6 +2353,8 @@ class SafeBoundCatalog:
         --------
         SafeBoundSpec.default : For details on the default hyperparameters
         """
+        build_start = datetime.now()
+
         eq_pcfs_repo = build_equality_mcvs(
             catalog_spec,
             mcv_size=stats_spec.mcv_size,
@@ -2378,7 +2382,11 @@ class SafeBoundCatalog:
             database=database,
             verbose=verbose,
         )
-        return SafeBoundCatalog(
+
+        build_end = datetime.now()
+        construction_time = build_end - build_start
+
+        catalog = SafeBoundCatalog(
             equality_pcfs=eq_pcfs_repo,
             range_pcfs=range_pcfs_repo,
             like_pcfs=like_pcfs_repo,
@@ -2386,6 +2394,8 @@ class SafeBoundCatalog:
             database=database,
             verbose=verbose,
         )
+        catalog._construction_time = construction_time
+        return catalog
 
     @staticmethod
     def load(
@@ -2432,8 +2442,9 @@ class SafeBoundCatalog:
         unconditioned_pcfs = load_unconditioned_json(
             catalog["unconditioned_pcfs"]
         )
+        construction_time = catalog["construction_time_s"]
 
-        return SafeBoundCatalog(
+        parsed_cat = SafeBoundCatalog(
             equality_pcfs=eq_pcfs,
             range_pcfs=range_pcfs,
             like_pcfs=like_pcfs,
@@ -2441,6 +2452,8 @@ class SafeBoundCatalog:
             database=database,
             verbose=verbose,
         )
+        parsed_cat._construction_time = timedelta(seconds=construction_time)
+        return parsed_cat
 
     @staticmethod
     def load_or_build(
@@ -2501,6 +2514,7 @@ class SafeBoundCatalog:
         self._like_pcfs = like_pcfs
         self._unconditioned_pcfs = unconditioned_pcfs
         self._db = database
+        self._construction_time: timedelta | None = None
         self._log = wrap_logger(verbose)
 
     def retrieve_stats(
@@ -2740,4 +2754,5 @@ class SafeBoundCatalog:
             "range_pcfs": self._range_pcfs,
             "like_pcfs": self._like_pcfs,
             "unconditioned_pcfs": unconditioned_jsonized,
+            "construction_time_s": self._construction_time,
         }
