@@ -2416,8 +2416,19 @@ class SafeBoundCatalog:
         """
         log = wrap_logger(verbose)
         archive = Path(archive)
+        if not archive.exists():
+            raise FileNotFoundError(f"Catalog path {archive} does not exist.")
         if archive.is_dir():
-            archive = archive / "safebound-catalog.json"
+            catalog_file = archive / "safebound-catalog.json.xz"
+            if not catalog_file.exists():
+                catalog_file = catalog_file.with_suffix(".json")
+            if not catalog_file.exists():
+                raise FileNotFoundError(
+                    "Fallback catalogs 'safebound-catalog.json' or "
+                    f"'safebound-catalog.json.xz' not found in {archive}. "
+                    "Please specify the catalog path explicitly."
+                )
+            archive = catalog_file
             log(f"No catalog name given, falling back to {archive}")
 
         if not archive.exists():
@@ -2701,7 +2712,7 @@ class SafeBoundCatalog:
         *safebound-catalog.json*.
         """
         archive = Path(archive)
-        if archive.is_dir():
+        if not archive.suffix:
             extension = "json.xz" if compressed else "json"
             archive = archive / f"safebound-catalog.{extension}"
         archive.parent.mkdir(parents=True, exist_ok=True)
