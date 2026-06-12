@@ -119,6 +119,7 @@ def make_json_parser(column_dtype: str) -> Callable[[Any], Any]:
     This functions as the inverse to PostBOUND's ``to_json()` utilitiy.
     """
 
+    column_dtype = column_dtype.lower()
     match column_dtype:
         case "timestamp with time zone" | "timestamp without time zone":
             return datetime.fromisoformat
@@ -127,4 +128,6 @@ def make_json_parser(column_dtype: str) -> Callable[[Any], Any]:
         case "varchar" | "text" | "integer":
             return _noop_parser
         case _:
-            raise ValueError(f"Missing JSON parser for column type {column_dtype}")
+            raise ValueError(
+                f"Missing JSON parser for column type {column_dtype}"
+            )

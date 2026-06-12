@@ -917,13 +917,9 @@ class RangeConditionedPCF[T: _HistogramKey]:
         Notes
         -----
         The original SafeBound paper did not specify how to obtain conditioned PCFs for half-open
-        ranges. Our algorithm works as follows: we first compute the distance of the closest (larger)
-        bucket boundary to the given value. If we have a higher resolution child, we also compute the
-        distance on its buckets. If the distance on the current histogram is smaller, we stay at the
-        current resolution. Otherwise, we recurse into the child histogram.
-
-        Once we have decided on the resolution, we simply sum-up the PCFs of all buckets below and
-        including the closest bucket boundary.
+        ranges. Our algorithm simply traverses the histogram hierarchy to the deepest level,
+        determines the first bucket whose upper bound is at least as large as the `value`,
+        and sums up the PCFs of all lower buckets.
 
         Our implementation currently does not distinguish between open and closed intervals. This is
         due to limitations of the histogram-based approach. If the value falls somewhere in the
@@ -937,24 +933,17 @@ class RangeConditionedPCF[T: _HistogramKey]:
         include the `inclusive` flag in the method signature. This avoids breaking changes - even if
         this flag has no effect for now.
         """
-        own_err = self._error_less(value, inclusive=inclusive)
-        if self._higher_res is None:
-            final_idx = own_err.closest_bound + 1
-            return self.pcf_from_buckets(slice(final_idx))
+        if self._higher_res:
+            return self._higher_res.get_less(value, inclusive=inclusive)
 
-        higher_res = self._higher_res._error_less(value, inclusive=inclusive)
-        if own_err.distance <= higher_res.distance:
-            final_idx = own_err.closest_bound + 1
-            return self.pcf_from_buckets(slice(final_idx))
-
-        # Instead of calling pcf_from_buckets() directly on higher_res,
-        # we intentionally delegate to get_range(). This allows the
-        # higher resolution histogram to compute an even better bound
-        # through its even higher resolution child.
-        # The downside is that we compute the error on the children
-        # twice, but since this is a rather cheap operation, we are fine
-        # with this for now.
-        return self._higher_res.get_less(value, inclusive=inclusive)
+        idx = bisect.bisect_right(self._bounds, value)
+        pcfs = self._buckets[:idx]
+        if not pcfs:
+            return PiecewiseConstantFn.zero()
+        cur, tail = pcfs[0], pcfs[1:]
+        for pcf in tail:
+            cur = cur + pcf  # see https://stackoverflow.com/a/38677336
+        return cur
 
     def get_greater(
         self, value: T, *, inclusive: bool = False
@@ -970,18 +959,17 @@ class RangeConditionedPCF[T: _HistogramKey]:
         get_less : for details on the underyling algorithm and the handling of open vs. closed
                    intervals.
         """
-        own_err = self._error_greater(value, inclusive=inclusive)
-        if self._higher_res is None:
-            init_idx = own_err.closest_bound
-            return self.pcf_from_buckets(slice(init_idx, len(self._bounds)))
+        if self._higher_res:
+            return self._higher_res.get_greater(value, inclusive=inclusive)
 
-        higher_res = self._higher_res._error_greater(value, inclusive=inclusive)
-        if own_err.distance <= higher_res.distance:
-            init_idx = own_err.closest_bound
-            return self.pcf_from_buckets(slice(init_idx, len(self._bounds)))
-
-        # See comment in get_less() for why we have to call get_greater()
-        return self._higher_res.get_greater(value, inclusive=inclusive)
+        idx = bisect.bisect_left(self._bounds, value)
+        pcfs = self._buckets[idx:]
+        if not pcfs:
+            return PiecewiseConstantFn.zero()
+        cur, tail = pcfs[0], pcfs[1:]
+        for pcf in tail:
+            cur = cur + pcf  # see https://stackoverflow.com/a/38677336
+        return cur
 
     def _error_range(self, lower: T, upper: T) -> tuple[T, slice]:
         err_lo = self._error_greater(lower, inclusive=True)
