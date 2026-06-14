@@ -125,9 +125,7 @@ def make_json_parser(column_dtype: str) -> Callable[[Any], Any]:
             return datetime.fromisoformat
         case "date":
             return _date_parser
-        case "varchar" | "text" | "integer":
+        case "varchar" | "character varying" | "text" | "integer":
             return _noop_parser
         case _:
-            raise ValueError(
-                f"Missing JSON parser for column type {column_dtype}"
-            )
+            raise ValueError(f"Missing JSON parser for column type {column_dtype}")
