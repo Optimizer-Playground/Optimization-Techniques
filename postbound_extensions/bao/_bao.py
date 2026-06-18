@@ -22,7 +22,7 @@ import functools
 import json
 from collections.abc import Iterable
 from pathlib import Path
-from typing import Optional, TypedDict
+from typing import Callable, Optional, TypedDict
 
 import numpy as np
 import pandas as pd
@@ -776,6 +776,11 @@ class BaoOptimizer(
         runtime_column: str = "runtime_ms",
         timeout_ms: Optional[float] = None,
         from_scratch: bool = False,
+        hint_sets: Optional[
+            Callable[
+                [str, pb.SqlQuery], Iterable[pb.PhysicalOperatorAssignment]
+            ]
+        ] = None,
     ) -> None:
         """Performs a batch training of the TCNN.
 
@@ -800,7 +805,9 @@ class BaoOptimizer(
         workload: pb.Workload | pd.DataFrame
             The workload that should be used for calibration. This can either be
             a set of queries to execute, or a DataFrame containing query plans
-            and runtimes.
+            and runtimes. If the workload is given as a set of queries, each
+            of those queries will be evaluated on each hint set. This can be
+            modified via `hint_sets` (see below).
         plan_column: str
             If `workload` is a DataFrame, this column is expected to contain the
             query plans. If the column does not already contain `pb.QueryPlan`
@@ -818,6 +825,13 @@ class BaoOptimizer(
         from_scratch: bool
             Whether to start the training with a fresh TCNN model. Defaults to
             False, which re-uses the current model weights as a starting point.
+        hint_sets: Optional[Callable[[str, pb.SqlQuery], Iterable[pb.PhysicalOperatorAssignment]]]
+            If `workload` is a set of queries, this optional callback can be
+            used to specify precisely which hint sets should be evaluated for
+            each query. If no callback is given, all hint sets that are
+            configured on the Bao optimizer will be used. Note that the hint
+            sets returned by the callback can be completely independent from
+            the ones configured on the optimizer.
         """
         if from_scratch:
             self._log("Obtaining new model")
@@ -831,9 +845,9 @@ class BaoOptimizer(
 
         self._log("Gathering query plans for calibration queries")
         query_iter = (
-            tqdm(workload.queries(), desc="Training query", unit="q")
+            tqdm(workload.entries(), desc="Training query", unit="q")
             if self._verbose
-            else workload.queries()
+            else workload.entries()
         )
 
         if timeout_ms and not isinstance(self._db, pb.db.TimeoutSupport):
@@ -849,8 +863,12 @@ class BaoOptimizer(
         else:
             executor = functools.partial(self._db.execute_query, raw=True)
 
-        for query in query_iter:
-            for hint_set in self._hint_sets:
+        for label, query in query_iter:
+            selected_hint_sets = (
+                hint_sets(label, query) if hint_sets else self._hint_sets
+            )
+
+            for hint_set in selected_hint_sets:
                 query = self._db.hinting().generate_hints(
                     query, physical_operators=hint_set
                 )
