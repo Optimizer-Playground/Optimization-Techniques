@@ -2379,6 +2379,20 @@ class SafeBoundCatalog:
 
         return stats
 
+    def retrieve_pcf(
+        self, join_col: pb.ColumnReference, filters: pb.qal.AbstractPredicate | None
+    ) -> PiecewiseConstantFn:
+        """Loads the best-matching PCF for a single (filtered) join column.
+
+        If no filters are given or none of the available conditioned PCFs is applicable, the unconditioned PCF is
+        returned.
+        """
+        if filters is None:
+            return self.lookup_unconditioned(join_col)
+
+        pred_traversal = _Predicate2PCF(self, log=self._log)
+        return filters.accept_visitor(pred_traversal, join_col=join_col)
+
     def lookup_unconditioned(self, join_col: pb.ColumnReference) -> PiecewiseConstantFn:
         """Loads the unconditioned PCF for a specific join column.
 
