@@ -38,9 +38,7 @@ def min_max_values_query(col: pb.ColumnReference) -> pb.SqlQuery:
 
     min_col = pb.qal.FunctionExpression.create_min(col)
     max_col = pb.qal.FunctionExpression.create_max(col)
-    select_clause = pb.qal.Select(
-        [pb.qal.BaseProjection(min_col), pb.qal.BaseProjection(max_col)]
-    )
+    select_clause = pb.qal.Select([pb.qal.BaseProjection(min_col), pb.qal.BaseProjection(max_col)])
     from_clause = pb.qal.From.create_for(table)
 
     return pb.qal.ImplicitSqlQuery(
@@ -121,7 +119,7 @@ def make_json_parser(column_dtype: str) -> Callable[[Any], Any]:
 
     column_dtype = column_dtype.lower()
     match column_dtype:
-        case "timestamp with time zone" | "timestamp without time zone":
+        case "timestamp" | "timestamp with time zone" | "timestamp without time zone":
             return datetime.fromisoformat
         case "date":
             return _date_parser
