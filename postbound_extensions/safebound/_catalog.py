@@ -8,7 +8,7 @@ from collections.abc import Generator, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Optional, Protocol
+from typing import Any, Optional, Protocol, overload
 
 import numpy as np
 import postbound as pb
@@ -303,6 +303,30 @@ def catalog_from_workload(
     return spec
 
 
+def _normalize_table(table: pb.TableReference) -> pb.TableReference:
+    normalized_name = table.full_name.lower()
+    normalized_alias = table.alias.lower()
+    normalized_schema = table.schema.lower()
+    normalized_catalog = table.catalog.lower()
+    return pb.TableReference(normalized_name, normalized_alias, catalog=normalized_catalog, schema=normalized_schema)
+
+
+@overload
+def _normalize_column(column: pb.BoundColumnReference) -> pb.BoundColumnReference: ...
+
+
+@overload
+def _normalize_column(column: pb.ColumnReference) -> pb.ColumnReference: ...
+
+
+def _normalize_column(column):
+    normalized_name = column.name.lower()
+    if not column.table:
+        return pb.ColumnReference(normalized_name)
+    normalized_table = _normalize_table(column.table)
+    return pb.ColumnReference(normalized_name, normalized_table)
+
+
 def catalog_from_schema(schema: pb.db.DatabaseSchema, verbose: bool | pb.util.Logger = False) -> CatalogSpec:
     """Infers the conditioned PCFs to build based on the schema of the database.
 
@@ -323,9 +347,11 @@ def catalog_from_schema(schema: pb.db.DatabaseSchema, verbose: bool | pb.util.Lo
         key_cols: set[pb.BoundColumnReference] = set()
         pk_col = schema.primary_key_column(table)
         if pk_col is not None:
+            pk_col = _normalize_column(pk_col)
             key_cols.add(pk_col)
 
         for col in schema.columns(table):
+            col = _normalize_column(col)
             if schema.foreign_keys_on(col):
                 key_cols.add(col)
 
@@ -341,7 +367,7 @@ def catalog_from_schema(schema: pb.db.DatabaseSchema, verbose: bool | pb.util.Lo
                     equality_cols.add(col)
                     range_cols.add(col)
                     like_cols.add(col)
-                case "timestamp with timezone" | "timestamp without timezone":
+                case "timestamp" | "timestamp with timezone" | "timestamp without timezone":
                     equality_cols.add(col)
                     range_cols.add(col)
                 case "date":
@@ -2542,7 +2568,7 @@ class SafeBoundCatalog:
     def _cast_value(self, value: Any, *, column: pb.ColumnReference) -> Any:
         col_dtype = self._db.schema().datatype(column)
         match col_dtype:
-            case "timestamp without time zone" if isinstance(value, str):
+            case "timestamp" | "timestamp without time zone" | "timestamp with time zone" if isinstance(value, str):
                 return datetime.fromisoformat(value)
             case "date" if isinstance(value, str):
                 return datetime.fromisoformat(value).date()
