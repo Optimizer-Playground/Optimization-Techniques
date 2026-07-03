@@ -21,11 +21,8 @@ from postbound.qal import (
     GroupBy,
     JoinTableSource,
     JoinType,
-    MathExpression,
-    MathOperator,
     OrderBy,
     Select,
-    StaticValueExpression,
     SubqueryTableSource,
     Where,
     WithQuery,
@@ -1631,10 +1628,10 @@ def build_frequent_trigrams(
     trigram_col = pb.ColumnReference("trigram")
     trigram_freq_col = pb.ColumnReference("trigram_freq")
     trigram_pos_col = pb.ColumnReference("trigram_pos")
-    substring_fn = pb.qal.as_expression(
+    substring_fn = pb.qal.as_func_expr(
         "substring",
         like_col,
-        keyword_args={"from": val_pos_col, "for": 3},
+        {"from": val_pos_col, "for": 3},
     )
     trigrams_select = Select(
         [
@@ -1643,16 +1640,10 @@ def build_frequent_trigrams(
             BaseProjection.create_window("count", partitioning=[trigram_col], target_name="trigram_freq"),
         ]
     )
-    series_fn = pb.qal.as_expression(
-        "generate_series",
-        1,
-        MathExpression(
-            MathOperator.Subtract,
-            pb.qal.as_expression("length", like_col),
-            StaticValueExpression(2),
-        ),
+    series_fn = pb.qal.as_func_expr(
+        "generate_series", 1, pb.qal.as_math_expr(pb.qal.as_func_expr("length", like_col), "-", 2)
     )
-    lateral_select = Select(BaseProjection(pb.qal.as_expression("unnest", series_fn), "pos"))
+    lateral_select = Select(BaseProjection(pb.qal.as_func_expr("unnest", series_fn), "pos"))
     trigrams_join = JoinTableSource(
         DirectTableSource(on.table),
         SubqueryTableSource(pb.qal.as_query(lateral_select), lateral=True),
@@ -1722,10 +1713,10 @@ def build_rare_trigrams(
     trigram_col = pb.ColumnReference("trigram")
     trigram_freq_col = pb.ColumnReference("trigram_freq")
     trigram_pos_col = pb.ColumnReference("trigram_pos")
-    substring_fn = pb.qal.as_expression(
+    substring_fn = pb.qal.as_func_expr(
         "substring",
         like_col,
-        keyword_args={"from": val_pos_col, "for": 3},
+        {"from": val_pos_col, "for": 3},
     )
     trigrams_select = Select(
         [
@@ -1734,16 +1725,10 @@ def build_rare_trigrams(
             BaseProjection.create_window("count", partitioning=[trigram_col], target_name="trigram_freq"),
         ]
     )
-    series_fn = pb.qal.as_expression(
-        "generate_series",
-        1,
-        MathExpression(
-            MathOperator.Subtract,
-            pb.qal.as_expression("length", like_col),
-            StaticValueExpression(2),
-        ),
+    series_fn = pb.qal.as_func_expr(
+        "generate_series", 1, pb.qal.as_math_expr(pb.qal.as_func_expr("length", like_col), "-", 2)
     )
-    lateral_select = Select(BaseProjection(pb.qal.as_expression("unnest", series_fn), "pos"))
+    lateral_select = Select(BaseProjection(pb.qal.as_func_expr("unnest", series_fn), "pos"))
     trigrams_join = JoinTableSource(
         DirectTableSource(on.table),
         SubqueryTableSource(pb.qal.as_query(lateral_select), lateral=True),
