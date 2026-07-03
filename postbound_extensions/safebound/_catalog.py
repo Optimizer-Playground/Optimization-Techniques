@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import bisect
 import collections
 import json
 import lzma
@@ -34,13 +33,9 @@ from ._piecewise_fns import DegreeSequence, PiecewiseConstantFn, load_pcf_json
 
 
 class _HistogramKey(Protocol):
-    def __lt__(self, other: _HistogramKey) -> bool: ...
+    def __le__(self, other: _HistogramKey) -> bool: ...
 
-    def __add__(self, other: _HistogramKey) -> _HistogramKey: ...
-
-    def __sub__(self, other: _HistogramKey) -> _HistogramKey: ...
-
-    def __hash__(self) -> int: ...
+    def __ge__(self, other: _HistogramKey) -> bool: ...
 
 
 @dataclass
@@ -296,7 +291,7 @@ def catalog_from_workload(
         join_map = _build_join_map(query)
         visitor.visit_query_predicates(query, join_map=join_map)
         join_cols = pb.util.set_union(pred.columns() for pred in query.joins())
-        spec.unconditioned_cols |= {col.drop_table_alias() for col in join_cols}
+        spec.unconditioned_cols |= {col.drop_table_alias() for col in join_cols}  # type: ignore
     return spec
 
 
@@ -800,49 +795,25 @@ class RangeConditionedPCF[T: _HistogramKey]:
 
     def __init__(
         self,
-        buckets: Sequence[PiecewiseConstantFn],
-        bounds: Sequence[T],
+        pcf: PiecewiseConstantFn,
         *,
         range_col: pb.ColumnReference,
-        higher_res: RangeConditionedPCF[T] | None = None,
+        lower_bound: T,
+        upper_bound: T,
+        lower_child: Optional[RangeConditionedPCF[T]] = None,
+        upper_child: Optional[RangeConditionedPCF[T]] = None,
     ) -> None:
-        if not buckets:
-            raise ValueError("Empty histogram is not allowed")
-        if len(buckets) != len(bounds):
-            raise ValueError("bounds and buckets have to have the same length")
-        self._buckets = list(buckets)
-        self._bounds = list(bounds)
+        self._pcf = pcf
+        self._lo, self._hi = lower_bound, upper_bound
+
         self._range_col = range_col
-        self._higher_res = higher_res
+
+        self._lower_child = lower_child
+        self._upper_child = upper_child
 
     @property
     def range_col(self) -> pb.ColumnReference:
         return self._range_col
-
-    @property
-    def higher_res(self) -> Optional[RangeConditionedPCF[T]]:
-        """Get the child histogram with more buckets.
-
-        If this is *None*, the current histogram has the highest resolution available on the column.
-        """
-        return self._higher_res
-
-    @higher_res.setter
-    def higher_res(self, value: RangeConditionedPCF[T] | None) -> None:
-        self._higher_res = value
-
-    def pcf_from_buckets(self, rng: slice) -> PiecewiseConstantFn:
-        """Obtains a PCF by bucket indices. The resulting PCF is the sum of all buckets in the given range."""
-        buckets = self._buckets[rng]
-        if not buckets:
-            raise IndexError("Slice does not contain any buckets: {rng}")
-        elif len(buckets) == 1:
-            return buckets[0]
-
-        pcf = buckets[0]
-        for current_pcf in buckets[1:]:
-            pcf += current_pcf
-        return pcf
 
     def get_range(self, lower: T, upper: T) -> Optional[PiecewiseConstantFn]:
         """Retrieves the PCF for a specific range of values.
@@ -854,23 +825,29 @@ class RangeConditionedPCF[T: _HistogramKey]:
         that encompasses the entire range (and thus the PCF that over-estimates the true frequencies
         by the smallest margin).
         """
-        lo = bisect.bisect_right(self._bounds, lower)
-        hi = bisect.bisect_left(self._bounds, upper)
-        if lo != hi:
-            # no bucket that encompasses the range. Since all higher resolutions have a
-            # ... higher resolution ... and thus smaller buckets, they can also never subsume the
-            # entire bucket. Therefore, we can stop here.
+        if self._lo >= lower or self._hi <= upper:
+            # The requested range is not completely enclosed in our bucket since all children only partition our bucket
+            # further, they also cannot suddenly enclose the range. We can stop here.
             return None
 
-        if self._higher_res is None:
-            # we have no higher resolution child, but we already have a matching bucket, return it
-            # and be done with it
-            return self._buckets[lo]
+        # The requested range is completely enclosed in our bucket. We can definitely return our own PCF as a valid
+        # result. However, it might be the case that one of our children still has a more narrow matching bucket,
+        # so we need to traverse further.
+        # Since the buckets of our lower and upper children are completely disjoint, we can stop as soon as one of
+        # them matches the range - it is impossible for the other child to match as well.
 
-        higher_bucket = self._higher_res.get_range(lower, upper)
-        return higher_bucket or self._buckets[lo]
+        lower_pcf = self._lower_child.get_range(lower, upper) if self._lower_child is not None else None
+        if lower_pcf is not None:
+            return lower_pcf
 
-    def get_less(self, value: T, *, inclusive: bool = False) -> PiecewiseConstantFn:
+        upper_pcf = self._upper_child.get_range(lower, upper) if self._upper_child is not None else None
+        if upper_pcf is not None:
+            return upper_pcf
+
+        # we have the best-matching PCF
+        return self._pcf
+
+    def get_less(self, value: T, *, inclusive: bool = False) -> Optional[PiecewiseConstantFn]:
         """Obtains the PCF for all values less than (or equal to) a given value.
 
         Use the `inclusive` flag to distinguish between open and closed ranges (i.e. strict less-than
@@ -895,19 +872,24 @@ class RangeConditionedPCF[T: _HistogramKey]:
         include the `inclusive` flag in the method signature. This avoids breaking changes - even if
         this flag has no effect for now.
         """
-        if self._higher_res:
-            return self._higher_res.get_less(value, inclusive=inclusive)
 
-        idx = bisect.bisect_right(self._bounds, value)
-        pcfs = self._buckets[:idx]
-        if not pcfs:
-            return PiecewiseConstantFn.zero()
-        cur, tail = pcfs[0], pcfs[1:]
-        for pcf in tail:
-            cur = cur + pcf  # see https://stackoverflow.com/a/38677336
-        return cur
+        # This method has a similar structure to get_range, see its comments for the logic behind the control flow.
 
-    def get_greater(self, value: T, *, inclusive: bool = False) -> PiecewiseConstantFn:
+        if self._hi <= value:
+            # Our upper bound cannot completely enclose the range, stop.
+            return None
+
+        lower_pcf = self._lower_child.get_less(value, inclusive=inclusive) if self._lower_child is not None else None
+        if lower_pcf is not None:
+            return lower_pcf
+
+        upper_pcf = self._upper_child.get_less(value, inclusive=inclusive) if self._upper_child is not None else None
+        if upper_pcf is not None:
+            return upper_pcf
+
+        return self._pcf
+
+    def get_greater(self, value: T, *, inclusive: bool = False) -> Optional[PiecewiseConstantFn]:
         """Obtains the PCF for all values greater than (or equal to) a given value.
 
         Use the `inclusive` flag to distinguish between open and closed ranges (i.e. strict
@@ -919,55 +901,35 @@ class RangeConditionedPCF[T: _HistogramKey]:
         get_less : for details on the underyling algorithm and the handling of open vs. closed
                    intervals.
         """
-        if self._higher_res:
-            return self._higher_res.get_greater(value, inclusive=inclusive)
 
-        idx = bisect.bisect_left(self._bounds, value)
-        pcfs = self._buckets[idx:]
-        if not pcfs:
-            return PiecewiseConstantFn.zero()
-        cur, tail = pcfs[0], pcfs[1:]
-        for pcf in tail:
-            cur = cur + pcf  # see https://stackoverflow.com/a/38677336
-        return cur
+        # This method has a similar structure to get_range, see its comments for the logic behind the control flow.
 
-    def _error_range(self, lower: T, upper: T) -> tuple[T, slice]:
-        err_lo = self._error_greater(lower, inclusive=True)
-        err_hi = self._error_less(upper, inclusive=True)
-        if err_lo.out_of_bounds or err_hi.out_of_bounds:
-            raise KeyError(f"Range [{lower}, {upper}] out of bounds for column {self.range_col}")
-        err_total = err_lo.distance + err_hi.distance
-        return (
-            err_total,
-            slice(err_lo.closest_bound, err_hi.closest_bound + 1),
-        )
+        if self._lo >= value:
+            # Our lower bound cannot completely enclose the range, stop.
+            return None
 
-    def _error_less(self, value: T, *, inclusive: bool) -> _RangeCheckRes:
-        idx = bisect.bisect_right(self._bounds, value)
-        if idx == len(self._bounds):
-            # Value is the largest value we have seen
-            idx = len(self._bounds) - 1
-        distance = self._bounds[idx] - value
-        return _RangeCheckRes.valid(idx, distance)
+        lower_pcf = self._lower_child.get_greater(value, inclusive=inclusive) if self._lower_child is not None else None
+        if lower_pcf is not None:
+            return lower_pcf
 
-    def _error_greater(self, value: T, *, inclusive: bool) -> _RangeCheckRes:
-        idx = bisect.bisect_left(self._bounds, value)
-        if idx == len(self._bounds):
-            # Value is the largest value we have seen
-            idx = len(self._bounds) - 1
-        distance = value - self._bounds[idx]
-        return _RangeCheckRes.valid(idx, distance)
+        upper_pcf = self._upper_child.get_greater(value, inclusive=inclusive) if self._upper_child is not None else None
+        if upper_pcf is not None:
+            return upper_pcf
+
+        return self._pcf
 
     def __json__(self) -> pb.util.jsondict:
         return {
-            "buckets": self._buckets,
-            "bounds": self._bounds,
-            "conditioned_col": self._range_col,
-            "higher_res": self._higher_res,
+            "pcf": self._pcf,
+            "range_col": self._range_col,
+            "lower_bound": self._lo,
+            "upper_bound": self._hi,
+            "lower_child": self._lower_child,
+            "upper_child": self._upper_child,
         }
 
     def __repr__(self) -> str:
-        return f"Range-conditioned PCF on {self.range_col} with k = {len(self._bounds)}"
+        return f"Range-conditioned PCF on {self.range_col} for bucket [{self._lo}, {self._hi}]"
 
 
 def load_range_pcf_json(json_data: dict | str, *, database: pb.Database) -> RangeConditionedPCF:
@@ -978,16 +940,21 @@ def load_range_pcf_json(json_data: dict | str, *, database: pb.Database) -> Rang
     if isinstance(json_data, str):
         json_data = json.loads(json_data)
 
-    buckets = [load_pcf_json(b) for b in json_data["buckets"]]
-    column = pb.parser.load_column_json(json_data["conditioned_col"])
-    dtype = database.schema().datatype(column)
+    pcf = load_pcf_json(json_data["pcf"])
+    range_col = pb.parser.load_column_json(json_data["range_col"])
+    dtype = database.schema().datatype(range_col)
     val_parser = make_json_parser(dtype)
-    bounds = [val_parser(bound) for bound in json_data["bounds"]]
+    lo = val_parser(json_data["lower_bound"])
+    hi = val_parser(json_data["upper_bound"])
 
-    nested_json = json_data.get("higher_res")
-    higher_res = None if nested_json is None else load_range_pcf_json(nested_json, database=database)
+    nested_lower = json_data.get("lower_child")
+    lower_child = load_range_pcf_json(nested_lower, database=database) if nested_lower is not None else None
+    nested_upper = json_data.get("upper_child")
+    upper_child = load_range_pcf_json(nested_upper, database=database) if nested_upper is not None else None
 
-    return RangeConditionedPCF(buckets, bounds, range_col=column, higher_res=higher_res)
+    return RangeConditionedPCF(
+        pcf, range_col=range_col, lower_bound=lo, upper_bound=hi, lower_child=lower_child, upper_child=upper_child
+    )
 
 
 class RangeConditionsRepo:
@@ -1194,108 +1161,129 @@ class RangeConditionsRepo:
         return {"pcfs": jsonized}
 
 
-def histogram_for_precision[T: _HistogramKey](
-    range_distribution: list[tuple[T, int]],
+def construct_histogram_hierarchy[T: _HistogramKey](
+    frequencies: np.ndarray,
+    values: Sequence[T],
     *,
-    k: int,
-    total_cardinality: int,
-    accuracy: float,
     join_col: pb.BoundColumnReference,
     range_col: pb.BoundColumnReference,
+    current_level: int,
+    max_level: int,
+    accuracy: float,
     database: pb.Database,
     log: pb.util.Logger,
 ) -> RangeConditionedPCF[T]:
-    """Constructs a single histogram at a specific "precision" (i.e. number of buckets).
+    """Recursively builds a histogram hierarchy starting at a specific depth.
+
+    The maximum number of buckets is inferred from the maximum level: each level splits the parent bucket into two.
 
     Parameters
     ----------
-    range_distribution : list[tuple[T, int]]
-        An ordered list of (value, frequency) pairs for all distinct values in the filter column.
-    k : int
-        The "precision" to use. This corresponds exactly to the *k* parameter in the original
-        SafeBound paper. Therefore, the actual number of buckets in the histogram will be 2^k.
-    total_cardinality : int
-        The total number of rows in the join column's table. While this could be derived from the
-        range distribution, the histogram construction algorithm is typically called multiple times
-        for a given join column/range column pair. Therefore, we can save some compute time by
-        pre-calculating this value.
-    accuracy : float
-        The accuracy to use when compressing the raw degree sequences into PCFs. This corresponds to
-        the *c* parameter in the original SafeBound paper.
+    frequencies : np.ndarray
+        The frequencies of the values in the range column. The i-th entry corresponds to the i-th entry in `values`.
+    values : Sequence[T]
+        The distinct values in the range column, sorted in ascending order. The i-th entry corresponds to the i-th
+        entry in `frequencies`.
     join_col : pb.BoundColumnReference
         The join column that the resulting PCFs should be defined on. This is required to fetch the
         correlated degree sequences from the database and to construct the resulting PCFs.
     range_col : pb.BoundColumnReference
         The filter column that the resulting PCFs should be conditioned on. This is required to
         fetch the correlated degree sequences from the database and to construct the resulting PCFs.
+    current_level : int
+        The current level of the histogram hierarchy. This is used to determine whether to continue splitting the
+        histogram into finer-grained buckets (until `max_level` is reached or there are no more buckets to split).
+    max_level : int
+        The maximum level/depth of the histogram hierarchy.
+    accuracy : float
+        The accuracy to use when compressing the raw degree sequences into PCFs. This corresponds to
+        the *c* parameter in the original SafeBound paper.
     database : pb.Database
         The database to fetch the degree sequences from.
     log : pb.util.Logger
         A logger to log the progress of the histogram construction.
     """
-    if not range_distribution:
-        raise ValueError(f"Cannot derive histograms for empty distribution on {join_col} conditioned by {range_col}")
+    if not values:
+        raise ValueError("Cannot derive histograms for empty distribution")
 
-    freq_per_bucket = total_cardinality // (2**k)
-    buckets: list[PiecewiseConstantFn] = []
-    bounds: list[T] = []
-
-    head_val, head_freq = range_distribution[0]
-    total_freq = head_freq
-    lower_bound = head_val
-
-    for prev, cur, nxt in pb.util.sliding_window(range_distribution, 3):
-        cur_val, cur_freq = cur
-        prev_val, prev_freq = prev
-        nxt_val, nxt_freq = nxt
-        updated_freq = total_freq + cur_freq
-        if updated_freq < freq_per_bucket:
-            # we still have room in our bucket
-            total_freq = updated_freq
-            continue
-
-        # Our current frequency exceeds the target frequency of each bucket,
-        # therefore we need to create a new bucket.
-        # To minimize the difference between ideal frequency of each bucket and
-        # the actual frequency, we need to compare whether the new bucket should
-        # end at the current element, or (if the current element's frequency is huge)
-        # if ending at the previous bucket would be even better.
-
-        lower_err = freq_per_bucket - total_freq
-        cur_err = updated_freq - freq_per_bucket
-        if lower_err < cur_err and lower_bound != cur_val:
-            # stop at the previous value, include the current value in the next bucket
-            upper_bound = cur_val  # upper bound is exclusive
-            total_freq = cur_freq
+    lo, hi = values[0], values[-1]
+    if lo == hi:
+        # We are processing a value that is so frequent, it has an entire bucket for its own
+        # Our "range predicate" should simply filter on this value.
+        if lo is None:
+            range_pred = pb.qal.as_predicate(range_col, "is", None)
         else:
-            # include the current value in the bucket
-            upper_bound = nxt_val  # upper bound is exclusive
-            total_freq = 0
-
-        wrapped_upper = pb.qal.StaticValueExpression("*") if upper_bound == "*" else upper_bound
-        upper_pred = pb.qal.as_predicate(range_col, "<", wrapped_upper)
-        if lower_bound is None:
-            lower_pred = pb.qal.as_predicate(range_col, "is", None)
-            range_pred = pb.qal.CompoundPredicate.create_or([lower_pred, upper_pred])
+            range_pred = pb.qal.as_predicate(range_col, "=", lo)
+    else:
+        # We are processing a proper range
+        if lo is None:
+            lo_pred = pb.qal.as_predicate(range_col, "is", None)
         else:
-            wrapped_lower = pb.qal.StaticValueExpression("*") if lower_bound == "*" else lower_bound
-            lower_pred = pb.qal.as_predicate(
-                range_col,
-                ">=",
-                wrapped_lower,
-            )
-            range_pred = pb.qal.CompoundPredicate.create_and([lower_pred, upper_pred])
+            lo_pred = pb.qal.as_predicate(range_col, ">=", lo)
 
-        log(f"Loading range-conditioned PCF for {join_col} on bucket {range_pred}")
-        pcf = fetch_correlated_ds(range_pred, on=join_col, database=database, accuracy=accuracy)
-        buckets.append(pcf)
-        bounds.append(upper_bound)
+        if hi is None:
+            hi_pred = pb.qal.as_predicate(range_col, "is", None)
+        else:
+            hi_pred = pb.qal.as_predicate(range_col, "<", hi)
 
-        # since our upper bound is exclusive, the next bucket has to start at our current upper bound
-        # to make sure we don't miss any values.
-        lower_bound = upper_bound
+        if lo_pred.operation == pb.qal.LogicalOperator.Is and hi_pred.operation == pb.qal.LogicalOperator.Is:
+            range_pred = lo_pred
+        elif lo_pred.operation == pb.qal.LogicalOperator.Is:
+            range_pred = pb.qal.CompoundPredicate.create_or([lo_pred, hi_pred])
+        elif hi_pred.operation == pb.qal.LogicalOperator.Is:
+            range_pred = pb.qal.CompoundPredicate.create_or([lo_pred, hi_pred])
+        else:
+            range_pred = pb.qal.CompoundPredicate.create_and([lo_pred, hi_pred])
 
-    return RangeConditionedPCF(buckets, bounds, range_col=range_col)
+    log(f"Loading range-conditioned PCF for {join_col} on bucket {range_pred}")
+    pcf = fetch_correlated_ds(range_pred, on=join_col, database=database, accuracy=accuracy)
+    if len(values) == 1 or current_level >= max_level:
+        return RangeConditionedPCF(pcf, range_col=range_col, lower_bound=lo, upper_bound=hi)
+
+    cumulative = np.cumsum(frequencies)
+    total_card = cumulative[-1]
+    cutoff_card = total_card // 2
+    cutoff_idx = np.searchsorted(cumulative, cutoff_card, side="right")
+    if cutoff_idx == 0 or cutoff_idx == len(values):
+        # we cannot split the histogram any further, since all values are in one bucket
+        return RangeConditionedPCF(pcf, range_col=range_col, lower_bound=lo, upper_bound=hi)
+
+    lower_vals = values[:cutoff_idx]
+    lower_freqs = frequencies[:cutoff_idx]
+    lower_child = construct_histogram_hierarchy(
+        lower_freqs,
+        lower_vals,
+        join_col=join_col,
+        range_col=range_col,
+        current_level=current_level + 1,
+        max_level=max_level,
+        accuracy=accuracy,
+        database=database,
+        log=log,
+    )
+
+    upper_vals = values[cutoff_idx:]
+    upper_freqs = frequencies[cutoff_idx:]
+    upper_child = construct_histogram_hierarchy(
+        upper_freqs,
+        upper_vals,
+        join_col=join_col,
+        range_col=range_col,
+        current_level=current_level + 1,
+        max_level=max_level,
+        accuracy=accuracy,
+        database=database,
+        log=log,
+    )
+
+    return RangeConditionedPCF(
+        pcf,
+        range_col=range_col,
+        lower_bound=lo,
+        upper_bound=hi,
+        lower_child=lower_child,
+        upper_child=upper_child,
+    )
 
 
 def build_histograms(
@@ -1336,29 +1324,19 @@ def build_histograms(
         for range_col in filter_cols:
             log(f"Loading column distribution for {join_col} conditioned on {range_col}")
             filter_distribution = fetch_column_distribution(range_col, database)
-            cardinality = database.statistics().total_rows(join_col.table, emulated=True)
-
-            last_histogram: RangeConditionedPCF | None = None
-            for i in range(hierarchy_depth, 0, -1):
-                # XXX: The current implementation is pretty inefficient:
-                # We essentially scan the entire distribution k times, summing up all the frequencies
-                # each and every time. Maybe we can use cumulative sums to eliminate some of this?
-
-                log(f"Building histogram for {join_col} on {range_col} at depth {i}")
-                current_histogram = histogram_for_precision(
-                    filter_distribution,
-                    k=i,
-                    total_cardinality=cardinality,
-                    accuracy=accuracy,
-                    join_col=join_col,
-                    range_col=range_col,
-                    database=database,
-                    log=log,
-                )
-                current_histogram.higher_res = last_histogram
-                last_histogram = current_histogram
-
-            pcfs[join_col].append(last_histogram)
+            values, frequencies = zip(*filter_distribution)
+            histogram = construct_histogram_hierarchy(
+                np.array(frequencies),
+                values,
+                join_col=join_col,
+                range_col=range_col,
+                current_level=0,
+                max_level=hierarchy_depth,
+                accuracy=accuracy,
+                database=database,
+                log=log,
+            )
+            pcfs[join_col].append(histogram)
 
     return RangeConditionsRepo(pcfs)
 
@@ -1685,7 +1663,6 @@ def build_frequent_trigrams(
 
     log(f"Computing per-trigram frequencies for {on} conditioned on {like_col}")
     sql = pb.qal.as_query(outer_cte, outer_select, outer_from, outer_where, outer_grouping)
-    print(pb.qal.format_quick(sql))
     result_set = database.execute_query(sql, raw=True)
     assert result_set is not None
 

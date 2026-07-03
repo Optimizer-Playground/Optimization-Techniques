@@ -140,6 +140,7 @@ References
 """
 
 from ._catalog import (
+    CatalogSpec,
     EqualityConditionedPCF,
     EqualityConditionsRepo,
     LikeConditionedPCF,
@@ -156,11 +157,11 @@ from ._catalog import (
     build_unconditioned_pcfs,
     catalog_from_schema,
     catalog_from_workload,
+    construct_histogram_hierarchy,
     fetch_column_distribution,
     fetch_column_values,
     fetch_correlated_ds,
     fetch_raw_ds,
-    histogram_for_precision,
     load_eq_pcf_json,
     load_eq_repo_json,
     load_like_pcf_json,
@@ -193,6 +194,7 @@ from ._piecewise_fns import (
 __all__ = [
     "AlphaStep",
     "BetaStep",
+    "CatalogSpec",
     "DegreeSequence",
     "DimensionJoin",
     "EqualityConditionedPCF",
@@ -215,10 +217,11 @@ __all__ = [
     "build_trigram_pcf",
     "build_histograms",
     "build_unconditioned_pcfs",
-    "decompose_acyclic",
-    "decompose_query",
     "catalog_from_schema",
     "catalog_from_workload",
+    "construct_histogram_hierarchy",
+    "decompose_acyclic",
+    "decompose_query",
     "fdsb",
     "fetch_column_distribution",
     "fetch_column_values",
