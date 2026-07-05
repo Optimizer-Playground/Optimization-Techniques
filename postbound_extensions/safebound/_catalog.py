@@ -33,6 +33,8 @@ from ._piecewise_fns import DegreeSequence, PiecewiseConstantFn, load_pcf_json
 
 
 class _HistogramKey(Protocol):
+    def __lt__(self, other: _HistogramKey) -> bool: ...
+
     def __le__(self, other: _HistogramKey) -> bool: ...
 
     def __ge__(self, other: _HistogramKey) -> bool: ...
@@ -802,6 +804,7 @@ class RangeConditionedPCF[T: _HistogramKey]:
         upper_bound: T,
         lower_child: Optional[RangeConditionedPCF[T]] = None,
         upper_child: Optional[RangeConditionedPCF[T]] = None,
+        cutoff_point: Optional[T] = None,
     ) -> None:
         self._pcf = pcf
         self._lo, self._hi = lower_bound, upper_bound
@@ -810,6 +813,8 @@ class RangeConditionedPCF[T: _HistogramKey]:
 
         self._lower_child = lower_child
         self._upper_child = upper_child
+        self._cutoff_point = cutoff_point
+        self._is_leaf = self._lower_child is None and self._upper_child is None
 
     @property
     def range_col(self) -> pb.ColumnReference:
@@ -825,7 +830,7 @@ class RangeConditionedPCF[T: _HistogramKey]:
         that encompasses the entire range (and thus the PCF that over-estimates the true frequencies
         by the smallest margin).
         """
-        if self._lo >= lower or self._hi <= upper:
+        if self._none_safe_le_lo(lower) or self._none_safe_ge_hi(upper):
             # The requested range is not completely enclosed in our bucket since all children only partition our bucket
             # further, they also cannot suddenly enclose the range. We can stop here.
             return None
@@ -847,7 +852,7 @@ class RangeConditionedPCF[T: _HistogramKey]:
         # we have the best-matching PCF
         return self._pcf
 
-    def get_less(self, value: T, *, inclusive: bool = False) -> Optional[PiecewiseConstantFn]:
+    def get_less(self, value: T, *, inclusive: bool = False) -> PiecewiseConstantFn:
         """Obtains the PCF for all values less than (or equal to) a given value.
 
         Use the `inclusive` flag to distinguish between open and closed ranges (i.e. strict less-than
@@ -872,24 +877,29 @@ class RangeConditionedPCF[T: _HistogramKey]:
         include the `inclusive` flag in the method signature. This avoids breaking changes - even if
         this flag has no effect for now.
         """
+        if self._none_safe_lt_lo(value):
+            # value is not part of the bucket, so we can return an empty PCF
+            return PiecewiseConstantFn.zero()
+        elif self._none_safe_gt_hi(value):
+            # value spans the entire bucket, so we can return the entire PCF
+            return self._pcf
 
-        # This method has a similar structure to get_range, see its comments for the logic behind the control flow.
+        if self._is_leaf:
+            return (
+                self._pcf
+                if self._none_safe_ge_lo(value) and self._none_safe_le_hi(value)
+                else PiecewiseConstantFn.zero()
+            )
 
-        if self._hi <= value:
-            # Our upper bound cannot completely enclose the range, stop.
-            return None
+        assert self._lower_child is not None and self._upper_child is not None
+        if self._none_safe_lt_cutoff(value):
+            return self._lower_child.get_less(value)
 
-        lower_pcf = self._lower_child.get_less(value, inclusive=inclusive) if self._lower_child is not None else None
-        if lower_pcf is not None:
-            return lower_pcf
+        lower_pcf = self._lower_child._pcf
+        upper_pcf = self._upper_child.get_less(value)
+        return lower_pcf + upper_pcf
 
-        upper_pcf = self._upper_child.get_less(value, inclusive=inclusive) if self._upper_child is not None else None
-        if upper_pcf is not None:
-            return upper_pcf
-
-        return self._pcf
-
-    def get_greater(self, value: T, *, inclusive: bool = False) -> Optional[PiecewiseConstantFn]:
+    def get_greater(self, value: T, *, inclusive: bool = False) -> PiecewiseConstantFn:
         """Obtains the PCF for all values greater than (or equal to) a given value.
 
         Use the `inclusive` flag to distinguish between open and closed ranges (i.e. strict
@@ -902,21 +912,116 @@ class RangeConditionedPCF[T: _HistogramKey]:
                    intervals.
         """
 
-        # This method has a similar structure to get_range, see its comments for the logic behind the control flow.
+        # This method is structurally very similar to `get_less`, but the logic is reversed.
+        # See its documentation for details.
 
-        if self._lo >= value:
-            # Our lower bound cannot completely enclose the range, stop.
-            return None
+        if self._none_safe_gt_hi(value):
+            return PiecewiseConstantFn.zero()
+        elif self._none_safe_lt_lo(value):
+            return self._pcf
 
-        lower_pcf = self._lower_child.get_greater(value, inclusive=inclusive) if self._lower_child is not None else None
-        if lower_pcf is not None:
-            return lower_pcf
+        if self._is_leaf:
+            return (
+                self._pcf
+                if self._none_safe_ge_lo(value) and self._none_safe_le_hi(value)
+                else PiecewiseConstantFn.zero()
+            )
 
-        upper_pcf = self._upper_child.get_greater(value, inclusive=inclusive) if self._upper_child is not None else None
-        if upper_pcf is not None:
-            return upper_pcf
+        assert self._lower_child is not None and self._upper_child is not None
+        if self._none_safe_lt_cutoff(value):
+            lower_pcf = self._lower_child.get_greater(value)
+            upper_pcf = self._upper_child._pcf
+            return lower_pcf + upper_pcf
 
-        return self._pcf
+        return self._upper_child.get_greater(value)
+
+    def _none_safe_lt_lo(self, value: T) -> bool:
+        """Checks, if the given value is less than or equal to the lower bound of this bucket.
+
+        This method is "None-safe" in the sense that it will treat None as any other value.
+        """
+        if self._lo is None and value is None:
+            return True
+        if self._lo is None or value is None:
+            return False
+        return value < self._lo
+
+    def _none_safe_le_lo(self, value: T) -> bool:
+        """Checks, if the given value is less than or equal to the lower bound of this bucket.
+
+        This method is "None-safe" in the sense that it will treat None as any other value.
+        """
+        if self._lo is None and value is None:
+            return True
+        if self._lo is None or value is None:
+            return False
+        return value <= self._lo
+
+    def _none_safe_ge_lo(self, value: T) -> bool:
+        """Checks, if the given value is greater than or equal to the lower bound of this bucket.
+
+        This method is "None-safe" in the sense that it will treat None as any other value.
+        """
+        if self._lo is None and value is None:
+            return True
+        if self._lo is None or value is None:
+            return False
+        return value >= self._lo
+
+    def _none_safe_le_hi(self, value: T) -> bool:
+        """Checks, if the given value is less than or equal to the upper bound of this bucket.
+
+        This method is "None-safe" in the sense that it will treat None as any other value.
+        """
+        if self._hi is None and value is None:
+            return True
+        if self._hi is None or value is None:
+            return False
+        return value <= self._hi
+
+    def _none_safe_gt_hi(self, value: T) -> bool:
+        """Checks, if the given value is greater than the upper bound of this bucket.
+
+        This method is "None-safe" in the sense that it will treat None as any other value.
+        """
+        if self._hi is None and value is None:
+            return False
+        if self._hi is None or value is None:
+            return True
+        return value > self._hi
+
+    def _none_safe_ge_hi(self, value: T) -> bool:
+        """Checks, if the given value is greater than or equal to the upper bound of this bucket.
+
+        This method is "None-safe" in the sense that it will treat None as any other value.
+        """
+        if self._hi is None and value is None:
+            return True
+        if self._hi is None or value is None:
+            return False
+        return value >= self._hi
+
+    def _none_safe_lt_cutoff(self, value: T) -> bool:
+        """Checks, if the given value is less than or equal to the cutoff point of this bucket.
+
+        This method is "None-safe" in the sense that it will treat None as any other value.
+        """
+        if self._cutoff_point is None and value is None:
+            return True
+        if self._cutoff_point is None or value is None:
+            return False
+        return value < self._cutoff_point
+
+    def _none_safe_ge_cutoff(self, value: T) -> bool:
+        """Checks, if the given value is greater than or equal to the cutoff point of this bucket.
+
+        This method is "None-safe" in the sense that it will treat None as any other value.
+        """
+        if self._cutoff_point is None and value is None:
+            return True
+        if self._cutoff_point is None or value is None:
+            return False
+        return value >= self._cutoff_point
 
     def __json__(self) -> pb.util.jsondict:
         return {
@@ -926,10 +1031,12 @@ class RangeConditionedPCF[T: _HistogramKey]:
             "upper_bound": self._hi,
             "lower_child": self._lower_child,
             "upper_child": self._upper_child,
+            "cutoff_point": self._cutoff_point,
         }
 
     def __repr__(self) -> str:
-        return f"Range-conditioned PCF on {self.range_col} for bucket [{self._lo}, {self._hi}]"
+        bucket_type = "leaf" if self._is_leaf else "intermediate"
+        return f"Range-conditioned PCF on {self.range_col} for {bucket_type} bucket [{self._lo}, {self._hi}]"
 
 
 def load_range_pcf_json(json_data: dict | str, *, database: pb.Database) -> RangeConditionedPCF:
@@ -951,9 +1058,17 @@ def load_range_pcf_json(json_data: dict | str, *, database: pb.Database) -> Rang
     lower_child = load_range_pcf_json(nested_lower, database=database) if nested_lower is not None else None
     nested_upper = json_data.get("upper_child")
     upper_child = load_range_pcf_json(nested_upper, database=database) if nested_upper is not None else None
+    nested_cutoff = json_data.get("cutoff_point")
+    cutoff_point = val_parser(nested_cutoff) if nested_cutoff is not None else None
 
     return RangeConditionedPCF(
-        pcf, range_col=range_col, lower_bound=lo, upper_bound=hi, lower_child=lower_child, upper_child=upper_child
+        pcf,
+        range_col=range_col,
+        lower_bound=lo,
+        upper_bound=hi,
+        lower_child=lower_child,
+        upper_child=upper_child,
+        cutoff_point=cutoff_point,
     )
 
 
@@ -1247,6 +1362,7 @@ def construct_histogram_hierarchy[T: _HistogramKey](
     if cutoff_idx == 0 or cutoff_idx == len(values):
         # we cannot split the histogram any further, since all values are in one bucket
         return RangeConditionedPCF(pcf, range_col=range_col, lower_bound=lo, upper_bound=hi)
+    cutoff_point = values[cutoff_idx - 1]
 
     lower_vals = values[:cutoff_idx]
     lower_freqs = frequencies[:cutoff_idx]
@@ -1283,6 +1399,7 @@ def construct_histogram_hierarchy[T: _HistogramKey](
         upper_bound=hi,
         lower_child=lower_child,
         upper_child=upper_child,
+        cutoff_point=cutoff_point,
     )
 
 
