@@ -2351,7 +2351,7 @@ class SafeBoundCatalog:
         if archive.is_dir():
             catalog_file = archive / "safebound-catalog.json.xz"
             if not catalog_file.exists():
-                catalog_file = catalog_file.with_suffix(".json")
+                catalog_file = archive / "safebound-catalog.json"
             if not catalog_file.exists():
                 raise FileNotFoundError(
                     "Fallback catalogs 'safebound-catalog.json' or "
@@ -2568,14 +2568,14 @@ class SafeBoundCatalog:
             )
 
         elif lower_bound is not None and lower_inclusive:
-            pcf = self._range_pcfs.lookup_less_equal(join_col, range_col=range_col, bound=lower_bound)
+            pcf = self._range_pcfs.lookup_greater_equal(join_col, range_col=range_col, bound=lower_bound)
         elif lower_bound is not None and not lower_inclusive:
-            pcf = self._range_pcfs.lookup_strict_less(join_col, range_col=range_col, bound=lower_bound)
+            pcf = self._range_pcfs.lookup_strict_greater(join_col, range_col=range_col, bound=lower_bound)
 
         elif upper_bound is not None and upper_inclusive:
-            pcf = self._range_pcfs.lookup_greater_equal(join_col, range_col=range_col, bound=upper_bound)
+            pcf = self._range_pcfs.lookup_less_equal(join_col, range_col=range_col, bound=upper_bound)
         elif upper_bound is not None and not upper_inclusive:
-            pcf = self._range_pcfs.lookup_strict_greater(join_col, range_col=range_col, bound=upper_bound)
+            pcf = self._range_pcfs.lookup_strict_less(join_col, range_col=range_col, bound=upper_bound)
 
         else:
             raise ValueError("At least one of lower_bound and upper_bound has to be non-None")
