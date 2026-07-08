@@ -799,6 +799,7 @@ class RangeConditionedPCF[T: _HistogramKey]:
         self,
         pcf: PiecewiseConstantFn,
         *,
+        unique_join_col: bool,
         range_col: pb.ColumnReference,
         lower_bound: T,
         upper_bound: T,
@@ -810,6 +811,7 @@ class RangeConditionedPCF[T: _HistogramKey]:
         self._lo, self._hi = lower_bound, upper_bound
 
         self._range_col = range_col
+        self._unique_join_col = unique_join_col
 
         self._lower_child = lower_child
         self._upper_child = upper_child
@@ -830,7 +832,7 @@ class RangeConditionedPCF[T: _HistogramKey]:
         that encompasses the entire range (and thus the PCF that over-estimates the true frequencies
         by the smallest margin).
         """
-        if self._none_safe_le_lo(lower) or self._none_safe_ge_hi(upper):
+        if self._none_safe_lt_lo(lower) or self._none_safe_gt_hi(upper):
             # The requested range is not completely enclosed in our bucket since all children only partition our bucket
             # further, they also cannot suddenly enclose the range. We can stop here.
             return None
@@ -893,11 +895,11 @@ class RangeConditionedPCF[T: _HistogramKey]:
 
         assert self._lower_child is not None and self._upper_child is not None
         if self._none_safe_lt_cutoff(value):
-            return self._lower_child.get_less(value)
+            return self._lower_child.get_less(value, inclusive=inclusive)
 
         lower_pcf = self._lower_child._pcf
-        upper_pcf = self._upper_child.get_less(value)
-        return lower_pcf + upper_pcf
+        upper_pcf = self._upper_child.get_less(value, inclusive=inclusive)
+        return self._merge_pcfs(lower_pcf, upper_pcf)
 
     def get_greater(self, value: T, *, inclusive: bool = False) -> PiecewiseConstantFn:
         """Obtains the PCF for all values greater than (or equal to) a given value.
@@ -914,10 +916,10 @@ class RangeConditionedPCF[T: _HistogramKey]:
 
         # This method is structurally very similar to `get_less`, but the logic is reversed.
         # See its documentation for details.
-
+        #
         if self._none_safe_gt_hi(value):
             return PiecewiseConstantFn.zero()
-        elif self._none_safe_lt_lo(value):
+        elif self._none_safe_le_lo(value):
             return self._pcf
 
         if self._is_leaf:
@@ -929,11 +931,31 @@ class RangeConditionedPCF[T: _HistogramKey]:
 
         assert self._lower_child is not None and self._upper_child is not None
         if self._none_safe_lt_cutoff(value):
-            lower_pcf = self._lower_child.get_greater(value)
+            lower_pcf = self._lower_child.get_greater(value, inclusive=inclusive)
             upper_pcf = self._upper_child._pcf
-            return lower_pcf + upper_pcf
+            return self._merge_pcfs(lower_pcf, upper_pcf)
 
-        return self._upper_child.get_greater(value)
+        return self._upper_child.get_greater(value, inclusive=inclusive)
+
+    def _is_singleton_bucket(self) -> bool:
+        """Checks, whether this bucket is just for a single value."""
+        return (self._lo is None and self._hi is None) or (self._lo == self._hi)
+
+    def _merge_pcfs(self, a: PiecewiseConstantFn, b: PiecewiseConstantFn) -> PiecewiseConstantFn:
+        """Merges two PCFs into a single PCF.
+
+        If the join column is unique, the PCFs must correspond to disjunct values and we can simply concatenate them.
+        Otherwise, we must add the frequencies by position.
+        """
+        return a.expand_by(b) if self._unique_join_col else (a + b)
+
+    def _none_safe_eq(self, a: T, b: T) -> bool:
+        """Checks, whether two values are equal, treating None as a normal value."""
+        return (a is None and b is None) or (a == b)
+
+    def _none_safe_eq_lo(self, value: T) -> bool:
+        """Checks, whether the given value is equal to the lower bound of this bucket."""
+        return (self._lo is None and value is None) or (self._lo == value)
 
     def _none_safe_lt_lo(self, value: T) -> bool:
         """Checks, if the given value is less than or equal to the lower bound of this bucket.
@@ -979,6 +1001,18 @@ class RangeConditionedPCF[T: _HistogramKey]:
 
         # Neither value nor lo are None, we can compare safely
         return value >= self._lo
+
+    def _none_safe_lt_hi(self, value: T) -> bool:
+        """Checks, if the given value is less than the upper bound of this bucket.
+
+        This method is "None-safe" in the sense that it will treat None as any other value.
+        """
+        if self._hi is None:
+            return False
+        elif value is None:
+            return True
+
+        return value < self._hi
 
     def _none_safe_le_hi(self, value: T) -> bool:
         """Checks, if the given value is less than or equal to the upper bound of this bucket.
@@ -1041,6 +1075,7 @@ class RangeConditionedPCF[T: _HistogramKey]:
     def __json__(self) -> pb.util.jsondict:
         return {
             "pcf": self._pcf,
+            "unique_join_col": self._unique_join_col,
             "range_col": self._range_col,
             "lower_bound": self._lo,
             "upper_bound": self._hi,
@@ -1051,7 +1086,11 @@ class RangeConditionedPCF[T: _HistogramKey]:
 
     def __repr__(self) -> str:
         bucket_type = "leaf" if self._is_leaf else "intermediate"
-        return f"Range-conditioned PCF on {self.range_col} for {bucket_type} bucket [{self._lo}, {self._hi}]"
+        if self._cutoff_point is not None:
+            interval = f"[{self._lo} -- {self._cutoff_point} -- {self._hi}]"
+        else:
+            interval = f"[{self._lo}, {self._hi}]"
+        return f"Range-conditioned PCF on {self.range_col} for {bucket_type} bucket {interval}"
 
 
 def load_range_pcf_json(json_data: dict | str, *, database: pb.Database) -> RangeConditionedPCF:
@@ -1064,6 +1103,8 @@ def load_range_pcf_json(json_data: dict | str, *, database: pb.Database) -> Rang
 
     pcf = load_pcf_json(json_data["pcf"])
     range_col = pb.parser.load_column_json(json_data["range_col"])
+    unique_join_col = json_data["unique_join_col"]
+
     dtype = database.schema().datatype(range_col)
     val_parser = make_json_parser(dtype)
     lo = val_parser(json_data["lower_bound"])
@@ -1078,6 +1119,7 @@ def load_range_pcf_json(json_data: dict | str, *, database: pb.Database) -> Rang
 
     return RangeConditionedPCF(
         pcf,
+        unique_join_col=unique_join_col,
         range_col=range_col,
         lower_bound=lo,
         upper_bound=hi,
@@ -1336,6 +1378,7 @@ def build_histogram_hierarchy[T: _HistogramKey](
     if not values:
         raise ValueError("Cannot derive histograms for empty distribution")
 
+    unique_join_col = database.schema().is_primary_key(join_col)
     lo, hi = values[0], values[-1]
     if lo == hi:
         # We are processing a value that is so frequent, it has an entire bucket for its own
@@ -1354,7 +1397,11 @@ def build_histogram_hierarchy[T: _HistogramKey](
         if hi is None:
             hi_pred = pb.qal.as_predicate(range_col, "is", None)
         else:
-            hi_pred = pb.qal.as_predicate(range_col, "<", hi)
+            # Greater-equals is the correct operation here!
+            # Our bisection logic below already ensures that all ranges are disjunct
+            # If we would do a strict-greater check here (as the histograms will do), we would loose the final
+            # bucket values.
+            hi_pred = pb.qal.as_predicate(range_col, "<=", hi)
 
         if lo_pred.operation == pb.qal.LogicalOperator.Is and hi_pred.operation == pb.qal.LogicalOperator.Is:
             range_pred = lo_pred
@@ -1368,7 +1415,9 @@ def build_histogram_hierarchy[T: _HistogramKey](
     log(f"Loading range-conditioned PCF for {join_col} on bucket {range_pred}")
     pcf = fetch_correlated_ds(range_pred, on=join_col, database=database, accuracy=accuracy)
     if len(values) == 1 or current_level >= max_level:
-        return RangeConditionedPCF(pcf, range_col=range_col, lower_bound=lo, upper_bound=hi)
+        return RangeConditionedPCF(
+            pcf, unique_join_col=unique_join_col, range_col=range_col, lower_bound=lo, upper_bound=hi
+        )
 
     cumulative = np.cumsum(frequencies)
     total_card = cumulative[-1]
@@ -1376,8 +1425,10 @@ def build_histogram_hierarchy[T: _HistogramKey](
     cutoff_idx = np.searchsorted(cumulative, cutoff_card, side="right")
     if cutoff_idx == 0 or cutoff_idx == len(values):
         # we cannot split the histogram any further, since all values are in one bucket
-        return RangeConditionedPCF(pcf, range_col=range_col, lower_bound=lo, upper_bound=hi)
-    cutoff_point = values[cutoff_idx - 1]
+        return RangeConditionedPCF(
+            pcf, unique_join_col=unique_join_col, range_col=range_col, lower_bound=lo, upper_bound=hi
+        )
+    cutoff_point = values[cutoff_idx]
 
     lower_vals = values[:cutoff_idx]
     lower_freqs = frequencies[:cutoff_idx]
@@ -1409,6 +1460,7 @@ def build_histogram_hierarchy[T: _HistogramKey](
 
     return RangeConditionedPCF(
         pcf,
+        unique_join_col=unique_join_col,
         range_col=range_col,
         lower_bound=lo,
         upper_bound=hi,

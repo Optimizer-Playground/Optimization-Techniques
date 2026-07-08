@@ -105,9 +105,7 @@ class DegreeSequence:
     """
 
     @staticmethod
-    def from_mcv(
-        mcv: pb.db.MostCommonValues, *, column: Optional[pb.ColumnReference] = None
-    ) -> DegreeSequence:
+    def from_mcv(mcv: pb.db.MostCommonValues, *, column: Optional[pb.ColumnReference] = None) -> DegreeSequence:
         """Creates a new degree sequence for a specific most-common values list.
 
         The column is used by the higher-up processing and should only be omitted for
@@ -116,9 +114,7 @@ class DegreeSequence:
         return DegreeSequence(mcv.frequencies, column=column)
 
     @staticmethod
-    def for_primary_key(
-        n_values: int, *, column: Optional[pb.ColumnReference] = None
-    ) -> DegreeSequence:
+    def for_primary_key(n_values: int, *, column: Optional[pb.ColumnReference] = None) -> DegreeSequence:
         """Creates a new degree sequence for a PRIMARY KEY/UNIQUE column.
 
         For such a column, all frequencies are by definition 1. Therefore, the degree sequence can
@@ -136,11 +132,7 @@ class DegreeSequence:
         column: Optional[pb.ColumnReference] = None,
     ) -> None:
         if not isinstance(degrees, np.ndarray):
-            degrees = [
-                int(deg)
-                for deg in degrees
-                if not isinstance(deg, pb.Cardinality) or deg.is_valid()
-            ]
+            degrees = [int(deg) for deg in degrees if not isinstance(deg, pb.Cardinality) or deg.is_valid()]
             degrees = np.asarray(degrees)
         degrees = np.sort(degrees)[::-1]  # see https://stackoverflow.com/q/26984414
         self._degrees: NDArray[np.int_] = np.array(degrees)
@@ -198,9 +190,7 @@ class DegreeSequence:
         sequences must have the same number of elements.
         """
         if len(self._degrees) != len(other._degrees):
-            raise ValueError(
-                "Degree sequences must have the same length for join bound calculation"
-            )
+            raise ValueError("Degree sequences must have the same length for join bound calculation")
         return int(self._degrees @ other._degrees)
 
     def expand_to(self, n_elems: int) -> DegreeSequence:
@@ -225,9 +215,7 @@ class DegreeSequence:
 
     def __le__(self, other: DegreeSequence) -> bool:
         if len(self) != len(other):
-            raise ValueError(
-                "Degree sequences must have the same length for comparison"
-            )
+            raise ValueError("Degree sequences must have the same length for comparison")
         return bool(np.min(other._degrees - self._degrees) >= 0)
 
     def __repr__(self) -> str:
@@ -324,9 +312,7 @@ class Segment:
 
     def __call__(self, i: int) -> int:
         if not self.lower <= i < self.higher:
-            raise ValueError(
-                f"i={i} is out of bounds for segment [{self.lower}, {self.higher})"
-            )
+            raise ValueError(f"i={i} is out of bounds for segment [{self.lower}, {self.higher})")
         return round(self.slope * i + self.intercept)
 
 
@@ -446,9 +432,7 @@ class PiecewiseConstantFn:
         """
         widths = np.diff(np.concat(([0], self._bounds)))
         intercepts = np.cumsum(widths * self._values)
-        return PiecewiseLinearFn(
-            slopes=self._values, intercepts=intercepts, bounds=self._bounds
-        )
+        return PiecewiseLinearFn(slopes=self._values, intercepts=intercepts, bounds=self._bounds)
 
     def cut_at(self, n_distinct: int) -> PiecewiseConstantFn:
         """Cuts the PCF after the first `n_distinct` values.
@@ -466,9 +450,7 @@ class PiecewiseConstantFn:
         bounds = np.concat((self._bounds[:cutoff], [n_distinct]))
         return PiecewiseConstantFn(values, bounds)
 
-    def align_with(
-        self, other: PiecewiseConstantFn
-    ) -> tuple[PiecewiseConstantFn, PiecewiseConstantFn]:
+    def align_with(self, other: PiecewiseConstantFn) -> tuple[PiecewiseConstantFn, PiecewiseConstantFn]:
         """Provides two aligned versions of the PCFs as (algined_self, aligned_other).
 
         See Also
@@ -498,6 +480,21 @@ class PiecewiseConstantFn:
             aligned_self._bounds,
             column=col,
         )
+
+    def expand_by(self, n: int | PiecewiseConstantFn) -> PiecewiseConstantFn:
+        """Expands a single-segment PCF to cover an additonal `n` values.
+
+        Notes
+        -----
+        This method is primarily intended for PCFs that correspond to disjunct segments of the same unique column.
+        """
+        if len(self._values) != 1:
+            raise ValueError("Can only expand a single-segment PCF")
+        if not isinstance(n, int):
+            n = n.n_distinct
+
+        expanded_bound = self._bounds[0] + n
+        return PiecewiseConstantFn(self._values, [expanded_bound], column=self.column)
 
     def evaluate_at(self, vals: np.ndarray) -> np.ndarray:
         """Computes the output frequencies of the given PCF indexes.
@@ -566,16 +563,10 @@ class PiecewiseConstantFn:
         in_initial_bucket = idx == 0
         clipped_lower = np.where(in_initial_bucket, 1, clipped_upper)
 
-        freq_until_bucket = np.where(
-            in_initial_bucket | out_of_bounds, 0, self._cum_widths[clipped_lower - 1]
-        )
+        freq_until_bucket = np.where(in_initial_bucket | out_of_bounds, 0, self._cum_widths[clipped_lower - 1])
 
-        prev_bucket_freq = np.where(
-            in_initial_bucket, 0, self._cumulative[clipped_lower - 1]
-        )
-        per_elem_freq = np.where(
-            out_of_bounds, 1, self._values[clipped_upper]
-        )  # use 1 to prevent division by 0
+        prev_bucket_freq = np.where(in_initial_bucket, 0, self._cumulative[clipped_lower - 1])
+        per_elem_freq = np.where(out_of_bounds, 1, self._values[clipped_upper])  # use 1 to prevent division by 0
         in_bucket_freq = (vals - prev_bucket_freq) / per_elem_freq
 
         return np.where(out_of_bounds, 0, freq_until_bucket + in_bucket_freq)
@@ -591,9 +582,7 @@ class PiecewiseConstantFn:
         else:
             col_desc = ""
 
-        lines: list[str] = [
-            f"PCF {col_desc}({len(self._values)} segments, {self._num_distinct} distinct values)"
-        ]
+        lines: list[str] = [f"PCF {col_desc}({len(self._values)} segments, {self._num_distinct} distinct values)"]
 
         prev_bound = 0
         max_bound = self._bounds[-1]
@@ -685,7 +674,7 @@ class PiecewiseConstantFn:
 
 class PiecewiseLinearFn:
     """A piecewise linear functions is divided into segments of simple linear functions.
-    
+
     The segments are aligned in such a way that there are no gaps between segments and no segments overlap.
 
     This class differs from `PiecewiseConstantFn` in that the segments are linear instead of constant. This makes it
@@ -713,9 +702,7 @@ class PiecewiseLinearFn:
     """
 
     @staticmethod
-    def from_segments(
-        segments: Iterable[Segment], column: Optional[pb.ColumnReference] = None
-    ) -> PiecewiseLinearFn:
+    def from_segments(segments: Iterable[Segment], column: Optional[pb.ColumnReference] = None) -> PiecewiseLinearFn:
         """Creates a new PCF.
 
         Segments can be either linear or constant. Furthermore, it is assumed that segments are already ordered
@@ -730,9 +717,7 @@ class PiecewiseLinearFn:
             intercepts.append(seg.intercept)
             bounds.append(seg.higher)
 
-        return PiecewiseLinearFn(
-            slopes=slopes, intercepts=intercepts, bounds=bounds, column=column
-        )
+        return PiecewiseLinearFn(slopes=slopes, intercepts=intercepts, bounds=bounds, column=column)
 
     def __init__(
         self,
@@ -814,7 +799,7 @@ def align_functions(
     The alignment logic splits the first segment of PCF A into two segments with the same value: 10 for [0, 5], and
     10 for (5, 10]. The other segments of PCF A remain unchanged. The first segment of PCF B remains unchanged, while
     the other two segments are split to align with the segments of PCF A: 4 for (10, 15], and 4 for (15, 20].
-    
+
     As a result of the alignment process, the two PCFs have the same bounds and the same number of segments.
 
     If `cut_early` is enabled, the longer PCF is cut after the last bound of the shorter PCF. All further values are
@@ -862,12 +847,7 @@ def align_functions(
             cur_a = next(iter_a, None)
             continue
 
-        assert (
-            a_val is not None
-            and b_val is not None
-            and a_bound is not None
-            and b_bound is not None
-        )
+        assert a_val is not None and b_val is not None and a_bound is not None and b_bound is not None
 
         if a_bound == b_bound:
             values_a.append(a_val)
