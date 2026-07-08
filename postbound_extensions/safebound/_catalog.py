@@ -854,7 +854,7 @@ class RangeConditionedPCF[T: _HistogramKey]:
         # we have the best-matching PCF
         return self._pcf
 
-    def get_less(self, value: T, *, inclusive: bool = False) -> PiecewiseConstantFn:
+    def get_less(self, value: T, *, inclusive: bool = False) -> Optional[PiecewiseConstantFn]:
         """Obtains the PCF for all values less than (or equal to) a given value.
 
         Use the `inclusive` flag to distinguish between open and closed ranges (i.e. strict less-than
@@ -863,9 +863,7 @@ class RangeConditionedPCF[T: _HistogramKey]:
         Notes
         -----
         The original SafeBound paper did not specify how to obtain conditioned PCFs for half-open
-        ranges. Our algorithm simply traverses the histogram hierarchy to the deepest level,
-        determines the first bucket whose upper bound is at least as large as the `value`,
-        and sums up the PCFs of all lower buckets.
+        ranges. Our algorithm simply maps a filter *col < v* to the range *col between MIN and v*.
 
         Our implementation currently does not distinguish between open and closed intervals. This is
         due to limitations of the histogram-based approach. If the value falls somewhere in the
@@ -879,29 +877,9 @@ class RangeConditionedPCF[T: _HistogramKey]:
         include the `inclusive` flag in the method signature. This avoids breaking changes - even if
         this flag has no effect for now.
         """
-        if self._none_safe_lt_lo(value):
-            # value is not part of the bucket, so we can return an empty PCF
-            return PiecewiseConstantFn.zero()
-        elif self._none_safe_gt_hi(value):
-            # value spans the entire bucket, so we can return the entire PCF
-            return self._pcf
+        return self.get_range(self._lo, value)
 
-        if self._is_leaf:
-            return (
-                self._pcf
-                if self._none_safe_ge_lo(value) and self._none_safe_le_hi(value)
-                else PiecewiseConstantFn.zero()
-            )
-
-        assert self._lower_child is not None and self._upper_child is not None
-        if self._none_safe_lt_cutoff(value):
-            return self._lower_child.get_less(value, inclusive=inclusive)
-
-        lower_pcf = self._lower_child._pcf
-        upper_pcf = self._upper_child.get_less(value, inclusive=inclusive)
-        return self._merge_pcfs(lower_pcf, upper_pcf)
-
-    def get_greater(self, value: T, *, inclusive: bool = False) -> PiecewiseConstantFn:
+    def get_greater(self, value: T, *, inclusive: bool = False) -> Optional[PiecewiseConstantFn]:
         """Obtains the PCF for all values greater than (or equal to) a given value.
 
         Use the `inclusive` flag to distinguish between open and closed ranges (i.e. strict
@@ -913,29 +891,7 @@ class RangeConditionedPCF[T: _HistogramKey]:
         get_less : for details on the underyling algorithm and the handling of open vs. closed
                    intervals.
         """
-
-        # This method is structurally very similar to `get_less`, but the logic is reversed.
-        # See its documentation for details.
-        #
-        if self._none_safe_gt_hi(value):
-            return PiecewiseConstantFn.zero()
-        elif self._none_safe_le_lo(value):
-            return self._pcf
-
-        if self._is_leaf:
-            return (
-                self._pcf
-                if self._none_safe_ge_lo(value) and self._none_safe_le_hi(value)
-                else PiecewiseConstantFn.zero()
-            )
-
-        assert self._lower_child is not None and self._upper_child is not None
-        if self._none_safe_lt_cutoff(value):
-            lower_pcf = self._lower_child.get_greater(value, inclusive=inclusive)
-            upper_pcf = self._upper_child._pcf
-            return self._merge_pcfs(lower_pcf, upper_pcf)
-
-        return self._upper_child.get_greater(value, inclusive=inclusive)
+        return self.get_range(value, self._hi)
 
     def _is_singleton_bucket(self) -> bool:
         """Checks, whether this bucket is just for a single value."""
