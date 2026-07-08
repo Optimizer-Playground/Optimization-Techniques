@@ -940,10 +940,15 @@ class RangeConditionedPCF[T: _HistogramKey]:
 
         This method is "None-safe" in the sense that it will treat None as any other value.
         """
-        if self._lo is None and value is None:
-            return True
-        if self._lo is None or value is None:
+        if self._lo is None:
+            # None is (by construction of our buckets) always the first element of any histogram. Therefore, no other
+            # value can ever be less (and we have strict less and not less/equal here)
             return False
+        elif value is None:
+            # The inverse of the above: None is always smallest and our value is None
+            return True
+
+        # Neither value nor lo are None, we can compare safely
         return value < self._lo
 
     def _none_safe_le_lo(self, value: T) -> bool:
@@ -951,10 +956,11 @@ class RangeConditionedPCF[T: _HistogramKey]:
 
         This method is "None-safe" in the sense that it will treat None as any other value.
         """
-        if self._lo is None and value is None:
+        if value is None:
             return True
-        if self._lo is None or value is None:
+        elif self._lo is None:
             return False
+
         return value <= self._lo
 
     def _none_safe_ge_lo(self, value: T) -> bool:
@@ -962,10 +968,16 @@ class RangeConditionedPCF[T: _HistogramKey]:
 
         This method is "None-safe" in the sense that it will treat None as any other value.
         """
-        if self._lo is None and value is None:
+        if self._lo is None:
+            # None is (by construction of our buckets) always the first element of any histogram. Therefore, any value
+            # _must_ be greater (or equal if it is also None)
             return True
-        if self._lo is None or value is None:
+        elif value is None:
+            # The inverse of the above: None would have been the lowest value, but lo is not None. Our value must be
+            # less than lo
             return False
+
+        # Neither value nor lo are None, we can compare safely
         return value >= self._lo
 
     def _none_safe_le_hi(self, value: T) -> bool:
@@ -973,10 +985,11 @@ class RangeConditionedPCF[T: _HistogramKey]:
 
         This method is "None-safe" in the sense that it will treat None as any other value.
         """
-        if self._hi is None and value is None:
+        if value is None:
             return True
-        if self._hi is None or value is None:
+        elif self._hi is None:
             return False
+
         return value <= self._hi
 
     def _none_safe_gt_hi(self, value: T) -> bool:
@@ -984,10 +997,11 @@ class RangeConditionedPCF[T: _HistogramKey]:
 
         This method is "None-safe" in the sense that it will treat None as any other value.
         """
-        if self._hi is None and value is None:
+        if value is None:
             return False
-        if self._hi is None or value is None:
+        elif self._hi is None:
             return True
+
         return value > self._hi
 
     def _none_safe_ge_hi(self, value: T) -> bool:
@@ -995,10 +1009,11 @@ class RangeConditionedPCF[T: _HistogramKey]:
 
         This method is "None-safe" in the sense that it will treat None as any other value.
         """
-        if self._hi is None and value is None:
+        if self._hi is None:
             return True
-        if self._hi is None or value is None:
+        elif value is None:
             return False
+
         return value >= self._hi
 
     def _none_safe_lt_cutoff(self, value: T) -> bool:
@@ -1006,10 +1021,10 @@ class RangeConditionedPCF[T: _HistogramKey]:
 
         This method is "None-safe" in the sense that it will treat None as any other value.
         """
-        if self._cutoff_point is None and value is None:
+        assert self._cutoff_point is not None
+        if value is None:
             return True
-        if self._cutoff_point is None or value is None:
-            return False
+
         return value < self._cutoff_point
 
     def _none_safe_ge_cutoff(self, value: T) -> bool:
@@ -1017,10 +1032,10 @@ class RangeConditionedPCF[T: _HistogramKey]:
 
         This method is "None-safe" in the sense that it will treat None as any other value.
         """
-        if self._cutoff_point is None and value is None:
-            return True
-        if self._cutoff_point is None or value is None:
+        assert self._cutoff_point is not None
+        if value is None:
             return False
+
         return value >= self._cutoff_point
 
     def __json__(self) -> pb.util.jsondict:
@@ -1276,7 +1291,7 @@ class RangeConditionsRepo:
         return {"pcfs": jsonized}
 
 
-def construct_histogram_hierarchy[T: _HistogramKey](
+def build_histogram_hierarchy[T: _HistogramKey](
     frequencies: np.ndarray,
     values: Sequence[T],
     *,
@@ -1366,7 +1381,7 @@ def construct_histogram_hierarchy[T: _HistogramKey](
 
     lower_vals = values[:cutoff_idx]
     lower_freqs = frequencies[:cutoff_idx]
-    lower_child = construct_histogram_hierarchy(
+    lower_child = build_histogram_hierarchy(
         lower_freqs,
         lower_vals,
         join_col=join_col,
@@ -1380,7 +1395,7 @@ def construct_histogram_hierarchy[T: _HistogramKey](
 
     upper_vals = values[cutoff_idx:]
     upper_freqs = frequencies[cutoff_idx:]
-    upper_child = construct_histogram_hierarchy(
+    upper_child = build_histogram_hierarchy(
         upper_freqs,
         upper_vals,
         join_col=join_col,
@@ -1442,7 +1457,7 @@ def build_histograms(
             log(f"Loading column distribution for {join_col} conditioned on {range_col}")
             filter_distribution = fetch_column_distribution(range_col, database)
             values, frequencies = zip(*filter_distribution)
-            histogram = construct_histogram_hierarchy(
+            histogram = build_histogram_hierarchy(
                 np.array(frequencies),
                 values,
                 join_col=join_col,
