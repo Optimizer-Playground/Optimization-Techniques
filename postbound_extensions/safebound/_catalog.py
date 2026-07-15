@@ -3,7 +3,7 @@ from __future__ import annotations
 import collections
 import json
 import lzma
-from collections.abc import Generator, Iterable, Mapping, Sequence
+from collections.abc import Callable, Generator, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -2042,26 +2042,35 @@ class _Predicate2PCF(pb.qal.PredicateVisitor[PiecewiseConstantFn]):
     >>> pcf = filters.accept_visitor(visitor, join_col=join_col)
     """
 
-    def __init__(self, catalog: SafeBoundCatalog, *, log: pb.util.Logger) -> None:
+    def __init__(
+        self,
+        catalog: SafeBoundCatalog,
+        *,
+        log: pb.util.Logger,
+        callback: Optional[Callable[[pb.qal.AbstractPredicate, PiecewiseConstantFn], None]] = None,
+    ) -> None:
         self._catalog = catalog
+        self._callback = callback or (lambda predicate, pcf: None)
         self._log = log
 
     def visit_binary_predicate(self, predicate: pb.qal.BinaryPredicate, *args, **kwargs) -> PiecewiseConstantFn:
         join_col = kwargs["join_col"]
         if not pb.qal.SimpleFilter.can_wrap(predicate):
-            return self._catalog.lookup_unconditioned(join_col)
-        simplified = pb.qal.SimpleFilter(predicate)
+            pcf = self._catalog.lookup_unconditioned(join_col)
+            self._callback(predicate, pcf)
+            return pcf
 
+        simplified = pb.qal.SimpleFilter(predicate)
         match simplified.operation:
             case pb.qal.LogicalOperator.Equal | pb.qal.LogicalOperator.Is:
-                return self._catalog.lookup_eq_conditioned(
+                pcf = self._catalog.lookup_eq_conditioned(
                     join_col,
                     filter_col=simplified.column,
                     filter_val=simplified.value,
                 )
 
             case pb.qal.LogicalOperator.Less:
-                return self._catalog.lookup_range_conditioned(
+                pcf = self._catalog.lookup_range_conditioned(
                     join_col,
                     range_col=simplified.column,
                     upper_bound=simplified.value,
@@ -2069,7 +2078,7 @@ class _Predicate2PCF(pb.qal.PredicateVisitor[PiecewiseConstantFn]):
                 )
 
             case pb.qal.LogicalOperator.LessEqual:
-                return self._catalog.lookup_range_conditioned(
+                pcf = self._catalog.lookup_range_conditioned(
                     join_col,
                     range_col=simplified.column,
                     upper_bound=simplified.value,
@@ -2077,7 +2086,7 @@ class _Predicate2PCF(pb.qal.PredicateVisitor[PiecewiseConstantFn]):
                 )
 
             case pb.qal.LogicalOperator.Greater:
-                return self._catalog.lookup_range_conditioned(
+                pcf = self._catalog.lookup_range_conditioned(
                     join_col,
                     range_col=simplified.column,
                     lower_bound=simplified.value,
@@ -2085,7 +2094,7 @@ class _Predicate2PCF(pb.qal.PredicateVisitor[PiecewiseConstantFn]):
                 )
 
             case pb.qal.LogicalOperator.GreaterEqual:
-                return self._catalog.lookup_range_conditioned(
+                pcf = self._catalog.lookup_range_conditioned(
                     join_col,
                     range_col=simplified.column,
                     lower_bound=simplified.value,
@@ -2094,7 +2103,7 @@ class _Predicate2PCF(pb.qal.PredicateVisitor[PiecewiseConstantFn]):
 
             case pb.qal.LogicalOperator.Like | pb.qal.LogicalOperator.ILike:
                 assert isinstance(simplified.value, str)
-                return self._catalog.lookup_like_conditioned(
+                pcf = self._catalog.lookup_like_conditioned(
                     join_col,
                     like_col=simplified.column,
                     like_val=simplified.value,
@@ -2111,13 +2120,16 @@ class _Predicate2PCF(pb.qal.PredicateVisitor[PiecewiseConstantFn]):
                     "Falling back to unconditioned PCF for predicate "
                     f"{predicate} on join column {join_col}"
                 )
-                return self._catalog.lookup_unconditioned(join_col)
+                pcf = self._catalog.lookup_unconditioned(join_col)
 
             case _:
                 self._log(
                     f"Unknown predicate type {predicate}. Falling back to unconditioned PCF for join column {join_col}"
                 )
-                return self._catalog.lookup_unconditioned(join_col)
+                pcf = self._catalog.lookup_unconditioned(join_col)
+
+        self._callback(predicate, pcf)
+        return pcf
 
     def visit_between_predicate(self, predicate: pb.qal.BetweenPredicate, *args, **kwargs) -> PiecewiseConstantFn:
         join_col = kwargs["join_col"]
@@ -2125,13 +2137,17 @@ class _Predicate2PCF(pb.qal.PredicateVisitor[PiecewiseConstantFn]):
             return self._catalog.lookup_unconditioned(join_col)
         simplified = pb.qal.SimpleFilter(predicate)
         assert isinstance(simplified.value, tuple)
+
         lo, hi = simplified.value
-        return self._catalog.lookup_range_conditioned(
+        pcf = self._catalog.lookup_range_conditioned(
             join_col,
             range_col=simplified.column,
             lower_bound=lo,
             upper_bound=hi,
         )
+
+        self._callback(predicate, pcf)
+        return pcf
 
     def visit_in_predicate(self, predicate: pb.qal.InPredicate, *args, **kwargs) -> PiecewiseConstantFn:
         join_col = kwargs["join_col"]
@@ -2139,18 +2155,25 @@ class _Predicate2PCF(pb.qal.PredicateVisitor[PiecewiseConstantFn]):
             return self._catalog.lookup_unconditioned(join_col)
         simplified = pb.qal.SimpleFilter(predicate)
         assert isinstance(simplified.value, Iterable)
+
         pcf = PiecewiseConstantFn.zero()
         for filter_val in simplified.value:
             filter_pcf = self._catalog.lookup_eq_conditioned(
                 join_col, filter_col=simplified.column, filter_val=filter_val
             )
             pcf += filter_pcf
+
+        self._callback(predicate, pcf)
         return pcf
 
     def visit_unary_predicate(self, predicate: pb.qal.UnaryPredicate, *args, **kwargs) -> PiecewiseConstantFn:
         join_col = kwargs["join_col"]
         self._log(f"Falling back to unconditioned PCF for unary predicate {predicate} on join column {join_col}")
-        return self._catalog.lookup_unconditioned(join_col)
+
+        pcf = self._catalog.lookup_unconditioned(join_col)
+
+        self._callback(predicate, pcf)
+        return pcf
 
     def visit_not_predicate(
         self,
@@ -2161,7 +2184,11 @@ class _Predicate2PCF(pb.qal.PredicateVisitor[PiecewiseConstantFn]):
     ) -> PiecewiseConstantFn:
         join_col = kwargs["join_col"]
         self._log(f"Falling back to unconditioned PCF for NOT predicate {predicate} on join column {join_col}")
-        return self._catalog.lookup_unconditioned(join_col)
+
+        pcf = self._catalog.lookup_unconditioned(join_col)
+
+        self._callback(predicate, pcf)
+        return pcf
 
     def visit_or_predicate(
         self,
@@ -2171,9 +2198,12 @@ class _Predicate2PCF(pb.qal.PredicateVisitor[PiecewiseConstantFn]):
         **kwargs,
     ) -> PiecewiseConstantFn:
         pcf = PiecewiseConstantFn.zero()
+
         for child in components:
             child_pcf = child.accept_visitor(self, *args, **kwargs)
             pcf += child_pcf
+
+        self._callback(predicate, pcf)
         return pcf
 
     def visit_and_predicate(
@@ -2185,9 +2215,12 @@ class _Predicate2PCF(pb.qal.PredicateVisitor[PiecewiseConstantFn]):
     ) -> PiecewiseConstantFn:
         head, tail = components[0], components[1:]
         pcf = head.accept_visitor(self, *args, **kwargs)
+
         for child in tail:
             child_pcf = child.accept_visitor(self, *args, **kwargs)
             pcf = pcf.min_with(child_pcf)
+
+        self._callback(predicate, pcf)
         return pcf
 
 
@@ -2473,7 +2506,12 @@ class SafeBoundCatalog:
         self._construction_time: timedelta | None = None
         self._log = wrap_logger(verbose)
 
-    def retrieve_stats(self, query: pb.SqlQuery) -> Mapping[pb.ColumnReference, PiecewiseConstantFn]:
+    def retrieve_stats(
+        self,
+        query: pb.SqlQuery,
+        *,
+        trace_callback: Optional[Callable[[pb.qal.AbstractPredicate, PiecewiseConstantFn], None]] = None,
+    ) -> Mapping[pb.ColumnReference, PiecewiseConstantFn]:
         """Fetches all PCFs for a specific query.
 
         For each of the join columns in the query, this determines all applicable filter predicates,
@@ -2481,6 +2519,9 @@ class SafeBoundCatalog:
         and combines the PCFs according to the conjunction/disjunction predicates.
 
         The result is provided as a mapping from join column to the final PCF on that column.
+
+        The callback can be used to trace the PCF retrieval for each individual predicate in the query. It is called
+        with the predicate and the corresponding PCF as arguments.
 
         Notes
         -----
@@ -2499,7 +2540,7 @@ class SafeBoundCatalog:
                 continue
             join_map[join_col] = filter_preds
 
-        pred_traversal = _Predicate2PCF(self, log=self._log)
+        pred_traversal = _Predicate2PCF(self, log=self._log, callback=trace_callback)
         stats = {col: pred.accept_visitor(pred_traversal, join_col=col) for col, pred in join_map.items()}
 
         for join_col in unconditioned_cols:
@@ -2508,17 +2549,24 @@ class SafeBoundCatalog:
         return stats
 
     def retrieve_pcf(
-        self, join_col: pb.ColumnReference, filters: pb.qal.AbstractPredicate | None
+        self,
+        join_col: pb.ColumnReference,
+        filters: pb.qal.AbstractPredicate | None,
+        *,
+        trace_callback: Optional[Callable[[pb.qal.AbstractPredicate, PiecewiseConstantFn], None]] = None,
     ) -> PiecewiseConstantFn:
         """Loads the best-matching PCF for a single (filtered) join column.
 
         If no filters are given or none of the available conditioned PCFs is applicable, the unconditioned PCF is
         returned.
+
+        The callback can be used to trace the PCF retrieval for each individual predicate in the query. It is called
+        with the predicate and the corresponding PCF as arguments.
         """
         if filters is None:
             return self.lookup_unconditioned(join_col)
 
-        pred_traversal = _Predicate2PCF(self, log=self._log)
+        pred_traversal = _Predicate2PCF(self, log=self._log, callback=trace_callback)
         return filters.accept_visitor(pred_traversal, join_col=join_col)
 
     def lookup_unconditioned(self, join_col: pb.ColumnReference) -> PiecewiseConstantFn:
