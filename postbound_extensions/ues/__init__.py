@@ -120,6 +120,6 @@ You should have received a copy of the GNU General Public License
 along with this program.  If not, see <https://www.gnu.org/licenses/>.
 """
 
-from ._ues import UesJoinOrdering, UesOperators
+from ._ues import NativeStatsProvider, PreciseStatsProvider, StatsProvider, UesJoinOrdering, UesOperators
 
-__all__ = ["UesJoinOrdering", "UesOperators"]
+__all__ = ["NativeStatsProvider", "PreciseStatsProvider", "StatsProvider", "UesJoinOrdering", "UesOperators"]

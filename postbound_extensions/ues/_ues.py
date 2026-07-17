@@ -21,7 +21,7 @@ from __future__ import annotations
 import collections
 import warnings
 from collections.abc import Iterable
-from typing import Literal, Optional
+from typing import Literal, Optional, Protocol
 
 import postbound as pb
 
@@ -29,6 +29,77 @@ Intermediate = frozenset[pb.TableReference]
 UpperBound = pb.Cardinality
 JoinKey = tuple[pb.ColumnReference, pb.ColumnReference]
 JoinPartners = set[JoinKey]
+
+
+class StatsProvider(Protocol):
+    """Interface for the statistics that are required by UES."""
+
+    def filter_card(self, table: pb.TableReference, *, query: pb.SqlQuery) -> pb.Cardinality:
+        """Estimate the cardinality of a table after applying all filters in the query."""
+        ...
+
+    def max_freq(self, column: pb.ColumnReference, *, query: pb.SqlQuery) -> pb.Cardinality:
+        """Estimate the maximum frequency of a column in the query."""
+        ...
+
+
+class NativeStatsProvider:
+    """Native stats are obtained directly from the statistics catalog of a database.
+
+    The quality of these statistics is highly dependent on the database system and its configuration.
+    """
+
+    def __init__(self, database: pb.Database) -> None:
+        self._db = database
+        self._stats = database.statistics()
+        self._stats.emulated = False
+        self._stats.enable_emulation_fallback = False
+
+    def filter_card(self, table: pb.TableReference, *, query: pb.SqlQuery) -> pb.Cardinality:
+        filter_query = pb.transform.extract_subquery(query, table)
+        return self._db.optimizer().cardinality_estimate(filter_query)
+
+    def max_freq(self, column: pb.ColumnReference, *, query: pb.SqlQuery) -> pb.Cardinality:
+        if not pb.ColumnReference.assert_bound(column):
+            raise ValueError(f"Column {column} is not bound to a table.")
+
+        mcv = self._stats.most_common_values(column, k=1, emulated=False)
+        if mcv:
+            _, freq = mcv[0]
+            return pb.Cardinality(freq)
+
+        # No MCV - assume uniform distribution
+        total_card = self._stats.total_rows(column.table)
+        distinct_count = self._stats.distinct_values(column)
+        assert total_card is not None
+
+        if not distinct_count:
+            return pb.Cardinality(1)
+        return pb.Cardinality(total_card // distinct_count)
+
+
+class PreciseStatsProvider:
+    """Precise stats are obtained by computing the true values of the statistics.
+
+    These "perfect" estimates are calculated by issuing actual SQL queries to the database.
+    """
+
+    def __init__(self, database: pb.Database) -> None:
+        self._db = database
+        self._stats = database.statistics()
+        self._stats.emulated = True
+
+    def filter_card(self, table: pb.TableReference, *, query: pb.SqlQuery) -> pb.Cardinality:
+        filter_query = pb.transform.extract_subquery(query, table)
+        filter_query = pb.transform.as_count_star_query(filter_query)
+        result = self._db.execute_query(filter_query)
+        return pb.Cardinality(result)
+
+    def max_freq(self, column: pb.ColumnReference, *, query: pb.SqlQuery) -> pb.Cardinality:
+        mcv = self._stats.most_common_values(column, k=1, emulated=True)[0]
+        assert mcv is not None
+        _, freq = mcv
+        return pb.Cardinality(freq)
 
 
 class UesJoinOrdering(pb.JoinOrderOptimization, pb.CardinalityEstimator):
@@ -51,13 +122,15 @@ class UesJoinOrdering(pb.JoinOrderOptimization, pb.CardinalityEstimator):
     database : Optional[pb.Database], optional
         The database to obtain all statistics and schema information. If not provided, the database will be inferred from
         PostBOUND's database pool.
-    estimations : Literal["native", "precise"], optional
+    estimations : Literal["native", "precise"] | StatsProvider, optional
         How the statistics should be obtained. *precise* means that we emulate perfect statistics. Internally, this is achieved
         by issuing actual SQL queries to obtain the true value for base table cardinalities and maximum frequencies. *native*
         means that we use the estimates provided by the database's statistics catalog and cardinality estimator.
         This will improve optimization performance by a lot, but the resulting join order might be worse due to inaccurate
         estimates. Furthermore, be aware that the *native* option goes against the original design of UES and is not
         recommended in an actual benchmarking scenario. The default is *precise*.
+
+        Users can also supply a custom stats provider for more advanced use cases.
 
     See Also
     --------
@@ -73,18 +146,20 @@ class UesJoinOrdering(pb.JoinOrderOptimization, pb.CardinalityEstimator):
         self,
         *,
         database: Optional[pb.Database] = None,
-        estimations: Literal["native", "precise"] = "precise",
+        estimations: Literal["native", "precise"] | StatsProvider = "precise",
     ) -> None:
         super().__init__()
         self._database = database or pb.db.current_database()
 
-        emulate_stats = estimations == "precise"
-        self._stats = self._database.statistics()
-        self._stats.emulated = emulate_stats
+        match estimations:
+            case "native":
+                self._stats = NativeStatsProvider(self._database)
+            case "precise":
+                self._stats = PreciseStatsProvider(self._database)
+            case _:
+                self._stats = estimations
 
-    def optimize_join_order(
-        self, query: pb.SqlQuery
-    ) -> pb.JoinTree[pb.Cardinality] | None:
+    def optimize_join_order(self, query: pb.SqlQuery) -> pb.JoinTree[pb.Cardinality] | None:
         join_tree: pb.JoinTree[pb.Cardinality] = pb.JoinTree()
         expanding_tables, filtering_tables = self._determine_table_types(query)
         upper: dict[Intermediate, UpperBound] = {}
@@ -110,9 +185,7 @@ class UesJoinOrdering(pb.JoinOrderOptimization, pb.CardinalityEstimator):
             best_candidate: Optional[pb.TableReference] = None
             best_col: Optional[pb.ColumnReference] = None
             best_partner: Optional[pb.ColumnReference] = None
-            candidate_joins = self._join_partners(
-                expanding_tables, bound_tables=join_tree.tables(), query=query
-            )
+            candidate_joins = self._join_partners(expanding_tables, bound_tables=join_tree.tables(), query=query)
 
             for candidate, join_partners in candidate_joins.items():
                 join_bounds = {
@@ -129,11 +202,7 @@ class UesJoinOrdering(pb.JoinOrderOptimization, pb.CardinalityEstimator):
                     best_col = free_col
                     best_partner = bound_col
 
-            assert (
-                best_candidate is not None
-                and best_col is not None
-                and best_partner is not None
-            )
+            assert best_candidate is not None and best_col is not None and best_partner is not None
             available_pks = self._available_pk_tables(
                 best_candidate,
                 intermediate=join_tree.tables(),
@@ -141,7 +210,7 @@ class UesJoinOrdering(pb.JoinOrderOptimization, pb.CardinalityEstimator):
                 query=query,
             )
             bound_cols = {col for col in max_freqs if col.table in join_tree.tables()}
-            if best_bound < self._filter_card(best_candidate, query=query):
+            if best_bound < self._stats.filter_card(best_candidate, query=query):
                 pk_fk_tree = pb.JoinTree(base_table=best_candidate)
                 dangling_pks: list[pb.TableReference] = []
                 for pk_table in available_pks:
@@ -164,11 +233,7 @@ class UesJoinOrdering(pb.JoinOrderOptimization, pb.CardinalityEstimator):
             free_freq = max_freqs[best_col]
             bound_freq = max_freqs[best_partner]
             new_tables = {best_candidate} | set(available_pks)
-            new_cols = [
-                free_col
-                for free_col in max_freqs.keys()
-                if free_col.table in new_tables
-            ]
+            new_cols = [free_col for free_col in max_freqs.keys() if free_col.table in new_tables]
             for bound_col in bound_cols:
                 max_freqs[bound_col] *= free_freq
             for free_col in new_cols:
@@ -179,10 +244,7 @@ class UesJoinOrdering(pb.JoinOrderOptimization, pb.CardinalityEstimator):
 
         remaining_tables = query.tables() - join_tree.tables()
         if remaining_tables:
-            warnings.warn(
-                f"Query {query} has unprocessed tables left: {remaining_tables}. "
-                "Not returning a join order."
-            )
+            warnings.warn(f"Query {query} has unprocessed tables left: {remaining_tables}. Not returning a join order.")
             return None
 
         return join_tree
@@ -203,15 +265,11 @@ class UesJoinOrdering(pb.JoinOrderOptimization, pb.CardinalityEstimator):
     def describe(self) -> pb.util.jsondict:
         return {"name": "UES", "type": "original"}
 
-    def _init_max_freqs(
-        self, query: pb.SqlQuery
-    ) -> dict[pb.ColumnReference, pb.Cardinality]:
+    def _init_max_freqs(self, query: pb.SqlQuery) -> dict[pb.ColumnReference, pb.Cardinality]:
         max_freqs: dict[pb.ColumnReference, pb.Cardinality] = {}
-        join_cols = pb.util.set_union(
-            join_pred.columns() for join_pred in query.joins()
-        )
+        join_cols = pb.util.set_union(join_pred.columns() for join_pred in query.joins())
         for col in join_cols:
-            max_freqs[col] = self._max_freq(col)
+            max_freqs[col] = self._stats.max_freq(col, query=query)
         return max_freqs
 
     def _upper_bound(
@@ -230,9 +288,7 @@ class UesJoinOrdering(pb.JoinOrderOptimization, pb.CardinalityEstimator):
         candidate_freq = max_freqs[free_col]
         return min(partner_bound * candidate_freq, candidate_bound * partner_freq)
 
-    def _determine_table_types(
-        self, query: pb.SqlQuery
-    ) -> tuple[set[pb.TableReference], set[pb.TableReference]]:
+    def _determine_table_types(self, query: pb.SqlQuery) -> tuple[set[pb.TableReference], set[pb.TableReference]]:
         schema = self._database.schema()
         candidate_joins = query.joins()
         expanding_tables: set[pb.TableReference] = set()
@@ -264,13 +320,11 @@ class UesJoinOrdering(pb.JoinOrderOptimization, pb.CardinalityEstimator):
         query: pb.SqlQuery,
     ) -> None:
         for table in expanding_tables:
-            pk_fk_bound: UpperBound = self._filter_card(table, query=query)
-            pk_partners = self._pk_partners(
-                table, candidates=filter_candidates, query=query
-            )
+            pk_fk_bound: UpperBound = self._stats.filter_card(table, query=query)
+            pk_partners = self._pk_partners(table, candidates=filter_candidates, query=query)
             for pk_table, join_column in pk_partners.items():
                 max_freq = max_freqs[join_column]
-                pk_card = self._filter_card(pk_table, query=query)
+                pk_card = self._stats.filter_card(pk_table, query=query)
                 current_bound = max_freq * pk_card
                 pk_fk_bound = min(pk_fk_bound, current_bound)
             upper[frozenset([table])] = pk_fk_bound
@@ -282,9 +336,7 @@ class UesJoinOrdering(pb.JoinOrderOptimization, pb.CardinalityEstimator):
         candidates: set[pb.TableReference],
         query: pb.SqlQuery,
     ) -> dict[pb.TableReference, pb.ColumnReference]:
-        partner_tables = [
-            partner for partner in candidates if query.joins_between(table, partner)
-        ]
+        partner_tables = [partner for partner in candidates if query.joins_between(table, partner)]
 
         partners: dict[pb.TableReference, pb.ColumnReference] = {}
         for partner in partner_tables:
@@ -334,33 +386,7 @@ class UesJoinOrdering(pb.JoinOrderOptimization, pb.CardinalityEstimator):
         query: pb.SqlQuery,
     ) -> list[pb.TableReference]:
         bound_tables = intermediate.union({table})
-        return [
-            candidate
-            for candidate in candidates
-            if query.joins_between(bound_tables, candidate)
-        ]
-
-    def _filter_card(
-        self, table: pb.TableReference, *, query: pb.SqlQuery
-    ) -> pb.Cardinality:
-        filter_query = pb.transform.extract_query_fragment(query, table)
-        assert filter_query is not None
-        return self._database.optimizer().cardinality_estimate(filter_query)
-
-    def _max_freq(self, column: pb.ColumnReference) -> pb.Cardinality:
-        assert column.table, "Unbound column"
-        mcv = self._stats.most_common_values(column, k=1)[0]
-        if mcv:
-            return pb.Cardinality(mcv[1])
-
-        # No MCV - assume uniform distribution
-        total_card = self._stats.total_rows(column.table)
-        distinct_count = self._stats.distinct_values(column)
-        assert total_card is not None
-
-        if not distinct_count:
-            return pb.Cardinality(1)
-        return pb.Cardinality(total_card // distinct_count)
+        return [candidate for candidate in candidates if query.joins_between(bound_tables, candidate)]
 
 
 class UesOperators(pb.PhysicalOperatorSelection):
@@ -384,13 +410,9 @@ class UesOperators(pb.PhysicalOperatorSelection):
     ) -> pb.PhysicalOperatorAssignment:
         operators = pb.PhysicalOperatorAssignment()
         if self._database.hinting().supports_hint(pb.JoinOperator.NestedLoopJoin):
-            operators.set_operator_enabled_globally(
-                pb.JoinOperator.NestedLoopJoin, False
-            )
+            operators.set_operator_enabled_globally(pb.JoinOperator.NestedLoopJoin, False)
         if self._database.hinting().supports_hint(pb.JoinOperator.SortMergeJoin):
-            operators.set_operator_enabled_globally(
-                pb.JoinOperator.SortMergeJoin, False
-            )
+            operators.set_operator_enabled_globally(pb.JoinOperator.SortMergeJoin, False)
         if self._database.hinting().supports_hint(pb.JoinOperator.HashJoin):
             operators.set_operator_enabled_globally(pb.JoinOperator.HashJoin, True)
         return operators
