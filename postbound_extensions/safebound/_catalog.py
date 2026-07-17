@@ -583,6 +583,13 @@ class EqualityConditionedPCF[T]:
         fn = self._functions.get(key)
         return fn or self._unconditioned
 
+    def num_pcfs(self) -> int:
+        """Returns the number of PCFs stored in this object.
+
+        This includes the unconditioned PCF.
+        """
+        return len(self._functions) + 1  # +1 for the unconditioned PCF
+
     def __json__(self) -> pb.util.jsondict:
         return {
             "equality_col": self._col,
@@ -658,6 +665,10 @@ class EqualityConditionsRepo:
             return None
 
         return target_pcf.get(filter_val)
+
+    def count_pcfs(self) -> int:
+        """Counts the total number of equality-conditioned PCFs in the repository."""
+        return sum(len(pcfs) for pcfs in self._functions.values())
 
     def _repr_pretty_(self, p, cycle):
         if cycle:
@@ -839,7 +850,6 @@ class RangeConditionedPCF[T: _HistogramKey]:
 
         # The requested range is completely enclosed in our bucket. We can definitely return our own PCF as a valid
         # result. However, it might be the case that one of our children still has a more narrow matching bucket,
-        # so we need to traverse further.
         # Since the buckets of our lower and upper children are completely disjoint, we can stop as soon as one of
         # them matches the range - it is impossible for the other child to match as well.
 
@@ -871,7 +881,6 @@ class RangeConditionedPCF[T: _HistogramKey]:
         exactly on a bucket boundary, we do not know what the first smaller value is and thus have to
         default once again to the entire bucket (in case of an open interval). Lastly, for closed
         intervals, we have to include the boundary value anyway and thus use the entire bucket. To
-        circumvent this situation, we would likely need to come up with an entirely different
         representation for range predicates. We argue that this would no longer be a faithful
         adaptation of SafeBound. In case we come up with a better solution in the future, we already
         include the `inclusive` flag in the method signature. This avoids breaking changes - even if
@@ -892,6 +901,15 @@ class RangeConditionedPCF[T: _HistogramKey]:
                    intervals.
         """
         return self.get_range(value, self._hi)
+
+    def count_pcfs(self) -> int:
+        """Counts the total number of PCFs in this histogram and all its children."""
+        count = 1
+        if self._lower_child is not None:
+            count += self._lower_child.count_pcfs()
+        if self._upper_child is not None:
+            count += self._upper_child.count_pcfs()
+        return count
 
     def _is_singleton_bucket(self) -> bool:
         """Checks, whether this bucket is just for a single value."""
@@ -1059,7 +1077,7 @@ def load_range_pcf_json(json_data: dict | str, *, database: pb.Database) -> Rang
 
     pcf = load_pcf_json(json_data["pcf"])
     range_col = pb.parser.load_column_json(json_data["range_col"])
-    unique_join_col = json_data["unique_join_col"]
+    unique_join_col = json_data.get("unique_join_col", False)
 
     dtype = database.schema().datatype(range_col)
     val_parser = make_json_parser(dtype)
@@ -1265,6 +1283,13 @@ class RangeConditionsRepo:
         if target_pcf is None:
             return None
         return target_pcf.get_greater(bound, inclusive=False)
+
+    def count_pcfs(self) -> int:
+        """Counts the total number of range-conditioned PCFs in the repository."""
+        counter = 0
+        for pcfs in self._join_pcfs.values():
+            counter += sum(pcf.count_pcfs() for pcf in pcfs)
+        return counter
 
     def _repr_pretty_(self, p, cycle):
         if cycle:
@@ -1561,6 +1586,10 @@ class LikeConditionedPCF:
 
         return result_pcf or self._unconditioned
 
+    def count_pcfs(self) -> int:
+        """Counts the total number of PCFs in this like-conditioned PCF."""
+        return len(self._grams) + 1  # +1 for the unconditioned PCF
+
     def __json__(self) -> pb.util.jsondict:
         return {
             "three_grams": self._grams,
@@ -1637,6 +1666,13 @@ class LikeConditionsRepo:
             else:
                 final_pcf = final_pcf.min_with(target_pcf.get(val))
         return final_pcf
+
+    def count_pcfs(self) -> int:
+        """Counts the total number of like-conditioned PCFs in the repository."""
+        counter = 0
+        for pcfs in self._pcfs.values():
+            counter += sum(pcf.count_pcfs() for pcf in pcfs)
+        return counter
 
     def _repr_pretty_(self, p, cycle):
         if cycle:
@@ -2234,7 +2270,6 @@ class SafeBoundCatalog:
 
     In addition, the catalog provides functionality to retrieve the appropriate PCFs for a specific
     query. This behavior is encoded in the different ``lookup_XYZ()`` methods and the
-    `retrieve_stats` method. Generally, users only need to interact with the latter.
 
     Creating a Catalog
     ------------------
@@ -2475,8 +2510,11 @@ class SafeBoundCatalog:
         SafeBoundSpec.default : For details on the default hyperparameters
         """
         archive = Path(archive)
-        if archive.is_dir():
+        if archive.is_dir() and (archive / "safebound-catalog.json.xz").exists():
+            archive = archive / "safebound-catalog.json.xz"
+        elif archive.is_dir() and (archive / "safebound-catalog.json").exists():
             archive = archive / "safebound-catalog.json"
+
         if archive.is_file():
             return SafeBoundCatalog.load(archive, database=database)
 
@@ -2506,6 +2544,20 @@ class SafeBoundCatalog:
         self._construction_time: timedelta | None = None
         self._log = wrap_logger(verbose)
 
+    @property
+    def construction_time(self) -> Optional[timedelta]:
+        """Returns the time it took to build the catalog, or None if it is unknown."""
+        return self._construction_time
+
+    def count_pcfs(self) -> int:
+        """Counts the total number of PCFs in the catalog."""
+        return (
+            self._eq_pcfs.count_pcfs()
+            + self._range_pcfs.count_pcfs()
+            + self._like_pcfs.count_pcfs()
+            + len(self._unconditioned_pcfs)
+        )
+
     def retrieve_stats(
         self,
         query: pb.SqlQuery,
@@ -2525,7 +2577,6 @@ class SafeBoundCatalog:
 
         Notes
         -----
-        Generally speaking, this is the only method that users need to worry about when extracting
         PCFs from the catalog. The other ``lookup_XYZ`` methods should be considered internal work
         horses.
         """
