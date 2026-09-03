@@ -225,10 +225,10 @@ class DatabaseCacheState:
 
         pct_sum = 0
         for rel in rels:
-            total_pages = self._stats.n_pages(rel)
+            total_pages = self._stats.n_pages(rel)  # type: ignore - guarded by isinstance(PostgresInterface) above
             buffered_pages = self._cache_state.get(rel, -1)
             if buffered_pages == -1:
-                buffered_pages = self._stats.n_buffered(rel)
+                buffered_pages = self._stats.n_buffered(rel)  # type: ignore - guarded by isinstance(PostgresInterface) above
                 self._cache_state[rel] = buffered_pages
             pct_sum += buffered_pages / total_pages
 
@@ -323,7 +323,7 @@ class BaoFeaturizer:
 
         select_clause = pb.qal.Select.count_star()
         from_clause = pb.qal.From.create_for(largest_tables)
-        cross_product = pb.qal.SqlQuery(select_clause=select_clause, from_clause=from_clause)
+        cross_product = pb.qal.as_query(select_clause, from_clause)
 
         max_cost = database.optimizer().cost_estimate(cross_product)
 

@@ -45,7 +45,7 @@ class AlphaStep:
         if all(isinstance(rel, PiecewiseConstantFn) for rel in self._fns):
             self._combined = self._fns[0]
             for pcf in self._fns[1:]:
-                self._combined *= pcf
+                self._combined *= pcf  # type: ignore - guarded by the isinstance() check above
             self._n_distinct = self._combined.n_distinct
         else:
             self._combined = None
@@ -141,9 +141,7 @@ class AlphaStep:
                 continue
 
             if not isinstance(fn, (AlphaStep, BetaStep)):
-                raise ValueError(
-                    f"Unknown function type {type(fn).__name__}: {fn}"
-                )
+                raise ValueError(f"Unknown function type {type(fn).__name__}: {fn}")
 
             nested_inspect = fn._inspect_internal()
             nested_inspect[0] = f"{padding} +- {nested_inspect[0]}"
@@ -249,9 +247,7 @@ class BetaStep:
         self._proj: PiecewiseConstantFn = projection
         self._dimension_joins = tuple(pcfs)
         if len(self._dimension_joins) < 1:
-            raise ValueError(
-                "At least one dimension join required for a beta step!"
-            )
+            raise ValueError("At least one dimension join required for a beta step!")
 
     @property
     def n_distinct(self) -> int:
@@ -260,9 +256,7 @@ class BetaStep:
 
     def columns(self) -> set[pb.ColumnReference]:
         """Provides all join columns that are part of this alpha step, including nested steps."""
-        return self._proj.columns() | pb.util.set_union(
-            dim_join.columns() for dim_join in self._dimension_joins
-        )
+        return self._proj.columns() | pb.util.set_union(dim_join.columns() for dim_join in self._dimension_joins)
 
     def evaluate_at(self, vals: np.ndarray) -> np.ndarray:
         """Computes the output frequencies of the given PCF indexes.
@@ -335,10 +329,7 @@ class BetaStep:
         for dim_join in self._dimension_joins:
             fact_pcf = dim_join.fact_pcf
             if not isinstance(fact_pcf, PiecewiseConstantFn):
-                raise ValueError(
-                    "Expected PiecewiseConstantFn for fact side of dimension join, "
-                    f"got {type(fact_pcf)}"
-                )
+                raise ValueError(f"Expected PiecewiseConstantFn for fact side of dimension join, got {type(fact_pcf)}")
 
             lines.append(f"{padding}+- fact col {fact_pcf.column}::")
             dim_pcf = dim_join.dimension_pcf
@@ -393,9 +384,7 @@ class BetaStep:
 
     def __repr__(self) -> str:
         components = ", ".join(repr(fn) for fn in self._dimension_joins)
-        return (
-            f"BetaStep(relations=[{components}], projection={repr(self._proj)})"
-        )
+        return f"BetaStep(relations=[{components}], projection={repr(self._proj)})"
 
     def __str__(self) -> str:
         components = ", ".join(str(fn) for fn in self._dimension_joins)
@@ -409,9 +398,7 @@ def _adj_flow(
 
 
 @overload
-def _adj_flow(
-    join_graph: nx.Graph, node: pb.TableReference, *, source: int
-) -> Generator[int, None, None]: ...
+def _adj_flow(join_graph: nx.Graph, node: pb.TableReference, *, source: int) -> Generator[int, None, None]: ...
 
 
 def _adj_flow(
@@ -458,9 +445,7 @@ def _create_alpha_step(
             relations.append(pcf)
             continue
 
-        beta_step = _create_beta_step(
-            join_graph, neighbor, project_on=join, statistics=statistics
-        )
+        beta_step = _create_beta_step(join_graph, neighbor, project_on=join, statistics=statistics)
         relations.append(beta_step)
 
     if include_source:
@@ -548,9 +533,7 @@ def _select_acyclic_root(join_graph: nx.Graph) -> pb.TableReference:
     Currently we use the first applicable table that we encouter when iterating the join graph,
     but this is an implementation detail that might change in the future.
     """
-    return next(
-        node for node in join_graph.nodes if join_graph.degree[node] == 1
-    )
+    return next(node for node in join_graph.nodes if join_graph.degree[node] == 1)
 
 
 def decompose_acyclic(
@@ -630,9 +613,11 @@ def fdsb_graph(query: pb.SqlQuery) -> nx.Graph:
         node_type="base_table",
     )
 
-    for i, eqc in enumerate(
-        pb.qal.determine_join_equivalence_classes(query.joins())
-    ):
+    joins = query.joins()
+    if not pb.qal.all_binary_predicates(joins):
+        raise ValueError(f"FDSB only works for binary joins, not '{joins}'")
+
+    for i, eqc in enumerate(pb.qal.determine_join_equivalence_classes(joins)):
         join_graph.add_node(i, node_type="join")
         join_graph.add_edges_from((i, col, {"join_col": col}) for col in eqc)
     return join_graph
@@ -660,9 +645,7 @@ def decompose_query(
     """
     join_graph = fdsb_graph(query)
     if not nx.is_tree(join_graph):
-        raise ValueError(
-            f"Decomposition only works for acyclic queries, not '{query}'"
-        )
+        raise ValueError(f"Decomposition only works for acyclic queries, not '{query}'")
     root = _select_acyclic_root(join_graph)
     return decompose_acyclic(join_graph, root, statistics=statistics)
 

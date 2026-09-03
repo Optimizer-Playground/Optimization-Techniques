@@ -1719,7 +1719,7 @@ requires-dist = [
     { name = "networkx", specifier = ">=3.6.1" },
     { name = "numpy", specifier = ">=2.4.2" },
     { name = "pandas", specifier = ">=2.3.3" },
-    { name = "postbound", specifier = ">=0.21.5" },
+    { name = "postbound", git = "https://github.com/Optimizer-Playground/PostBOUND.git?rev=2e4341f" },
     { name = "pyarrow", specifier = ">=23.0.1" },
     { name = "scikit-learn", specifier = ">=1.8.0" },
     { name = "scipy", specifier = ">=1.17.0" },
@@ -1984,8 +1984,8 @@ wheels = [
 
 [[package]]
 name = "postbound"
-version = "0.21.5"
-source = { registry = "https://pypi.org/simple" }
+version = "0.22.0.dev1"
+source = { git = "https://github.com/Optimizer-Playground/PostBOUND.git?rev=2e4341f#2e4341f85b8ecd4bbf7d9a9c4bb6c399d7691619" }
 dependencies = [
     { name = "lazy-loader" },
     { name = "levenshtein" },
@@ -1996,10 +1996,6 @@ dependencies = [
     { name = "pglast" },
     { name = "psycopg", extra = ["binary"] },
     { name = "tqdm" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/cb/4c/2ec6f007e78cdff382e1b1569845f20eb834b1fd842f3b073ba56dbdb3f1/postbound-0.21.5.tar.gz", hash = "sha256:a2a97349074c77e3a57f75d284604ecb86f6e8cdd4300ecfad0e95cac78e7eb9", size = 484070, upload-time = "2026-07-09T11:20:10.42Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/b3/28/f3c1f0402440d614d16a6d7cdf33e91e831da97daa69b12125d455e1963e/postbound-0.21.5-py3-none-any.whl", hash = "sha256:6c73cafcd1053298b6b8bafa54f495b595c92847322556ffc5e38388decf3722", size = 502194, upload-time = "2026-07-09T11:20:08.65Z" },
 ]
 
 [[package]]

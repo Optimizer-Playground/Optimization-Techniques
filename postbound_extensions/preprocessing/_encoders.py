@@ -78,19 +78,19 @@ def _build_datetime_encoder(
 class ColumnEncoder[T](ABC):
     @staticmethod
     def online(
-        column: pb.BoundColumnReference,
+        column: pb.ColumnReference,
         *,
         database: pb.Database,
         verbose: bool | pb.util.Logger = False,
     ) -> ColumnEncoder:
         log = wrap_logger(verbose)
+        if not pb.ColumnReference.assert_bound(column):
+            raise pb.UnboundColumnError(column)
 
         datatype = database.schema().datatype(column)
         match datatype.lower():
             case "integer" | "smallint" | "bigint":
-                enc = _build_numeric_encoder(
-                    column, datatype, database=database, log=log
-                )
+                enc = _build_numeric_encoder(column, datatype, database=database, log=log)
             case "character varying" | "varchar" | "text":
                 enc = _build_text_encoder(column, datatype, database=database, log=log)
             case "timestamp without time zone":
@@ -116,7 +116,7 @@ class ColumnEncoder[T](ABC):
 
         return enc
 
-    def __new__(cls, column: pb.BoundColumnReference, dtype: str) -> ColumnEncoder:
+    def __new__(cls, column: pb.BoundColumnReference, dtype: str):
         if cls is not ColumnEncoder:
             return super().__new__(cls)
 
@@ -130,9 +130,7 @@ class ColumnEncoder[T](ABC):
             case "date":
                 return DateTimeEncoder(column, dtype, date_only=True)
             case _:
-                raise TypeError(
-                    f"Missing encoder for dtype '{dtype}' on column {column.table.full_name}.{column.name}"
-                )
+                raise TypeError(f"Missing encoder for dtype '{dtype}' on column {column.table.full_name}.{column.name}")
 
     def __init__(self, column: pb.BoundColumnReference, dtype: str) -> None:
         self.column = column
@@ -182,9 +180,7 @@ class NumericEncoder(ColumnEncoder):
         self._min_val = None
         self._max_val = None
 
-    def fit(
-        self, values: Sequence[int | float], *, prepare_values: bool = True
-    ) -> None:
+    def fit(self, values: Sequence[int | float], *, prepare_values: bool = True) -> None:
         arr = np.array(values).reshape(-1, 1)
         if prepare_values and arr.dtype == "object":
             # if the array is not of object type, it can't contain None values, so we can skip this step
@@ -264,22 +260,16 @@ def _timestamp(value: datetime | date | None) -> float:
 
 
 class DateTimeEncoder(ColumnEncoder):
-    def __new__(
-        cls, column: pb.BoundColumnReference, dtype: str, *, date_only: bool
-    ) -> DateTimeEncoder:
+    def __new__(cls, column: pb.BoundColumnReference, dtype: str, *, date_only: bool) -> DateTimeEncoder:
         return super(object).__new__(cls)
 
-    def __init__(
-        self, column: pb.BoundColumnReference, dtype: str, *, date_only: bool
-    ) -> None:
+    def __init__(self, column: pb.BoundColumnReference, dtype: str, *, date_only: bool) -> None:
         super().__init__(column, dtype)
         self.date_only = date_only
         self._min_val = None
         self._max_val = None
 
-    def fit(
-        self, values: Sequence[datetime | date], *, prepare_values: bool = True
-    ) -> None:
+    def fit(self, values: Sequence[datetime | date], *, prepare_values: bool = True) -> None:
         arr = np.array([_timestamp(v) for v in values]).reshape(-1, 1)
         self.values = arr
         self._min_val = np.nanmin(arr)

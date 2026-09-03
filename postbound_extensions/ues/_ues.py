@@ -52,8 +52,6 @@ class NativeStatsProvider:
     def __init__(self, database: pb.Database) -> None:
         self._db = database
         self._stats = database.statistics()
-        self._stats.emulated = False
-        self._stats.enable_emulation_fallback = False
 
     def filter_card(self, table: pb.TableReference, *, query: pb.SqlQuery) -> pb.Cardinality:
         filter_query = pb.transform.extract_subquery(query, table)
@@ -63,14 +61,14 @@ class NativeStatsProvider:
         if not pb.ColumnReference.assert_bound(column):
             raise ValueError(f"Column {column} is not bound to a table.")
 
-        mcv = self._stats.most_common_values(column, k=1, emulated=False)
+        mcv = self._stats.most_common_values(column)
         if mcv:
             _, freq = mcv[0]
             return pb.Cardinality(freq)
 
         # No MCV - assume uniform distribution
         total_card = self._stats.total_rows(column.table)
-        distinct_count = self._stats.distinct_values(column)
+        distinct_count = self._stats.num_distinct(column)
         assert total_card is not None
 
         if not distinct_count:
@@ -86,8 +84,7 @@ class PreciseStatsProvider:
 
     def __init__(self, database: pb.Database) -> None:
         self._db = database
-        self._stats = database.statistics()
-        self._stats.emulated = True
+        self._stats = pb.db.PreciseStatistics.create_cached(database)
 
     def filter_card(self, table: pb.TableReference, *, query: pb.SqlQuery) -> pb.Cardinality:
         filter_query = pb.transform.extract_subquery(query, table)
@@ -96,7 +93,7 @@ class PreciseStatsProvider:
         return pb.Cardinality(result)
 
     def max_freq(self, column: pb.ColumnReference, *, query: pb.SqlQuery) -> pb.Cardinality:
-        mcv = self._stats.most_common_values(column, k=1, emulated=True)[0]
+        mcv = self._stats.most_common_values(column, k=1)[0]
         assert mcv is not None
         _, freq = mcv
         return pb.Cardinality(freq)
@@ -260,7 +257,10 @@ class UesJoinOrdering(pb.JoinOrderOptimization, pb.CardinalityEstimator):
         join_tree = self.optimize_join_order(subquery)
         if not join_tree:
             return pb.Cardinality.unknown()
-        return join_tree.annotation
+
+        cardinality = join_tree.annotation
+        assert cardinality is not None
+        return cardinality
 
     def describe(self) -> pb.util.jsondict:
         return {"name": "UES", "type": "original"}

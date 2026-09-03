@@ -39,28 +39,22 @@ from ..preprocessing import ColumnEncoder
 from ..util import wrap_logger
 
 
-def _normalize_column(
-    col: pb.ColumnReference, drop_table_aliases: bool
-) -> pb.ColumnReference:
+def _normalize_column(col: pb.ColumnReference, drop_table_aliases: bool) -> pb.ColumnReference:
     if drop_table_aliases:
         return col.drop_table_alias()
     return col
 
 
-def _normalize_join_key(
-    join: pb.qal.AbstractPredicate, drop_table_aliases: bool
-) -> pb.qal.BinaryPredicate:
+def _normalize_join_key(join: pb.qal.AbstractPredicate, drop_table_aliases: bool) -> pb.qal.BinaryPredicate:
     if not pb.qal.SimpleJoin.can_wrap(join):
-        raise ValueError(
-            f"Cannot featurized join predicate {join}. Structure is not supported"
-        )
+        raise ValueError(f"Cannot featurized join predicate {join}. Structure is not supported")
     simplified = pb.qal.SimpleJoin(join)
 
     key1 = _normalize_column(simplified.lhs, drop_table_aliases)
     key2 = _normalize_column(simplified.rhs, drop_table_aliases)
     if key2 < key1:
         key1, key2 = key2, key1
-    return pb.qal.as_predicate(key1, pb.qal.LogicalOperator.Equal, key2)
+    return pb.qal.as_predicate(key1, "=", key2)
 
 
 class FeaturizationWarning(UserWarning):
@@ -214,21 +208,14 @@ class MscnFeaturizer:
         schema = database.schema()
         if tables is None:
             # Optimization: drop all Postgres system tables should they still be present.
-            tables = [
-                tab for tab in schema.tables() if not tab.full_name.startswith("pg_")
-            ]
+            tables = [tab for tab in schema.tables() if not tab.full_name.startswith("pg_")]
         else:
             tables = [tab.drop_alias() for tab in tables]
 
         fk_join_classes = schema.join_equivalence_classes()
-        join_pairs = pb.util.flatten(
-            itertools.combinations(cls, 2) for cls in fk_join_classes
-        )
+        join_pairs = pb.util.flatten(itertools.combinations(cls, 2) for cls in fk_join_classes)
         join_pairs = [tuple(sorted(pair)) for pair in join_pairs]
-        joins = [
-            pb.qal.as_predicate(key1, pb.qal.LogicalOperator.Equal, key2)
-            for key1, key2 in join_pairs
-        ]
+        joins = [pb.qal.as_predicate(key1, "=", key2) for key1, key2 in join_pairs]
 
         columns = pb.util.flatten([schema.columns(table) for table in tables])
 
@@ -236,11 +223,10 @@ class MscnFeaturizer:
         cards = [stats.total_rows(tab) for tab in tables]
         cards = [card for card in cards if card is not None]
         cards.sort(reverse=True)
-        outer_extent = np.prod(cards[:3])
+        outer_extent = np.prod(cards[:3])  # type: ignore
 
         column_encoders: Mapping[pb.ColumnReference, ColumnEncoder] = {
-            col: ColumnEncoder.online(col, database=database, verbose=verbose)
-            for col in columns
+            col: ColumnEncoder.online(col, database=database, verbose=verbose) for col in columns
         }
 
         return MscnFeaturizer(
@@ -248,7 +234,7 @@ class MscnFeaturizer:
             tables=tables,
             joins=joins,
             filter_columns=columns,
-            comparison_operators=list(pb.qal.LogicalOperator),
+            comparison_operators=list(pb.qal.BinaryOperator) + list(pb.qal.UnaryOperator),
             value_encoders=column_encoders,
             min_card=pb.Cardinality(0),
             max_card=pb.Cardinality(outer_extent),
@@ -316,7 +302,7 @@ class MscnFeaturizer:
         tables: set[pb.TableReference] = set()
         joins: set[pb.qal.BinaryPredicate] = set()
         filter_columns: set[pb.ColumnReference] = set()
-        comparison_operators: set[pb.qal.LogicalOperator] = set()
+        comparison_operators: set[pb.qal.BinaryOperator | pb.qal.UnaryOperator] = set()
 
         for query in workload.queries():
             tables.update({tab.drop_alias() for tab in query.tables()})
@@ -340,10 +326,7 @@ class MscnFeaturizer:
                 comparison_operators.add(simplified.operation)
 
         database = database or pb.db.current_database()
-        column_encoders = {
-            col: ColumnEncoder.online(col, database=database, verbose=verbose)
-            for col in filter_columns
-        }
+        column_encoders = {col: ColumnEncoder.online(col, database=database, verbose=verbose) for col in filter_columns}
 
         min_card = pb.Cardinality.of(min_card)
         max_card = pb.Cardinality.of(max_card)
@@ -352,7 +335,7 @@ class MscnFeaturizer:
         if max_card.is_unknown():
             cards = [database.statistics().total_rows(tab) or 0 for tab in tables]
             cards.sort(reverse=True)
-            outer_extent = np.prod(cards[:3])
+            outer_extent = np.prod(cards[:3])  # type: ignore
             max_card = pb.Cardinality.of(outer_extent)
 
         return MscnFeaturizer(
@@ -443,13 +426,9 @@ class MscnFeaturizer:
         # Therefore, we build the featurization over the union of train and test queries.
 
         if workload is None:
-            workload = pb.Workload(
-                {i: query for i, query in enumerate(queries, start=1)}
-            )
+            workload = pb.Workload({i: query for i, query in enumerate(queries, start=1)})
         else:
-            sample_queries: dict[str, pb.SqlQuery] = {
-                f"train_{i}": query for i, query in enumerate(queries, start=1)
-            }
+            sample_queries: dict[str, pb.SqlQuery] = {f"train_{i}": query for i, query in enumerate(queries, start=1)}
             sample_queries.update(workload)
             workload = pb.Workload(sample_queries)
 
@@ -464,9 +443,7 @@ class MscnFeaturizer:
         )
 
     @staticmethod
-    def pre_built(
-        catalog_path: Path | str, verbose: bool | pb.util.Logger = False
-    ) -> MscnFeaturizer:
+    def pre_built(catalog_path: Path | str, verbose: bool | pb.util.Logger = False) -> MscnFeaturizer:
         """Loads a previously built featurization from disk.
 
         See Also
@@ -488,12 +465,8 @@ class MscnFeaturizer:
         joins = [pb.parser.load_predicate_json(j) for j in catalog.get("joins", [])]
 
         logger("Parsing filters")
-        filter_columns = [
-            pb.parser.load_column_json(c) for c in catalog.get("filter_columns", [])
-        ]
-        comparison_operators = [
-            pb.qal.LogicalOperator(op) for op in catalog.get("comparison_operators", [])
-        ]
+        filter_columns = [pb.parser.load_column_json(c) for c in catalog.get("filter_columns", [])]
+        comparison_operators = [pb.parser.load_operator_json(op) for op in catalog.get("comparison_operators", [])]
 
         column_encoders: dict[pb.ColumnReference, ColumnEncoder] = {}
         for encoder_entry in catalog.get("column_encoders", []):
@@ -512,7 +485,7 @@ class MscnFeaturizer:
             tables=tables,
             joins=joins,
             filter_columns=filter_columns,
-            comparison_operators=comparison_operators,
+            comparison_operators=comparison_operators,  # type: ignore
             value_encoders=column_encoders,
             min_card=pb.Cardinality(catalog["min_card"]),
             max_card=pb.Cardinality(catalog["max_card"]),
@@ -544,9 +517,7 @@ class MscnFeaturizer:
             return MscnFeaturizer.pre_built(catalog_path, verbose=verbose)
         log("MSCN featurizer not found. Building new one.")
         featurizer = (
-            MscnFeaturizer.infer_from_workload(
-                workload, database=database, verbose=verbose
-            )
+            MscnFeaturizer.infer_from_workload(workload, database=database, verbose=verbose)
             if workload
             else MscnFeaturizer.online(database, verbose=verbose)
         )
@@ -560,7 +531,7 @@ class MscnFeaturizer:
         tables: Iterable[pb.TableReference],
         joins: Iterable[pb.qal.BinaryPredicate],
         filter_columns: Iterable[pb.ColumnReference],
-        comparison_operators: Iterable[pb.qal.LogicalOperator],
+        comparison_operators: Iterable[pb.qal.BinaryOperator | pb.qal.UnaryOperator],
         *,
         min_card: pb.Cardinality,
         max_card: pb.Cardinality,
@@ -592,9 +563,7 @@ class MscnFeaturizer:
 
         self._operators = [op.value for op in comparison_operators]
         operators_arr = np.asarray(self._operators).reshape(-1, 1)
-        self._operator_encoder = sklearn.preprocessing.OneHotEncoder(
-            sparse_output=False
-        )
+        self._operator_encoder = sklearn.preprocessing.OneHotEncoder(sparse_output=False)
         self._operator_encoder.fit(operators_arr)
 
         self._value_encoders = value_encoders
@@ -675,6 +644,10 @@ class MscnFeaturizer:
         tables = query.tables()
         joins = query.joins()
         predicates = query.filters()
+        if not pb.qal.all_binary_predicates(joins):
+            raise ValueError(f"Cannot featurize query {query}. Not all joins are binary predicates")
+        if not pb.qal.all_binary_predicates(predicates):
+            raise ValueError(f"Cannot featurize query {query}. Not all filter predicates are binary predicates")
 
         tables_enc = self.encode_tables(tables)
         joins_enc = self.encode_joins(joins)
@@ -693,9 +666,7 @@ class MscnFeaturizer:
             predicates_mask=torch.FloatTensor(predicates_mask),
         )
 
-    def encode_batch(
-        self, queries: Iterable[pb.SqlQuery]
-    ) -> Generator[FeaturizedQuery, None, None]:
+    def encode_batch(self, queries: Iterable[pb.SqlQuery]) -> Generator[FeaturizedQuery, None, None]:
         """Encodes multiple queries.
 
         See Also
@@ -747,9 +718,7 @@ class MscnFeaturizer:
             if key2 < key1:
                 key1, key2 = key2, key1
 
-            normalized_joins.append(
-                pb.qal.as_predicate(key1, pb.qal.LogicalOperator.Equal, key2)
-            )
+            normalized_joins.append(pb.qal.as_predicate(key1, "=", key2))
 
         joins_arr = np.asarray([str(j) for j in normalized_joins]).reshape(-1, 1)
         enc = self._joins_encoder.transform(joins_arr)
@@ -772,18 +741,14 @@ class MscnFeaturizer:
                 if key2 < key1:
                     key1, key2 = key2, key1
 
-                normalized_join = pb.qal.as_predicate(
-                    key1, pb.qal.LogicalOperator.Equal, key2
-                )
+                normalized_join = pb.qal.as_predicate(key1, "=", key2)
                 raw_joins.append(str(normalized_join))
 
         joins_arr = np.asarray(raw_joins).reshape(-1, 1)
         enc = self._joins_encoder.transform(joins_arr)
         return enc, batch_indexes
 
-    def encode_filter_predicates(
-        self, predicates: Collection[pb.qal.BinaryPredicate]
-    ) -> np.ndarray:
+    def encode_filter_predicates(self, predicates: Collection[pb.qal.BinaryPredicate]) -> np.ndarray:
         """Computes the feature matrix for a set of filter predicates.
 
         The matrix is automatically padded based on the total number of filter columns.
@@ -842,8 +807,8 @@ class MscnFeaturizer:
             simplified = pb.qal.SimpleFilter(pred)
             col = _normalize_column(simplified.column, self._drop_table_aliases)
             unsupported_ops = [
-                pb.qal.LogicalOperator.Between,
-                pb.qal.LogicalOperator.In,
+                pb.qal.BinaryOperator.Between,
+                pb.qal.BinaryOperator.In,
             ]
             if simplified.operation in unsupported_ops:
                 warnings.warn(
@@ -879,12 +844,8 @@ class MscnFeaturizer:
 
         # Step 2: invoke the actual encoders
 
-        encoded_columns = self._columns_encoder.transform(
-            np.array(column_strings).reshape(-1, 1)
-        )
-        encoded_operators = self._operator_encoder.transform(
-            np.array(operators).reshape(-1, 1)
-        )
+        encoded_columns = self._columns_encoder.transform(np.array(column_strings).reshape(-1, 1))
+        encoded_operators = self._operator_encoder.transform(np.array(operators).reshape(-1, 1))
         encoded_values = {
             col: self._value_encoders[col].encode_batch(np.array(vals).reshape(-1, 1))
             for col, vals in encoder_batches.items()
@@ -926,9 +887,7 @@ class MscnFeaturizer:
         padding = np.zeros(n_max - n_set, dtype=np.float32)
         return np.concatenate([present, padding], axis=0).reshape(-1, 1)
 
-    def store(
-        self, catalog_path: Path | str, *, encoder_dir: Optional[Path | str] = None
-    ) -> None:
+    def store(self, catalog_path: Path | str, *, encoder_dir: Optional[Path | str] = None) -> None:
         """Persists the featurization info and column encoders at the specified location.
 
         To store a featurization, we need to export two kinds of information: general metadata

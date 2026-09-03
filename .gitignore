@@ -223,8 +223,10 @@ localtest*
 .pg-connect*.toml
 *.prof
 .query_cache*.json
+*.duckdb
 models/
 generated/
+results/
 
 /tests/
 /queries/

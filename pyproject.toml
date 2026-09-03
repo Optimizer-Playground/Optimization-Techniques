@@ -32,3 +32,6 @@ dev = [
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["postbound_extensions*"]
+
+[tool.uv.sources]
+postbound = { git = "https://github.com/Optimizer-Playground/PostBOUND.git", rev = "2e4341f" }

@@ -26,16 +26,12 @@ import numpy as np
 import torch
 
 
-def unnormalize_torch(
-    vals: torch.Tensor, min_val: float, max_val: float
-) -> torch.Tensor:
+def unnormalize_torch(vals: torch.Tensor, min_val: float, max_val: float) -> torch.Tensor:
     vals = (vals * (max_val - min_val)) + min_val
     return torch.expm1(vals)
 
 
-def qerror_loss(
-    preds: torch.Tensor, targets: torch.Tensor, min_val: float, max_val: float
-) -> torch.Tensor:
+def qerror_loss(preds: torch.Tensor, targets: torch.Tensor, min_val: float, max_val: float) -> torch.Tensor:
     qerror = []
     preds = unnormalize_torch(preds, min_val, max_val)
     targets = unnormalize_torch(targets, min_val, max_val)
@@ -53,15 +49,13 @@ def normalize_labels(labels: Iterable[float]) -> tuple[np.ndarray, float, float]
 
 
 @overload
-def normalize_labels(
-    labels: Iterable[float], min_val: float, max_val: float
-) -> np.ndarray: ...
+def normalize_labels(labels: Iterable[float], min_val: float, max_val: float) -> np.ndarray: ...
 
 
 def normalize_labels(
     labels,
-    min_val,
-    max_val,
+    min_val=None,
+    max_val=None,
 ):
     infer_min_max = min_val is None or max_val is None
     labels = np.log1p(np.asarray(labels))
@@ -80,9 +74,7 @@ def normalize_labels(
     return labels_norm
 
 
-def unnormalize_labels(
-    labels: torch.Tensor, min_val: float, max_val: float
-) -> torch.Tensor:
+def unnormalize_labels(labels: torch.Tensor, min_val: float, max_val: float) -> torch.Tensor:
     labels = (labels * (max_val - min_val)) + min_val
     return torch.exp(labels)
 

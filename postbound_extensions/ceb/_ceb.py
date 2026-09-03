@@ -24,6 +24,7 @@ from typing import Any, Literal, Optional
 
 import numpy as np
 import postbound as pb
+from postbound.qal import SqlQuery
 
 # we introduce a bunch of type aliases to prevent types like dict[str, str]
 TemplatedQuery = str
@@ -64,9 +65,7 @@ def _make_options_list(
     return [(opt,) for opt in options]
 
 
-def _remove_weight_col(
-    val: tuple[PlaceHolderValue], col_idx: int
-) -> tuple[PlaceHolderValue]:
+def _remove_weight_col(val: tuple[PlaceHolderValue], col_idx: int) -> tuple[PlaceHolderValue]:
     """Drops the weight column from a pre-weighted tuple."""
     return tuple([elem for i, elem in enumerate(val) if i != col_idx])
 
@@ -147,17 +146,13 @@ class PredicateGenerator:
         self.name = name
 
         if "IN" in pred_type and len(provided_keys) > 1:
-            raise ValueError(
-                "IN predicates must only compute a single placeholder value"
-            )
+            raise ValueError("IN predicates must only compute a single placeholder value")
         self.pred_type = pred_type
 
         self.dependencies = dependencies or []
 
         if not (len(provided_keys) == len(target_columns) == len(pred_type)):
-            raise ValueError(
-                "The number of provided keys, target columns, and predicate types must match"
-            )
+            raise ValueError("The number of provided keys, target columns, and predicate types must match")
         self._key_lookup = dict(((k, i) for i, k in enumerate(provided_keys)))
 
         self._parent_generator: QueryTemplate | None = None
@@ -166,21 +161,13 @@ class PredicateGenerator:
         self._target_columns = target_columns
 
         if template_type == "sql" and not sql_query:
-            raise ValueError(
-                f"SQL query must be provided for sql-typed predicate '{name}'"
-            )
+            raise ValueError(f"SQL query must be provided for sql-typed predicate '{name}'")
         if template_type == "list" and not list_allowed_values:
-            raise ValueError(
-                f"Option values must be provided for list-typed predicate '{name}'"
-            )
+            raise ValueError(f"Option values must be provided for list-typed predicate '{name}'")
         self._sql_query = sql_query
-        self._list_allowed_values = (
-            _make_options_list(list_allowed_values) if list_allowed_values else None
-        )
+        self._list_allowed_values = _make_options_list(list_allowed_values) if list_allowed_values else None
 
-        self._count_col_idx = (
-            count_column_idx - 1 if count_column_idx is not None else None
-        )
+        self._count_col_idx = count_column_idx - 1 if count_column_idx is not None else None
 
         self._in_pred_min_samples = in_pred_min_samples
         self._in_pred_max_samples = in_pred_max_samples
@@ -221,8 +208,7 @@ class PredicateGenerator:
                 continue
 
             violates_constraint = any(
-                not self._value_passes_constraints(key, selected_value)
-                for key in self._key_lookup.keys()
+                not self._value_passes_constraints(key, selected_value) for key in self._key_lookup.keys()
             )
             if violates_constraint:
                 redraw_dependent_values = True
@@ -232,9 +218,7 @@ class PredicateGenerator:
                 break
 
         if not selected_value:
-            raise SamplingError(
-                f"Did not find a valid value for predicate '{self.name}'"
-            )
+            raise SamplingError(f"Did not find a valid value for predicate '{self.name}'")
         self._selected_values = selected_value
 
     def fetch_value(self, key: PlaceholderName) -> PlaceHolderValue:
@@ -273,9 +257,7 @@ class PredicateGenerator:
         value_idx = self._key_lookup[key]
         return self.pred_type[value_idx]
 
-    def _next_predicate_value(
-        self, redraw_dependent_values: bool
-    ) -> tuple[PlaceHolderValue]:
+    def _next_predicate_value(self, redraw_dependent_values: bool) -> tuple[PlaceHolderValue]:
         """Calculates the next (tuple of) placeholder values based on the specified selection strategy.
 
         This is the main workhorse method which delegates to all further more specialized methods, e.g. to actually draw
@@ -290,9 +272,7 @@ class PredicateGenerator:
         if self._template_type == "list" and self._list_allowed_values is not None:
             candidate_values = self._list_allowed_values
         elif self._template_type == "sql":
-            candidate_values = self._collect_candidate_values_from_sql(
-                redraw_dependent_values
-            )
+            candidate_values = self._collect_candidate_values_from_sql(redraw_dependent_values)
         else:
             raise ValueError(f"Unknown template type: '{self._template_type}'")
 
@@ -301,15 +281,11 @@ class PredicateGenerator:
         else:
             selected_value = self._draw_scalar_value(candidate_values)
 
-        if not isinstance(selected_value, list) and not isinstance(
-            selected_value, tuple
-        ):
+        if not isinstance(selected_value, list) and not isinstance(selected_value, tuple):
             selected_value = [selected_value]
         return selected_value
 
-    def _collect_candidate_values_from_sql(
-        self, redraw_dependent_values: bool
-    ) -> list[tuple[PlaceHolderValue]]:
+    def _collect_candidate_values_from_sql(self, redraw_dependent_values: bool) -> list[tuple[PlaceHolderValue]]:
         """Provides all possible candidate values based on an SQL query.
 
         This method is also responsible for generating an adequate SQL query by subsituting all dependent values.
@@ -333,21 +309,15 @@ class PredicateGenerator:
 
         assert self.dependencies is not None
         for dep in self.dependencies:
-            dependent_values = self._parent_generator.selected_values(
-                dep, refresh=redraw_dependent_values
-            )
-            sql_query = self._parent_generator.substitute_placeholders(
-                sql_query, dependent_values
-            )
+            dependent_values = self._parent_generator.selected_values(dep, refresh=redraw_dependent_values)
+            sql_query = self._parent_generator.substitute_placeholders(sql_query, dependent_values)
 
         candidate_values = self._db_connection.execute_query(sql_query, raw=True)
         if not candidate_values:
             raise SamplingError(f"No values found for predicate '{self.name}'")
         return [tuple(candidate) for candidate in candidate_values]
 
-    def _draw_scalar_value(
-        self, candidate_values: list[tuple[PlaceHolderValue]]
-    ) -> tuple[PlaceHolderValue]:
+    def _draw_scalar_value(self, candidate_values: list[tuple[PlaceHolderValue]]) -> tuple[PlaceHolderValue]:
         """Selects a single value from the candidates according to the specified sampling strategy."""
         if self._sampling_method == "uniform":
             # For uniform selection duplicate occurences of the same value should not increase their chance of selection.
@@ -364,13 +334,9 @@ class PredicateGenerator:
             # In the latter case, each occurence of the same candidate value counts as a weight increase, hence we can just
             # select one of the values at uniform probability without eliminating duplicates.
             weights: list[int] | None = (
-                [val[self._count_col_idx] for val in candidate_values]
-                if self._count_col_idx is not None
-                else None
+                [val[self._count_col_idx] for val in candidate_values] if self._count_col_idx is not None else None
             )
-            selected_val = random.choices(candidate_values, weights=weights, k=1)[
-                0
-            ]  # choices always returns a list!
+            selected_val = random.choices(candidate_values, weights=weights, k=1)[0]  # choices always returns a list!
 
             if self._count_col_idx is not None:
                 # for pre-weighted lists our selected value does not only contain the actual data, but also the weight column
@@ -382,16 +348,10 @@ class PredicateGenerator:
         else:
             raise ValueError(f"Unknown sampling method: '{self._sampling_method}'")
 
-    def _draw_multi_values(
-        self, candidate_values: list[tuple[PlaceHolderValue]]
-    ) -> tuple[PlaceHolderValue]:
+    def _draw_multi_values(self, candidate_values: list[tuple[PlaceHolderValue]]) -> tuple[PlaceHolderValue]:
         """Selects placeholder values for *IN* predicates according to the specified sampling strategy."""
-        if len(candidate_values[0]) != 1 or (
-            self._count_col_idx and len(candidate_values[0]) != 2
-        ):
-            raise ValueError(
-                "IN predicates must only compute a single placeholder value"
-            )
+        if len(candidate_values[0]) != 1 or (self._count_col_idx and len(candidate_values[0]) != 2):
+            raise ValueError("IN predicates must only compute a single placeholder value")
 
         min_values = self._in_pred_min_samples
 
@@ -413,18 +373,14 @@ class PredicateGenerator:
         if self._count_col_idx is not None:
             # If weights are already supplied, we just need to extract them
             val_idx = 0 if self._count_col_idx == 1 else 1
-            population, weights = zip(
-                *[(val[val_idx], val[self._count_col_idx]) for val in candidate_values]
-            )
+            population, weights = zip(*[(val[val_idx], val[self._count_col_idx]) for val in candidate_values])
         else:
             # Otherwise we calculate our own weights based on the number of occurences of each value
             counter = collections.Counter([val[0] for val in candidate_values])
             population, weights = zip(*counter.items())
 
         max_values = (
-            len(population)
-            if self._in_pred_max_samples is None
-            else min(self._in_pred_max_samples, len(population))
+            len(population) if self._in_pred_max_samples is None else min(self._in_pred_max_samples, len(population))
         )
         n_values = random.randint(min_values, max_values)
 
@@ -435,31 +391,21 @@ class PredicateGenerator:
         weights = weights / weights.sum()
 
         rng = np.random.default_rng()
-        selected_val: list[PlaceHolderValue] = rng.choice(
-            population, size=n_values, p=weights, replace=False
-        )
+        selected_val: list[PlaceHolderValue] = rng.choice(population, size=n_values, p=weights, replace=False)
         return [tuple(selected_val)]
 
-    def _value_passes_constraints(
-        self, key: PlaceholderName, value: list[PlaceHolderValue]
-    ) -> bool:
+    def _value_passes_constraints(self, key: PlaceholderName, value: list[PlaceHolderValue]) -> bool:
         """Checks, whether a specific value passes all constraints attached to its placeholder."""
         if self.predicate_for(key) != "IN":
             return True
 
-        max_allowed_values = (
-            self._in_pred_max_samples
-            if self._in_pred_max_samples is not None
-            else len(value)
-        )
+        max_allowed_values = self._in_pred_max_samples if self._in_pred_max_samples is not None else len(value)
         return self._in_pred_min_samples <= len(value) <= max_allowed_values
 
     def _assert_values_available(self) -> None:
         """Raises an error if no values have been selected yet."""
         if not self._selected_values:
-            raise pb.util.StateError(
-                "Must first call choose_predicate_values() to select values"
-            )
+            raise pb.util.StateError("Must first call choose_predicate_values() to select values")
 
     def _assert_valid_key(self, key: PlaceholderName) -> None:
         """Raises an error if a placeholder is not computed by the current predicate."""
@@ -515,9 +461,7 @@ class QueryTemplate:
         # fully-qualified name becomes the key instead. This makes the weird calculation of the target value necessary.
         # The root cause is that a physical table can be referenced with multiple aliases in the same query and other tables
         # might be referenced without any alias, still within the same query. SQL is weird, man!
-        self._table_aliases = {
-            alias: (tab if tab else alias) for alias, tab in table_aliases.items()
-        }
+        self._table_aliases = {alias: (tab if tab else alias) for alias, tab in table_aliases.items()}
 
         self._predicate_generators: dict[PredicateName, PredicateGenerator] = {}
         self._generator_lookup: dict[PlaceholderName, PredicateGenerator] = {}
@@ -539,17 +483,13 @@ class QueryTemplate:
             name.
         """
         if generator.name in self._predicate_generators:
-            raise KeyError(
-                f"Predicate '{generator.name}' already registered in template '{self.label}'"
-            )
+            raise KeyError(f"Predicate '{generator.name}' already registered in template '{self.label}'")
 
         self._predicate_generators[generator.name] = generator
 
         for key in generator.placeholders:
             if key in self._generator_lookup:
-                raise KeyError(
-                    f"Key '{key}' already registered in template '{self.label}'"
-                )
+                raise KeyError(f"Key '{key}' already registered in template '{self.label}'")
             self._generator_lookup[key] = generator
 
         generator._parent_generator = self
@@ -568,9 +508,7 @@ class QueryTemplate:
             constraints with the current values.
         """
         if predicate not in self._predicate_generators:
-            raise KeyError(
-                f"Predicate '{predicate}' not found in template '{self.label}'"
-            )
+            raise KeyError(f"Predicate '{predicate}' not found in template '{self.label}'")
 
         generator = self._predicate_generators[predicate]
         if refresh:
@@ -600,14 +538,10 @@ class QueryTemplate:
 
     def generate_raw_query(self) -> str:
         """Creates a new SQL query by replacing all placeholders in the base query with appropriate values."""
-        dep_graph: pb.util.DependencyGraph[PredicateGenerator] = (
-            pb.util.DependencyGraph()
-        )
+        dep_graph: pb.util.DependencyGraph[PredicateGenerator] = pb.util.DependencyGraph()
         for generator in self._predicate_generators.values():
             dependencies = (
-                [self._predicate_generators[dep] for dep in generator.dependencies]
-                if generator.dependencies
-                else []
+                [self._predicate_generators[dep] for dep in generator.dependencies] if generator.dependencies else []
             )
             dep_graph.add_task(generator, depends_on=dependencies)
 
@@ -629,14 +563,8 @@ class QueryTemplate:
     def _lookup_column(self, colname: ColumnName) -> pb.ColumnReference:
         """Generates an actual column reference for a specific column name."""
         if "." not in colname:
-            tables_without_alias = [
-                pb.TableReference(tab)
-                for tab, alias in self._table_aliases
-                if tab == alias
-            ]
-            target_table = self._db_conn.schema().lookup_column(
-                colname, tables_without_alias
-            )
+            tables_without_alias = [pb.TableReference(tab) for tab, alias in self._table_aliases if tab == alias]
+            target_table = self._db_conn.schema().lookup_column(colname, tables_without_alias)
             return pb.ColumnReference(colname, target_table)
 
         table, column = colname.split(".")
@@ -693,23 +621,16 @@ def _parse_template_toml(path: str | Path, db_connection: pb.Database) -> QueryT
     for raw_predicate in contents["predicates"]:
         parsed_predicate = PredicateGenerator(
             PredicateName(raw_predicate["name"]),
-            provided_keys=[
-                PlaceholderName(k.removeprefix("<<").removesuffix(">>"))
-                for k in raw_predicate["keys"]
-            ],
+            provided_keys=[PlaceholderName(k.removeprefix("<<").removesuffix(">>")) for k in raw_predicate["keys"]],
             template_type=raw_predicate["type"],
             sampling_method=raw_predicate["sampling_method"],
             pred_type=raw_predicate["pred_type"],
             target_columns=[ColumnName(c) for c in raw_predicate["columns"]],
             sql_query=raw_predicate.get("sql"),
-            list_allowed_values=[
-                _tuplelize_value(option) for option in raw_predicate.get("options", [])
-            ],
+            list_allowed_values=[_tuplelize_value(option) for option in raw_predicate.get("options", [])],
             in_pred_min_samples=raw_predicate.get("min_samples", 1),
             in_pred_max_samples=raw_predicate.get("max_samples"),
-            dependencies=[
-                PredicateName(d) for d in raw_predicate.get("dependencies", [])
-            ],
+            dependencies=[PredicateName(d) for d in raw_predicate.get("dependencies", [])],
             db_connection=db_connection,
         )
         query_template.register_generator(parsed_predicate)
@@ -766,9 +687,7 @@ def generate_raw_workload(
     for template_file in template_dir.glob(template_pattern):
         templates.append(_parse_template_toml(template_file, db_connection))
 
-    max_tries = (
-        len(templates) * queries_per_template * 10
-    )  # TODO: the user should be able to control this parameter?!
+    max_tries = len(templates) * queries_per_template * 10  # TODO: the user should be able to control this parameter?!
     generated_queries: set[str] = set()
     workload_queries: dict[str, str] = {}
     for template in templates:
@@ -778,17 +697,13 @@ def generate_raw_workload(
             query = template.generate_raw_query()
             if query in generated_queries:
                 if num_tries == max_tries:
-                    raise SamplingError(
-                        "Could not generate enough unique queries for template {template.label}"
-                    )
+                    raise SamplingError("Could not generate enough unique queries for template {template.label}")
                 continue
             else:
                 generated_queries.add(query)
                 generated_count += 1
 
-            template_idx = str(
-                generated_count
-            )  # this works b/c we already incremented the generated_count just above!
+            template_idx = str(generated_count)  # this works b/c we already incremented the generated_count just above!
             query_label = f"{template.label}-{template_idx}"
             workload_queries[query_label] = query
 
@@ -802,7 +717,7 @@ def generate_workload(
     name: Optional[str] = None,
     template_pattern: str = "*.toml",
     db_connection: Optional[pb.Database] = None,
-) -> pb.Workload[str]:
+) -> pb.Workload[str, pb.SqlQuery]:
     """Produces a full workload based on a number of CEB templates.
 
     Parameters
@@ -837,25 +752,19 @@ def generate_workload(
         template_pattern=template_pattern,
         db_connection=db_connection,
     )
-    workload_queries = {
-        label: pb.parse_query(query) for label, query in raw_workload.items()
-    }
+    workload_queries = {label: pb.parse_query(query) for label, query in raw_workload.items()}
 
     return pb.Workload(workload_queries, name=(name if name else ""), root=template_dir)
 
 
-def persist_workload(
-    path: str | Path, workload: pb.Workload[str] | dict[str, str]
-) -> None:
+def persist_workload(path: str | Path, workload: pb.Workload[str, SqlQuery] | dict[str, str]) -> None:
     """Stores all queries of a workload with one query per file in a specific directory.
 
     Files are named according to the query lables.
     """
     path = Path(path) if isinstance(path, str) else path
     if not isinstance(workload, pb.Workload):
-        workload = pb.Workload(
-            {label: pb.parse_query(query) for label, query in workload.items()}
-        )
+        workload = pb.Workload({label: pb.parse_query(query) for label, query in workload.items()})
 
     for label, query in workload.entries():
         query_file = path / f"{label}.sql"
