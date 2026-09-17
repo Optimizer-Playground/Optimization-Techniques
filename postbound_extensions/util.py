@@ -34,7 +34,9 @@ def min_max_values_query(col: pb.ColumnReference) -> pb.SqlQuery:
 
     min_col = pb.qal.FunctionExpression.create_min(col)
     max_col = pb.qal.FunctionExpression.create_max(col)
-    select_clause = pb.qal.Select([pb.qal.BaseProjection(min_col), pb.qal.BaseProjection(max_col)])
+    select_clause = pb.qal.Select(
+        [pb.qal.Projection(min_col), pb.qal.Projection(max_col)]
+    )
     from_clause = pb.qal.From.create_for(table)
 
     return pb.qal.as_query(select_clause, from_clause)

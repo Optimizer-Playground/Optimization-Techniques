@@ -20,9 +20,9 @@ from __future__ import annotations
 
 import functools
 import json
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from pathlib import Path
-from typing import Callable, Optional, TypedDict
+from typing import TypedDict
 
 import numpy as np
 import pandas as pd
@@ -448,7 +448,7 @@ def default_hint_sets() -> list[pb.PhysicalOperatorAssignment]:
 
 
 class BaoOptimizer(
-    pb.CompleteOptimizationAlgorithm, pb.PhysicalOperatorSelection, pb.CostModel
+    pb.CompleteOptimizationAlgorithm, pb.OperatorSelection, pb.CostModel
 ):
     """Bao is a learned query optimizer that uses hint sets to select optimal candidate plans.
 
@@ -559,9 +559,7 @@ class BaoOptimizer(
         with open(archive, "r") as f:
             catalog = json.load(f)
 
-        featurizer = BaoFeaturizer.pre_built(
-            catalog["featurizer"], database=database
-        )
+        featurizer = BaoFeaturizer.pre_built(catalog["featurizer"], database=database)
         experience = BaoExperience.load(
             catalog["experience"]["catalog"], featurizer=featurizer
         )
@@ -624,9 +622,7 @@ class BaoOptimizer(
 
         if archive.is_file():
             log(f"Detected existing BAO model at {archive}. Re-loading.")
-            return BaoOptimizer.pre_trained(
-                archive, database=database, verbose=verbose
-            )
+            return BaoOptimizer.pre_trained(archive, database=database, verbose=verbose)
 
         log(f"No BAO model found at {archive}. Creating a new one.")
         bao = BaoOptimizer(
@@ -649,10 +645,10 @@ class BaoOptimizer(
         self,
         target_db: pb.Database,
         *,
-        hint_sets: Optional[Iterable[pb.PhysicalOperatorAssignment]] = None,
-        tcnn: Optional[BaoModel] = None,
-        featurizer: Optional[BaoFeaturizer] = None,
-        experience: Optional[BaoExperience] = None,
+        hint_sets: Iterable[pb.PhysicalOperatorAssignment] | None = None,
+        tcnn: BaoModel | None = None,
+        featurizer: BaoFeaturizer | None = None,
+        experience: BaoExperience | None = None,
         retrain: bool = True,
         training_epochs: int = 100,
         experience_window: int = 2000,
@@ -662,9 +658,7 @@ class BaoOptimizer(
         super().__init__()
         self._db = target_db
         self._hint_sets = (
-            list(hint_sets)
-            if hint_sets is not None
-            else default_hint_sets()[:5]
+            list(hint_sets) if hint_sets is not None else default_hint_sets()[:5]
         )
         self._featurizer = featurizer or BaoFeaturizer.online(self._db)
         self._experience = experience or BaoExperience(
@@ -694,9 +688,7 @@ class BaoOptimizer(
 
     def optimize_query(self, query: pb.SqlQuery) -> pb.QueryPlan:
         cache_state = DatabaseCacheState(self._db)
-        plans = [
-            self._generate_plan(query, hint_set) for hint_set in self._hint_sets
-        ]
+        plans = [self._generate_plan(query, hint_set) for hint_set in self._hint_sets]
         featurized = [
             self._featurizer.encode_plan(plan, cache_state=cache_state)
             for plan in plans
@@ -710,7 +702,7 @@ class BaoOptimizer(
         return plans[idxmin]
 
     def select_physical_operators(
-        self, query: pb.SqlQuery, join_order: Optional[pb.JoinTree]
+        self, query: pb.SqlQuery, join_order: pb.JoinTree | None
     ) -> pb.PhysicalOperatorAssignment:
         cache_state = DatabaseCacheState(self._db)
         plans = [
@@ -774,13 +766,10 @@ class BaoOptimizer(
         *,
         plan_column: str = "query_plan",
         runtime_column: str = "runtime_ms",
-        timeout_ms: Optional[float] = None,
+        timeout_ms: float | None = None,
         from_scratch: bool = False,
-        hint_sets: Optional[
-            Callable[
-                [str, pb.SqlQuery], Iterable[pb.PhysicalOperatorAssignment]
-            ]
-        ] = None,
+        hint_sets: Callable[[str, pb.SqlQuery], Iterable[pb.PhysicalOperatorAssignment]]
+        | None = None,
     ) -> None:
         """Performs a batch training of the TCNN.
 
@@ -851,9 +840,7 @@ class BaoOptimizer(
         )
 
         if timeout_ms and not isinstance(self._db, pb.db.TimeoutSupport):
-            raise ValueError(
-                "Target database system does not provide timeout support."
-            )
+            raise ValueError("Target database system does not provide timeout support.")
 
         if timeout_ms:
             assert isinstance(self._db, pb.db.TimeoutSupport)
@@ -976,7 +963,7 @@ class BaoOptimizer(
         query: pb.SqlQuery,
         hint_set: pb.PhysicalOperatorAssignment,
         *,
-        join_order: Optional[pb.JoinTree] = None,
+        join_order: pb.JoinTree | None = None,
     ) -> pb.QueryPlan:
         hinted_query = self._db.hinting().generate_hints(
             query, join_order=join_order, physical_operators=hint_set
@@ -1023,8 +1010,6 @@ class BaoOptimizer(
                 optimizer.step()
 
             epoch_str = str(epoch + 1).rjust(len(str(self._epochs)))
-            self._log(
-                f"Epoch: {epoch_str} / {self._epochs} :: loss = {loss_total}"
-            )
+            self._log(f"Epoch: {epoch_str} / {self._epochs} :: loss = {loss_total}")
 
         self._tcnn.eval()

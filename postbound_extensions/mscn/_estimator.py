@@ -22,7 +22,6 @@ import time
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
 
 import pandas as pd
 import postbound as pb
@@ -122,7 +121,7 @@ class MscnEstimator(pb.CardinalityEstimator):
     def pre_trained(
         catalog_path: Path | str,
         *,
-        database: Optional[pb.Database] = None,
+        database: pb.Database | None = None,
         verbose: bool | pb.util.Logger = False,
     ) -> MscnEstimator:
         """Loads an MSCN estimator from disk.
@@ -180,8 +179,8 @@ class MscnEstimator(pb.CardinalityEstimator):
         catalog_path: Path | str,
         *,
         samples: pd.DataFrame | Path | str,
-        workload: Optional[pb.Workload] = None,
-        database: Optional[pb.Database] = None,
+        workload: pb.Workload | None = None,
+        database: pb.Database | None = None,
         training_params: MscnHyperParams = MscnHyperParams.default(),
         verbose: bool | pb.util.Logger = False,
     ) -> MscnEstimator:
@@ -230,9 +229,9 @@ class MscnEstimator(pb.CardinalityEstimator):
     def __init__(
         self,
         *,
-        model: Optional[SetConv] = None,
-        featurizer: Optional[MscnFeaturizer] = None,
-        database: Optional[pb.Database] = None,
+        model: SetConv | None = None,
+        featurizer: MscnFeaturizer | None = None,
+        database: pb.Database | None = None,
         verbose: bool | pb.util.Logger = False,
     ) -> None:
         super().__init__()
@@ -270,7 +269,11 @@ class MscnEstimator(pb.CardinalityEstimator):
         query: pb.SqlQuery,
         intermediate: pb.TableReference | Iterable[pb.TableReference],
     ) -> pb.Cardinality:
-        intermediate = pb.util.enlist(intermediate)
+        intermediate = (
+            [intermediate]
+            if isinstance(intermediate, pb.TableReference)
+            else list(intermediate)
+        )
         query_fragment = pb.transform.extract_query_fragment(query, intermediate)
         if not query_fragment:
             raise ValueError(f"Query fragment not found for query {query}")
@@ -410,8 +413,8 @@ class MscnEstimator(pb.CardinalityEstimator):
         self,
         catalog: Path | str,
         *,
-        encoder_dir: Optional[Path | str] = None,
-        model_file: Optional[Path | str] = None,
+        encoder_dir: Path | str | None = None,
+        model_file: Path | str | None = None,
     ) -> Path:
         """Persists model weights and featurization info at the specified location.
 
