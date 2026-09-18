@@ -1,6 +1,7 @@
 # Optimizer Collection
 
-This repository contains a curated collection of interesting and novel ideas for query optimization in relational database systems.
+This repository contains a curated collection of interesting and novel ideas for
+query optimization in relational database systems.
 Optimizer prototypes are implemented using the [PostBOUND framework](https://github.com/rbergm/PostBOUND).
 
 ## Optimizer Prototypes
