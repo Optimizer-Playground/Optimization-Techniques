@@ -32,7 +32,16 @@ def estimate_cardinalities(
     for query in query_iter:
         try:
             card = estimator.calculate_estimate(query, query.tables())
-        except Exception:
+        except Exception as e:
+            if isinstance(e, InterruptedError) or str(e) == "Query interrupted":
+                # DuckDB does not raise an interrupted error but instead a generic exception with interrupted
+                # in the text. What is even weirder, is that execution usually continues with the next query instead
+                # of just cancelling the entire workload.
+                #
+                # We fix the first issue by checking the exception text.
+                # The second issue we can actually use to our advantage: by just breaking the loop, we can stop the
+                # execution and still export the cardinalities we have collected so far.
+                break
             card = pb.Cardinality.unknown()
 
         cardinalities[query] = card
