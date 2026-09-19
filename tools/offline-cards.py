@@ -85,7 +85,7 @@ def main() -> None:
     logger("Creating estimator")
     match args.estimator:
         case "true-cards":
-            estimator = pb.opt.PreciseCardinalities(duck_instance)
+            estimator = pb.opt.PerfectCardinalities(duck_instance)
         case "safebound":
             cat = pbx.safebound.SafeBoundCatalog.load(args.estimator_path, database=duck_instance, verbose=args.verbose)
             estimator = pbx.safebound.SafeBoundEstimator(cat)
