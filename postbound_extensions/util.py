@@ -12,6 +12,13 @@ import postbound as pb
 from torch.utils.data import Dataset
 
 
+def simplify_pred(pred: pb.qal.AbstractPredicate) -> pb.qal.SimpleFilter | None:
+    try:
+        return pb.qal.SimpleFilter.attempt_wrap(pred)
+    except Exception:
+        return None
+
+
 def distinct_values_query(col: pb.ColumnReference) -> pb.SqlQuery:
     """Creates an SQL query to load all distinct values for a specific table.
 

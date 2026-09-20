@@ -27,7 +27,7 @@ from postbound.qal import (
     WithQuery,
 )
 
-from ..util import make_json_parser, wrap_logger
+from ..util import make_json_parser, simplify_pred, wrap_logger
 from ._compress import valid_compress
 from ._piecewise_fns import DegreeSequence, PiecewiseConstantFn, load_pcf_json
 
@@ -166,9 +166,9 @@ class _CatalogVisitor(pb.qal.PredicateVisitor[None]):
         self._log = log
 
     def visit_binary_predicate(self, predicate: pb.qal.BinaryPredicate, *args, **kwargs) -> None:
-        if not pb.qal.SimpleFilter.can_wrap(predicate):
+        simplified = simplify_pred(predicate)
+        if simplified is None:
             return
-        simplified = pb.qal.SimpleFilter.wrap(predicate)
         assert pb.ColumnReference.assert_bound(simplified.column)
         filter_col = simplified.column.drop_table_alias()
         join_map = kwargs["join_map"]
@@ -202,9 +202,9 @@ class _CatalogVisitor(pb.qal.PredicateVisitor[None]):
         # even for BETWEEN predicates we perform the simplification check.
         # This makes sure that the predicate contains a simple range, i.e. BETWEEN 24 AND 42
         # instead more sophisticated stuff like BETWEEN 42 * 42 AND R.b
-        if not pb.qal.SimpleFilter.can_wrap(predicate):
+        simplified = simplify_pred(predicate)
+        if simplified is None:
             return
-        simplified = pb.qal.SimpleFilter.wrap(predicate)
         assert pb.ColumnReference.assert_bound(simplified.column)
         filter_col = simplified.column.drop_table_alias()
 
@@ -217,9 +217,9 @@ class _CatalogVisitor(pb.qal.PredicateVisitor[None]):
         # even for IN predicates we perform the simplification check.
         # This makes sure that the predicate contains a simple range, i.e. IN (1, 2, 3)
         # instead more sophisticated stuff like IN(SELECT b FROM R)
-        if not pb.qal.SimpleFilter.can_wrap(predicate):
+        simplified = simplify_pred(predicate)
+        if simplified is None:
             return
-        simplified = pb.qal.SimpleFilter.wrap(predicate)
         assert pb.ColumnReference.assert_bound(simplified.column)
         filter_col = simplified.column.drop_table_alias()
 
@@ -2091,12 +2091,12 @@ class _Predicate2PCF(pb.qal.PredicateVisitor[PiecewiseConstantFn]):
 
     def visit_binary_predicate(self, predicate: pb.qal.BinaryPredicate, *args, **kwargs) -> PiecewiseConstantFn:
         join_col = kwargs["join_col"]
-        if not pb.qal.SimpleFilter.can_wrap(predicate):
+        simplified = simplify_pred(predicate)
+        if simplified is None:
             pcf = self._catalog.lookup_unconditioned(join_col)
             self._callback(predicate, pcf)
             return pcf
 
-        simplified = pb.qal.SimpleFilter(predicate)
         match simplified.operation:
             case pb.qal.LogicalOperator.Equal | pb.qal.LogicalOperator.Is:
                 pcf = self._catalog.lookup_eq_conditioned(
@@ -2169,9 +2169,9 @@ class _Predicate2PCF(pb.qal.PredicateVisitor[PiecewiseConstantFn]):
 
     def visit_between_predicate(self, predicate: pb.qal.BetweenPredicate, *args, **kwargs) -> PiecewiseConstantFn:
         join_col = kwargs["join_col"]
-        if not pb.qal.SimpleFilter.can_wrap(predicate):
+        simplified = simplify_pred(predicate)
+        if simplified is None:
             return self._catalog.lookup_unconditioned(join_col)
-        simplified = pb.qal.SimpleFilter(predicate)
         assert isinstance(simplified.value, tuple)
 
         lo, hi = simplified.value
@@ -2187,9 +2187,9 @@ class _Predicate2PCF(pb.qal.PredicateVisitor[PiecewiseConstantFn]):
 
     def visit_in_predicate(self, predicate: pb.qal.InPredicate, *args, **kwargs) -> PiecewiseConstantFn:
         join_col = kwargs["join_col"]
-        if not pb.qal.SimpleFilter.can_wrap(predicate):
+        simplified = simplify_pred(predicate)
+        if simplified is None:
             return self._catalog.lookup_unconditioned(join_col)
-        simplified = pb.qal.SimpleFilter(predicate)
         assert isinstance(simplified.value, Iterable)
 
         pcf = PiecewiseConstantFn.zero()

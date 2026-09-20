@@ -223,8 +223,16 @@ localtest*
 .pg-connect*.toml
 *.prof
 .query_cache*.json
+<<<<<<< Updated upstream
 models/
 generated/
+=======
+*.duckdb
+/generated/
+/models/
+/results/
+/workloads/
+>>>>>>> Stashed changes
 
 /tests/
 /queries/
