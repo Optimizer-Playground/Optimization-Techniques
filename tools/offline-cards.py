@@ -56,11 +56,14 @@ def main() -> None:
     parser.add_argument("--workload-path", type=Path, required=False, default=None)
     parser.add_argument("--estimator-path", type=Path, required=False, default=None)
     parser.add_argument("--duckdb", type=Path)
+    parser.add_argument("--timeout", type=float, required=False, default=None)
     parser.add_argument("--output", "-o", type=Path, required=True)
+    parser.add_argument("--continue", action="store_true", dest="filter_existing")
     parser.add_argument("--verbose", "-v", action="store_true")
 
     args = parser.parse_args()
     logger = pb.util.standard_logger(args.verbose)
+    output: Path = args.output
 
     logger("Connecting to database")
     duck_instance = pb.duckdb.connect(args.duckdb)
@@ -85,7 +88,7 @@ def main() -> None:
     logger("Creating estimator")
     match args.estimator:
         case "true-cards":
-            estimator = pb.opt.PerfectCardinalities(duck_instance)
+            estimator = pb.opt.PerfectCardinalities(duck_instance, timeout=args.timeout)
         case "safebound":
             cat = pbx.safebound.SafeBoundCatalog.load(args.estimator_path, database=duck_instance, verbose=args.verbose)
             estimator = pbx.safebound.SafeBoundEstimator(cat)
@@ -100,18 +103,29 @@ def main() -> None:
 
     logger("Collecting all intermediates to estimate")
     subqueries = collect_subqueries(workload, estimator=estimator, verbose=args.verbose)
+
+    if args.filter_existing and output.is_file():
+        logger("Reading existing estimates")
+        df = pb.util.read_df(output)
+        existing = df[~df["cardinality"].isna()]
+        existing_subqueries = {pb.parse_query(query) for query in existing["query"]}
+        subqueries -= existing_subqueries
+    else:
+        df = pd.DataFrame({"query": [], "cardinality": []})
+
     logger("Found", len(subqueries), "intermediates to estimate")
 
     logger("Estimating cardinalities")
     cardinalities = estimate_cardinalities(subqueries, estimator=estimator, verbose=args.verbose)
 
     logger("Exporting results")
-    queries: list[pb.SqlQuery] = []
-    cards: list[pb.Cardinality] = []
+    queries: list[str] = []
+    cards: list[float] = []
     for subquery, card in cardinalities.items():
-        queries.append(subquery)
-        cards.append(card)
-    df = pd.DataFrame({"query": queries, "cardinality": cards})
+        queries.append(str(subquery))
+        cards.append(float(card))
+
+    df = pd.concat([df, pd.DataFrame({"query": queries, "cardinality": cards})], ignore_index=True)
     pb.util.write_df(df, path=args.output)
 
 
