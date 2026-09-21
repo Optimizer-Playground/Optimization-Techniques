@@ -66,7 +66,7 @@ def main() -> None:
     output: Path = args.output
 
     logger("Connecting to database")
-    duck_instance = pb.duckdb.connect(args.duckdb)
+    duck_instance = pb.duckdb.connect(args.duckdb, read_only=True)
 
     logger("Loading workload")
     match args.workload:
@@ -118,7 +118,7 @@ def main() -> None:
     logger("Estimating cardinalities")
     cardinalities = estimate_cardinalities(subqueries, estimator=estimator, verbose=args.verbose)
 
-    logger("Exporting results")
+    logger("Gathering resutls")
     queries: list[str] = []
     cards: list[float] = []
     for subquery, card in cardinalities.items():
@@ -126,6 +126,10 @@ def main() -> None:
         cards.append(float(card))
 
     df = pd.concat([df, pd.DataFrame({"query": queries, "cardinality": cards})], ignore_index=True)
+    missing = df["cardinality"].isna().sum()
+    logger("Found", missing, "missing cardinalities")
+
+    logger("Exporting results")
     pb.util.write_df(df, path=args.output)
 
 
