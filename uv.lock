@@ -1688,7 +1688,7 @@ wheels = [
 
 [[package]]
 name = "optimizer-playground"
-version = "0.1.0.dev16"
+version = "0.1.0.dev17"
 source = { virtual = "." }
 dependencies = [
     { name = "lazy-loader" },
@@ -1718,7 +1718,7 @@ requires-dist = [
     { name = "networkx", specifier = ">=3.6.1" },
     { name = "numpy", specifier = ">=2.4.2" },
     { name = "pandas", specifier = ">=2.3.3" },
-    { name = "postbound", git = "https://github.com/OPtimizer-Playground/PostBOUND.git?rev=987c4af" },
+    { name = "postbound", git = "https://github.com/Optimizer-Playground/PostBOUND?rev=2e45fb8cb350a627685ab67f8982df8565c98904" },
     { name = "pyarrow", specifier = ">=23.0.1" },
     { name = "scikit-learn", specifier = ">=1.8.0" },
     { name = "scipy", specifier = ">=1.17.0" },
@@ -1983,7 +1983,7 @@ wheels = [
 [[package]]
 name = "postbound"
 version = "0.22.0.dev5"
-source = { git = "https://github.com/OPtimizer-Playground/PostBOUND.git?rev=987c4af#987c4afa80347fbd154a79adb8958c86631dbc32" }
+source = { git = "https://github.com/Optimizer-Playground/PostBOUND?rev=2e45fb8cb350a627685ab67f8982df8565c98904#2e45fb8cb350a627685ab67f8982df8565c98904" }
 dependencies = [
     { name = "lazy-loader" },
     { name = "levenshtein" },

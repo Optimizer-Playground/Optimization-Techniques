@@ -1,6 +1,6 @@
 [project]
 name = "Optimizer-Playground"
-version = "0.1.0.dev16"
+version = "0.1.0.dev17"
 description = """
 A curated collection of interesting and novel ideas in query optimization for relational database systems, implemented using the PostBOUND framework.
 """
@@ -33,7 +33,7 @@ where = ["."]
 include = ["postbound_extensions*"]
 
 [tool.uv.sources]
-postbound = { git = "https://github.com/OPtimizer-Playground/PostBOUND.git", rev = "987c4af" }
+postbound = { git = "https://github.com/Optimizer-Playground/PostBOUND", rev = "2e45fb8cb350a627685ab67f8982df8565c98904" }
 
 [tool.ty.src]
 exclude = ["postbound_extensions/fastgres/**", "postbound_extensions/ceb/**"]
