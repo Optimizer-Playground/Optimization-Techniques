@@ -191,7 +191,7 @@ def _update_bound_freqs(
     }
 
 
-class UesJoinOrdering(pb.JoinOrdering, pb.CardinalityEstimator):
+class UesJoinOrdering(pb.JoinOrdering):
     """UES is a pessimistic join ordering algorithm that combines upper bounds with a greedy enumeration strategy.
 
     UES does not need any advanced statistics. Instead, it relies on the target database and its statistics catalog to
