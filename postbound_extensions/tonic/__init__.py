@@ -59,8 +59,8 @@ Example
     # Step 3: create a UES/TONIC optimization pipeline
     #
 
-    ues = pbx.ues.UesJoinOrdering(database=pg_instance, estimations="precise")
-    tonic = pbx.tonic.TonicOperatorSelection.load_or_build(
+    ues = pbx.ues.UesJoinOrdering(database=pg_instance, estimations="perfect")
+    tonic = pbx.tonic.TonicOperators.load_or_build(
         "models/tonic/stats",
         filter_aware=True,
         gamma=0.8,
@@ -134,18 +134,13 @@ You should have received a copy of the GNU General Public License
 along with this program.  If not, see <https://www.gnu.org/licenses/>.
 """
 
-from ._tonic import (
-    QepsIdentifier,
-    QepsNode,
-    QepSynopsis,
-    TonicOperatorSelection,
-    make_qeps,
-)
+from ._tonic import FilterAwareQepsIdentifier, PlainQeps, QepsIdentifier, QepsNode, SubqueryQeps, TonicOperators
 
 __all__ = [
+    "FilterAwareQepsIdentifier",
+    "PlainQeps",
     "QepsIdentifier",
     "QepsNode",
-    "QepSynopsis",
-    "make_qeps",
-    "TonicOperatorSelection",
+    "SubqueryQeps",
+    "TonicOperators",
 ]
