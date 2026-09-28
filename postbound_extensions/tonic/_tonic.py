@@ -18,12 +18,16 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 from __future__ import annotations
 
+import json
 import time
 from abc import ABC, abstractmethod
-from collections.abc import Generator, Iterable
+from collections.abc import Generator, Iterable, Mapping
+from pathlib import Path
 
 import postbound as pb
 from postbound.qal import SqlQuery
+
+from ..util import wrap_logger
 
 
 def _traverse_join_tree(node: pb.JoinTree) -> Generator[pb.JoinTree, None, None]:
@@ -35,7 +39,9 @@ def _traverse_join_tree(node: pb.JoinTree) -> Generator[pb.JoinTree, None, None]
     yield node.inner_child
 
 
-def _traverse_query_plan(node: pb.QueryPlan) -> Generator[tuple[pb.QueryPlan, pb.QueryPlan | None], None, None]:
+def _traverse_query_plan(
+    node: pb.QueryPlan,
+) -> Generator[tuple[pb.QueryPlan, pb.QueryPlan | None], None, None]:
     if node.is_scan():
         yield node, None
 
@@ -68,6 +74,9 @@ class QepsIdentifier:
         combined = self._identifier.union(other._identifier)
         return QepsIdentifier(combined)
 
+    def __json__(self) -> pb.util.jsondict:
+        return {"identifier": self._identifier}
+
     def __hash__(self) -> int:
         return hash(self._identifier)
 
@@ -85,7 +94,9 @@ class QepsIdentifier:
 
 class FilterAwareQepsIdentifier(QepsIdentifier):
     @staticmethod
-    def infer(intermediate: Iterable[pb.TableReference], *, query: pb.qal.SelectStatement) -> FilterAwareQepsIdentifier:
+    def infer(
+        intermediate: Iterable[pb.TableReference], *, query: pb.qal.SelectStatement
+    ) -> FilterAwareQepsIdentifier:
         subquery = pb.transform.extract_subquery(query, intermediate)
         if len(subquery.tables()):
             return FilterAwareQepsIdentifier(intermediate, None)
@@ -93,7 +104,11 @@ class FilterAwareQepsIdentifier(QepsIdentifier):
         filter_pred = subquery.where_clause.root if subquery.where_clause else None
         return FilterAwareQepsIdentifier(intermediate, filter_pred)
 
-    def __init__(self, intermediate: Iterable[pb.TableReference], filter_pred: pb.qal.AbstractPredicate | None) -> None:
+    def __init__(
+        self,
+        intermediate: Iterable[pb.TableReference],
+        filter_pred: pb.qal.AbstractPredicate | None,
+    ) -> None:
         super().__init__(intermediate)
         self._filter_pred = filter_pred
 
@@ -101,13 +116,19 @@ class FilterAwareQepsIdentifier(QepsIdentifier):
         combined = self._identifier.union(other._identifier)
         return FilterAwareQepsIdentifier(combined, self._filter_pred)
 
+    def __json__(self) -> pb.util.jsondict:
+        return {"identifier": self._identifier, "filter": self._filter_pred}
+
     def __hash__(self) -> int:
         return hash((self._identifier, self._filter_pred))
 
     def __eq__(self, other: object) -> bool:
         if not isinstance(other, FilterAwareQepsIdentifier):
             return NotImplemented
-        return self._identifier == other._identifier and self._filter_pred == other._filter_pred
+        return (
+            self._identifier == other._identifier
+            and self._filter_pred == other._filter_pred
+        )
 
     def __repr__(self) -> str:
         return f"FilterAwareQepsIdentifier({self._identifier}, {self._filter_pred})"
@@ -116,9 +137,36 @@ class FilterAwareQepsIdentifier(QepsIdentifier):
         return f"FilterAwareQepsIdentifier({self._identifier}, {self._filter_pred})"
 
 
+def load_qeps_id_json(
+    json_data: str | dict,
+) -> QepsIdentifier | FilterAwareQepsIdentifier:
+    """Creates a QEPS identifier from its JSON representation.
+
+    Whether the identifier is filter-aware or not is determined automatically from the JSON data.
+    """
+    json_data = json.loads(json_data) if isinstance(json_data, str) else json_data
+    identifier = [pb.parser.load_table_json(raw) for raw in json_data["identifier"]]
+    raw_filter = json_data.get("filter")
+    if raw_filter is None:
+        return QepsIdentifier(identifier)
+
+    filter_pred = pb.parser.load_predicate_json(raw_filter)
+    return FilterAwareQepsIdentifier(identifier, filter_pred)
+
+
 class QepsNode(ABC):
     @abstractmethod
-    def follow(self, intermediate: Iterable[pb.TableReference], *, query: pb.qal.SelectStatement | None) -> QepsNode:
+    @property
+    def identifier(self) -> QepsIdentifier:
+        raise NotImplementedError
+
+    @abstractmethod
+    def follow(
+        self,
+        intermediate: Iterable[pb.TableReference],
+        *,
+        query: pb.qal.SelectStatement | None,
+    ) -> QepsNode:
         raise NotImplementedError
 
     @abstractmethod
@@ -155,11 +203,22 @@ class PlainQeps(QepsNode):
         self._cost_summary: dict[pb.JoinOperator, pb.Cost] = {}
         self._children: dict[QepsIdentifier, QepsNode] = {}
 
-    def follow(self, intermediate: Iterable[pb.TableReference], *, query: pb.qal.SelectStatement | None) -> QepsNode:
+    @property
+    def identifier(self) -> QepsIdentifier:
+        return self._identifier
+
+    def follow(
+        self,
+        intermediate: Iterable[pb.TableReference],
+        *,
+        query: pb.qal.SelectStatement | None,
+    ) -> QepsNode:
         child_identifier = (
             QepsIdentifier(intermediate).combine_with(self._identifier)
             if query is None
-            else FilterAwareQepsIdentifier.infer(intermediate, query=query).combine_with(self._identifier)
+            else FilterAwareQepsIdentifier.infer(
+                intermediate, query=query
+            ).combine_with(self._identifier)
         )
         child = self._children.get(child_identifier)
         if child is not None:
@@ -202,21 +261,40 @@ class PlainQeps(QepsNode):
 
         self._cost_summary[operator] = cost + self._gamma * current_cost
 
+    def __json__(self) -> pb.util.jsondict:
+        return {
+            "identifier": self._identifier,
+            "cost_summary": self._cost_summary,
+            "gamma": self._gamma,
+            "children": self._children,
+        }
+
 
 class SubqueryQeps(QepsNode):
     def __init__(self, identifier: QepsIdentifier, *, gamma: float) -> None:
         self._identifier = identifier
         self._gamma = gamma
 
-        self._subquery_root = PlainQeps.empty(gamma=gamma)
+        self._subquery_root: QepsNode = PlainQeps.empty(gamma=gamma)
         self._cost_summary: dict[pb.JoinOperator, pb.Cost] = {}
         self._children: dict[QepsIdentifier, QepsNode] = {}
 
-    def follow(self, intermediate: Iterable[pb.TableReference], *, query: pb.qal.SelectStatement | None) -> QepsNode:
+    @property
+    def identifier(self) -> QepsIdentifier:
+        return self._identifier
+
+    def follow(
+        self,
+        intermediate: Iterable[pb.TableReference],
+        *,
+        query: pb.qal.SelectStatement | None,
+    ) -> QepsNode:
         child_identifier = (
             QepsIdentifier(intermediate).combine_with(self._identifier)
             if query is None
-            else FilterAwareQepsIdentifier.infer(intermediate, query=query).combine_with(self._identifier)
+            else FilterAwareQepsIdentifier.infer(
+                intermediate, query=query
+            ).combine_with(self._identifier)
         )
         child = self._children.get(child_identifier)
         if child is not None:
@@ -238,7 +316,10 @@ class SubqueryQeps(QepsNode):
         query: pb.qal.SelectStatement | None,
     ) -> None:
         _generate_recommendations(
-            current_recommendation, qeps=self._subquery_root, join_order=intermediate, query=query
+            current_recommendation,
+            qeps=self._subquery_root,
+            join_order=intermediate,
+            query=query,
         )
 
         if not self._cost_summary:
@@ -261,7 +342,12 @@ class SubqueryQeps(QepsNode):
             if join_node is None:
                 continue
             assert isinstance(join_node.operator, pb.JoinOperator)
-            subquery_qeps.feedback(inner_node, operator=join_node.operator, cost=join_node.estimated_cost, query=query)
+            subquery_qeps.feedback(
+                inner_node,
+                operator=join_node.operator,
+                cost=join_node.estimated_cost,
+                query=query,
+            )
 
         current_cost = self._cost_summary.get(operator)
         if current_cost is None:
@@ -269,6 +355,46 @@ class SubqueryQeps(QepsNode):
             return
 
         self._cost_summary[operator] = cost + self._gamma * current_cost
+
+    def __json__(self) -> pb.util.jsondict:
+        return {
+            "identifier": self._identifier,
+            "cost_summary": self._cost_summary,
+            "gamma": self._gamma,
+            "subquery": self._subquery_root,
+            "children": self._children,
+        }
+
+
+def load_qeps_json(json_data: str | dict) -> QepsNode:
+    """Creates a QEPS node from its JSON representation.
+
+    Whether the node is filter-aware or not is determined automatically from the JSON data.
+    """
+    json_data = json.loads(json_data) if isinstance(json_data, str) else json_data
+    identifier = load_qeps_id_json(json_data["identifier"])
+    gamma = json_data["gamma"]
+    cost_summary = {
+        pb.opt.read_operator_json(k): v for k, v in json_data["cost_summary"].items()
+    }
+    if any(not isinstance(op, pb.JoinOperator) for op in cost_summary):
+        raise ValueError("Cost summary contains non-join operators.")
+
+    children = [load_qeps_json(child) for child in json_data["children"]]
+
+    raw_subquery = json_data.get("subquery")
+    if raw_subquery is None:
+        qeps = PlainQeps(identifier, gamma=gamma)
+        qeps._cost_summary = cost_summary  # type: ignore -- guarded by isinstance check above
+        qeps._children = {child.identifier: child for child in children}
+        return qeps
+
+    subquery = load_qeps_json(raw_subquery)
+    qeps = SubqueryQeps(identifier, gamma=gamma)
+    qeps._cost_summary = cost_summary  # type: ignore -- guarded by isinstance check above
+    qeps._subquery_root = subquery
+    qeps._children = {child.identifier: child for child in children}
+    return qeps
 
 
 def _generate_recommendations(
@@ -283,11 +409,76 @@ def _generate_recommendations(
         qeps.recommend(assignment, intermediate, query=query)
 
 
+def load_tonic_json(json_data: str | dict, *, database: pb.Database) -> TonicOperators:
+    """Creates a TONIC instance from its JSON representation."""
+    json_data = json.loads(json_data) if isinstance(json_data, str) else json_data
+    qeps = load_qeps_json(json_data["qeps"])
+    gamma = json_data["gamma"]
+    filter_aware = json_data["filter_aware"]
+    tonic = TonicOperators(database=database, gamma=gamma, filter_aware=filter_aware)
+    tonic._qeps = qeps  # type: ignore -- guarded by isinstance check above
+    return tonic
+
+
 class TonicOperators(pb.OperatorSelection):
-    def __init__(self, database: pb.Database | None = None, *, gamma: float = 0.8, filter_aware: bool = False) -> None:
+    @staticmethod
+    def pre_trained(
+        archive: Path | str,
+        *,
+        database: pb.Database,
+    ) -> TonicOperators:
+        archive = Path(archive)
+        if not archive.is_file():
+            raise FileNotFoundError(f"Archive file not found: {archive}")
+
+        with archive.open("r", encoding="utf-8") as f:
+            json_data = json.load(f)
+        return load_tonic_json(json_data, database=database)
+
+    @staticmethod
+    def load_or_build(
+        archive: Path | str,
+        *,
+        database: pb.Database | None = None,
+        gamma: float = 0.8,
+        filter_aware: bool = False,
+        sample_plans: Mapping[pb.SqlQuery, pb.QueryPlan] | None = None,
+        verbose: bool | pb.util.Logger = False,
+    ) -> TonicOperators:
+        logger = wrap_logger(verbose)
+        archive = Path(archive)
+
+        if archive.is_file():
+            logger(f"Loading pre-trained TONIC model from {archive}")
+            return TonicOperators.pre_trained(
+                archive, database=database or pb.db.current_database()
+            )
+
+        tonic = TonicOperators(
+            database=database, gamma=gamma, filter_aware=filter_aware
+        )
+
+        if sample_plans:
+            logger(f"Training TONIC model from {len(sample_plans)} sample plans")
+            for query, plan in sample_plans.items():
+                tonic.learn_from_feedback(query, plan, exec_time=plan.execution_time)
+
+        logger(f"Storing trained TONIC model to {archive}")
+        tonic.store(archive)
+
+        return tonic
+
+    def __init__(
+        self,
+        database: pb.Database | None = None,
+        *,
+        gamma: float = 0.8,
+        filter_aware: bool = False,
+    ) -> None:
         super().__init__()
         self._database = database or pb.db.current_database()
         self._qeps = PlainQeps.empty(gamma=gamma)
+        self._gamma = gamma
         self._filter_aware = filter_aware
 
     def select_physical_operators(
@@ -300,11 +491,17 @@ class TonicOperators(pb.OperatorSelection):
         assignment = pb.PhysicalOperatorAssignment()
 
         provide_query = query if self._filter_aware else None
-        _generate_recommendations(assignment, qeps=self._qeps, join_order=join_order, query=provide_query)
+        _generate_recommendations(
+            assignment, qeps=self._qeps, join_order=join_order, query=provide_query
+        )
         return assignment
 
     def learn_from_feedback(
-        self, query: SqlQuery, result_set: pb.db.ResultSet | pb.QueryPlan, *, exec_time: pb.TimeMs
+        self,
+        query: SqlQuery,
+        result_set: pb.db.ResultSet | pb.QueryPlan,
+        *,
+        exec_time: pb.TimeMs,
     ) -> pb.train.TrainingMetrics:
         if not pb.qal.is_select_query(query):
             raise pb.qal.QueryTypeError.expected_select(query)
@@ -327,12 +524,28 @@ class TonicOperators(pb.OperatorSelection):
                 continue
             assert isinstance(join_node.operator, pb.JoinOperator)
             current_qeps.feedback(
-                inner_node, operator=join_node.operator, cost=join_node.estimated_cost, query=provide_query
+                inner_node,
+                operator=join_node.operator,
+                cost=join_node.estimated_cost,
+                query=provide_query,
             )
         train_end = time.perf_counter_ns()
         training_time_ms = (train_end - train_start) / 1_000_000
         return {"status": "success", "training_time_ms": training_time_ms}
 
+    def store(self, archive: Path | str) -> None:
+        archive = Path(archive)
+        archive.parent.mkdir(parents=True, exist_ok=True)
+        with archive.open("w", encoding="utf-8") as f:
+            pb.util.to_json_dump(self, f)
+
     def _fallback_native_join_order(self, query: pb.qal.SelectStatement) -> pb.JoinTree:
         plan = self._database.optimizer().query_plan(query)
         return pb.jointree_from_plan(plan)
+
+    def __json__(self) -> pb.util.jsondict:
+        return {
+            "qeps": self._qeps,
+            "gamma": self._gamma,
+            "filter_aware": self._filter_aware,
+        }
