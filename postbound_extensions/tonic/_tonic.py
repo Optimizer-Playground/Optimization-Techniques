@@ -426,6 +426,7 @@ class TonicOperators(pb.OperatorSelection):
         archive: Path | str,
         *,
         database: pb.Database,
+        retrain: bool = True,
     ) -> TonicOperators:
         archive = Path(archive)
         if not archive.is_file():
@@ -433,7 +434,9 @@ class TonicOperators(pb.OperatorSelection):
 
         with archive.open("r", encoding="utf-8") as f:
             json_data = json.load(f)
-        return load_tonic_json(json_data, database=database)
+        tonic = load_tonic_json(json_data, database=database)
+        tonic.retrain = retrain
+        return tonic
 
     @staticmethod
     def load_or_build(
@@ -443,6 +446,7 @@ class TonicOperators(pb.OperatorSelection):
         gamma: float = 0.8,
         filter_aware: bool = False,
         sample_plans: Mapping[pb.SqlQuery, pb.QueryPlan] | None = None,
+        retrain: bool = True,
         verbose: bool | pb.util.Logger = False,
     ) -> TonicOperators:
         logger = wrap_logger(verbose)
@@ -451,17 +455,18 @@ class TonicOperators(pb.OperatorSelection):
         if archive.is_file():
             logger(f"Loading pre-trained TONIC model from {archive}")
             return TonicOperators.pre_trained(
-                archive, database=database or pb.db.current_database()
+                archive, database=database or pb.db.current_database(), retrain=retrain
             )
 
         tonic = TonicOperators(
-            database=database, gamma=gamma, filter_aware=filter_aware
+            database=database, gamma=gamma, filter_aware=filter_aware, retrain=True
         )
 
         if sample_plans:
             logger(f"Training TONIC model from {len(sample_plans)} sample plans")
             for query, plan in sample_plans.items():
                 tonic.learn_from_feedback(query, plan, exec_time=plan.execution_time)
+        tonic.retrain = retrain
 
         logger(f"Storing trained TONIC model to {archive}")
         tonic.store(archive)
@@ -474,12 +479,22 @@ class TonicOperators(pb.OperatorSelection):
         *,
         gamma: float = 0.8,
         filter_aware: bool = False,
+        retrain: bool = True,
     ) -> None:
         super().__init__()
         self._database = database or pb.db.current_database()
         self._qeps = PlainQeps.empty(gamma=gamma)
         self._gamma = gamma
         self._filter_aware = filter_aware
+        self._retrain = retrain
+
+    @property
+    def retrain(self) -> bool:
+        return self._retrain
+
+    @retrain.setter
+    def retrain(self, value: bool) -> None:
+        self._retrain = value
 
     def select_physical_operators(
         self, query: pb.SqlQuery, join_order: pb.JoinTree | None
@@ -490,9 +505,9 @@ class TonicOperators(pb.OperatorSelection):
         join_order = join_order or self._fallback_native_join_order(query)
         assignment = pb.PhysicalOperatorAssignment()
 
-        provide_query = query if self._filter_aware else None
+        query_ctx = query if self._filter_aware else None
         _generate_recommendations(
-            assignment, qeps=self._qeps, join_order=join_order, query=provide_query
+            assignment, qeps=self._qeps, join_order=join_order, query=query_ctx
         )
         return assignment
 
@@ -501,25 +516,33 @@ class TonicOperators(pb.OperatorSelection):
         query: SqlQuery,
         result_set: pb.db.ResultSet | pb.QueryPlan,
         *,
-        exec_time: pb.TimeMs,
+        exec_time: pb.TimeMs = float("nan"),
     ) -> pb.train.TrainingMetrics:
         if not pb.qal.is_select_query(query):
             raise pb.qal.QueryTypeError.expected_select(query)
+        if not self._retrain:
+            return {"status": "skipped", "details": "disabled"}
 
         if isinstance(result_set, pb.QueryPlan):
             plan = result_set
         else:
-            try:
-                plan = self._database.optimizer().parse_plan(result_set, query=query)
-            except Exception as e:
-                return {"status": "failure", "details": e}
+            plan = self._database.optimizer().parse_plan(result_set, query=query)
+
+        if not plan:
+            return {"status": "failure", "details": "could not parse plan"}
 
         current_qeps = self._qeps
-        provide_query = query if self._filter_aware else None
+        query_ctx = query if self._filter_aware else None
 
         train_start = time.perf_counter_ns()
+
+        true_card_query = self._database.hinting().generate_hints(
+            query, plan.with_actual_card()
+        )
+        plan = self._database.optimizer().query_plan(true_card_query)
+
         for inner_node, join_node in _traverse_query_plan(plan):
-            current_qeps = current_qeps.follow(inner_node.tables(), query=provide_query)
+            current_qeps = current_qeps.follow(inner_node.tables(), query=query_ctx)
             if join_node is None:
                 continue
             assert isinstance(join_node.operator, pb.JoinOperator)
@@ -527,7 +550,7 @@ class TonicOperators(pb.OperatorSelection):
                 inner_node,
                 operator=join_node.operator,
                 cost=join_node.estimated_cost,
-                query=provide_query,
+                query=query_ctx,
             )
         train_end = time.perf_counter_ns()
         training_time_ms = (train_end - train_start) / 1_000_000
@@ -548,4 +571,5 @@ class TonicOperators(pb.OperatorSelection):
             "qeps": self._qeps,
             "gamma": self._gamma,
             "filter_aware": self._filter_aware,
+            "retrain": self._retrain,
         }
