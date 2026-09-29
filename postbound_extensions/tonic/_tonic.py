@@ -418,7 +418,6 @@ def load_tonic_json(json_data: str | dict, *, database: pb.Database) -> TonicOpe
     filter_aware = json_data["filter_aware"]
     retrain = json_data.get("retrain", True)
     prediction_target = json_data.get("prediction_target", "true_cost")
-    eliminate_aliases = json_data.get("eliminate_aliases", False)
 
     tonic = TonicOperators(
         database=database,
@@ -426,7 +425,6 @@ def load_tonic_json(json_data: str | dict, *, database: pb.Database) -> TonicOpe
         filter_aware=filter_aware,
         retrain=retrain,
         prediction_target=prediction_target,
-        eliminate_aliases=eliminate_aliases,
     )
 
     qeps = load_qeps_json(json_data["qeps"])
