@@ -33,7 +33,7 @@ where = ["."]
 include = ["postbound_extensions*"]
 
 [tool.uv.sources]
-postbound = { git = "https://github.com/Optimizer-Playground/PostBOUND", rev = "4a6331a46d70dd66f98001ae6ced45c1d336f96d" }
+postbound = { git = "https://github.com/Optimizer-Playground/PostBOUND", rev = "d2a7e4276a2bd83578f6cb72996c414ff682086d" }
 
 [tool.ty.src]
 exclude = ["postbound_extensions/fastgres/**", "postbound_extensions/ceb/**"]

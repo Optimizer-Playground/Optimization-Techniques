@@ -23,6 +23,7 @@ import time
 from abc import ABC, abstractmethod
 from collections.abc import Generator, Iterable, Mapping
 from pathlib import Path
+from typing import Literal
 
 import postbound as pb
 from postbound.qal import SqlQuery
@@ -155,8 +156,8 @@ def load_qeps_id_json(
 
 
 class QepsNode(ABC):
-    @abstractmethod
     @property
+    @abstractmethod
     def identifier(self) -> QepsIdentifier:
         raise NotImplementedError
 
@@ -412,12 +413,73 @@ def _generate_recommendations(
 def load_tonic_json(json_data: str | dict, *, database: pb.Database) -> TonicOperators:
     """Creates a TONIC instance from its JSON representation."""
     json_data = json.loads(json_data) if isinstance(json_data, str) else json_data
-    qeps = load_qeps_json(json_data["qeps"])
+
     gamma = json_data["gamma"]
     filter_aware = json_data["filter_aware"]
-    tonic = TonicOperators(database=database, gamma=gamma, filter_aware=filter_aware)
+    retrain = json_data.get("retrain", True)
+    prediction_target = json_data.get("prediction_target", "true_cost")
+    eliminate_aliases = json_data.get("eliminate_aliases", False)
+
+    tonic = TonicOperators(
+        database=database,
+        gamma=gamma,
+        filter_aware=filter_aware,
+        retrain=retrain,
+        prediction_target=prediction_target,
+        eliminate_aliases=eliminate_aliases,
+    )
+
+    qeps = load_qeps_json(json_data["qeps"])
     tonic._qeps = qeps  # type: ignore -- guarded by isinstance check above
+
     return tonic
+
+
+def _scrub_query(query: pb.qal.SelectStatement) -> pb.qal.SelectStatement:
+    renamings = {tab: tab.drop_alias() for tab in query.tables()}
+    return pb.transform.rename_table(query, renamings)
+
+
+def _scrub_join_tree(join_tree: pb.JoinTree) -> pb.JoinTree:
+    if join_tree.is_scan():
+        scrubbed = join_tree.base_table.drop_alias()
+        return pb.JoinTree.create_scan(scrubbed)
+
+    scrubbed_outer = _scrub_join_tree(join_tree.outer_child)
+    scrubbed_inner = _scrub_join_tree(join_tree.inner_child)
+    return pb.JoinTree.create_join(scrubbed_outer, scrubbed_inner)
+
+
+def _scrub_query_plan(plan: pb.QueryPlan) -> pb.QueryPlan:
+    if plan.is_scan():
+        assert plan.base_table is not None
+        scrubbed = plan.base_table.drop_alias()
+        return pb.QueryPlan(
+            plan.node_type,
+            base_table=scrubbed,
+            estimates=plan.estimates,
+            measures=plan.measures,
+        )
+
+    if plan.is_join():
+        assert plan.outer_child is not None and plan.inner_child is not None
+        scrubbed_outer = _scrub_query_plan(plan.outer_child)
+        scrubbed_inner = _scrub_query_plan(plan.inner_child)
+        return pb.QueryPlan(
+            plan.node_type,
+            children=[scrubbed_outer, scrubbed_inner],
+            estimates=plan.estimates,
+            measures=plan.measures,
+        )
+
+    assert plan.input_node is not None
+    scrubbed_input = _scrub_query_plan(plan.input_node)
+    return pb.QueryPlan(
+        plan.node_type,
+        children=[scrubbed_input],
+        estimates=plan.estimates,
+        measures=plan.measures,
+    )
 
 
 class TonicOperators(pb.OperatorSelection):
@@ -480,6 +542,7 @@ class TonicOperators(pb.OperatorSelection):
         gamma: float = 0.8,
         filter_aware: bool = False,
         retrain: bool = True,
+        prediction_target: Literal["true_cost", "execution_time"] = "true_cost",
     ) -> None:
         super().__init__()
         self._database = database or pb.db.current_database()
@@ -487,6 +550,7 @@ class TonicOperators(pb.OperatorSelection):
         self._gamma = gamma
         self._filter_aware = filter_aware
         self._retrain = retrain
+        self._prediction_target = prediction_target
 
     @property
     def retrain(self) -> bool:
@@ -536,10 +600,20 @@ class TonicOperators(pb.OperatorSelection):
 
         train_start = time.perf_counter_ns()
 
-        true_card_query = self._database.hinting().generate_hints(
-            query, plan.with_actual_card()
-        )
-        plan = self._database.optimizer().query_plan(true_card_query)
+        match self._prediction_target:
+            case "true_cost":
+                true_card_query = self._database.hinting().generate_hints(
+                    query, plan.with_actual_card()
+                )
+                plan = self._database.optimizer().query_plan(true_card_query)
+
+            case "execution_time":
+                plan = plan.with_runtime_as_cost()
+
+            case _:
+                raise ValueError(
+                    f"Invalid prediction target: {self._prediction_target}. "
+                )
 
         for inner_node, join_node in _traverse_query_plan(plan):
             current_qeps = current_qeps.follow(inner_node.tables(), query=query_ctx)
@@ -572,4 +646,5 @@ class TonicOperators(pb.OperatorSelection):
             "gamma": self._gamma,
             "filter_aware": self._filter_aware,
             "retrain": self._retrain,
+            "prediction_target": self._prediction_target,
         }
