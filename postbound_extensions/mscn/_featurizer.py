@@ -27,7 +27,6 @@ import warnings
 from collections.abc import Collection, Generator, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
 
 import numpy as np
 import pandas as pd
@@ -161,7 +160,7 @@ class MscnFeaturizer:
     @staticmethod
     def online(
         database: pb.Database,
-        tables: Optional[Iterable[pb.TableReference]] = None,
+        tables: Iterable[pb.TableReference] | None = None,
         verbose: bool | pb.util.Logger = False,
     ) -> MscnFeaturizer:
         """Infers the featurization scheme from a database schema.
@@ -246,9 +245,9 @@ class MscnFeaturizer:
     def infer_from_workload(
         workload: pb.Workload,
         *,
-        min_card: pb.Cardinality | float | int = pb.Cardinality.unknown(),
-        max_card: pb.Cardinality | float | int = pb.Cardinality.unknown(),
-        database: Optional[pb.Database] = None,
+        min_card: pb.Cardinality | float = pb.Cardinality.unknown(),
+        max_card: pb.Cardinality | float = pb.Cardinality.unknown(),
+        database: pb.Database | None = None,
         verbose: bool | pb.util.Logger = False,
     ) -> MscnFeaturizer:
         """Builds a featurizer tailored for a specific workload.
@@ -357,8 +356,8 @@ class MscnFeaturizer:
         *,
         query_col: str = "query",
         cardinality_col: str = "cardinality",
-        workload: Optional[pb.Workload] = None,
-        database: Optional[pb.Database] = None,
+        workload: pb.Workload | None = None,
+        database: pb.Database | None = None,
         verbose: bool | pb.util.Logger = False,
     ) -> MscnFeaturizer:
         """Builds a featurizer tailored to a specific set of training queries.
@@ -498,7 +497,7 @@ class MscnFeaturizer:
         catalog_path: Path | str,
         *,
         database: pb.Database,
-        workload: Optional[pb.Workload] = None,
+        workload: pb.Workload | None = None,
         verbose: bool | pb.util.Logger = False,
     ) -> MscnFeaturizer:
         """Integrated inference and storage procedure.
@@ -887,7 +886,7 @@ class MscnFeaturizer:
         padding = np.zeros(n_max - n_set, dtype=np.float32)
         return np.concatenate([present, padding], axis=0).reshape(-1, 1)
 
-    def store(self, catalog_path: Path | str, *, encoder_dir: Optional[Path | str] = None) -> None:
+    def store(self, catalog_path: Path | str, *, encoder_dir: Path | str | None = None) -> None:
         """Persists the featurization info and column encoders at the specified location.
 
         To store a featurization, we need to export two kinds of information: general metadata

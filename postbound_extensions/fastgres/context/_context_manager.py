@@ -1,12 +1,19 @@
 from __future__ import annotations
 
-from enum import Enum
-from typing import Collection, Type
+from collections.abc import Collection
 from dataclasses import dataclass, field
+from enum import Enum
 
-from ._context import Context, TableContext, SchemaContext, ColumnContext, SuperTableContext
-from ._schema import DatabaseSchema
 from postbound import SqlQuery
+
+from ._context import (
+    ColumnContext,
+    Context,
+    SchemaContext,
+    SuperTableContext,
+    TableContext,
+)
+from ._schema import DatabaseSchema
 
 
 class CtxGranularity(Enum):
@@ -36,7 +43,7 @@ class ContextManager:
     ctx_granularity: CtxGranularity
     queries: Collection[SqlQuery]
     db_schema: DatabaseSchema | dict
-    ctx_cls: Type[Context] = field(init=False)
+    ctx_cls: type[Context] = field(init=False)
 
     def __post_init__(self):
         if isinstance(self.db_schema, dict):

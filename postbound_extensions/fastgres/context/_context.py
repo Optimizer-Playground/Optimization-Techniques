@@ -1,9 +1,12 @@
 from __future__ import annotations
-from dataclasses import dataclass
-from postbound import SqlQuery
-from ._schema import DatabaseSchema
+
 from abc import ABC, abstractmethod
-from typing import Collection
+from collections.abc import Collection
+from dataclasses import dataclass
+
+from postbound import SqlQuery
+
+from ._schema import DatabaseSchema
 
 
 class Context(ABC):

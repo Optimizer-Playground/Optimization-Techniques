@@ -159,16 +159,10 @@ class MscnEstimator(pb.CardinalityEstimator):
         model.load_state_dict(weights)
 
         raw_hyper_params = catalog.get("hyper_parameters")
-        training_params = (
-            MscnHyperParams(**raw_hyper_params)
-            if raw_hyper_params is not None
-            else None
-        )
+        training_params = MscnHyperParams(**raw_hyper_params) if raw_hyper_params is not None else None
         training_metrics = catalog.get("training_metrics", {})
 
-        estimator = MscnEstimator(
-            model=model, featurizer=featurizer, database=database, verbose=verbose
-        )
+        estimator = MscnEstimator(model=model, featurizer=featurizer, database=database, verbose=verbose)
         estimator._training_params = training_params
         estimator._training_metrics = training_metrics
 
@@ -214,13 +208,9 @@ class MscnEstimator(pb.CardinalityEstimator):
         # See comment in MscnFeaturizer.infer_from_samples() on why we have to use this
         # strategy instead of calling infer_from_workload() or load_or_build()
         logger("Determining MSCN features")
-        featurizer = MscnFeaturizer.infer_from_samples(
-            samples, workload=workload, database=database, verbose=verbose
-        )
+        featurizer = MscnFeaturizer.infer_from_samples(samples, workload=workload, database=database, verbose=verbose)
 
-        estimator = MscnEstimator(
-            featurizer=featurizer, database=database, verbose=verbose
-        )
+        estimator = MscnEstimator(featurizer=featurizer, database=database, verbose=verbose)
         logger("Training new MSCN estimator")
         estimator.train(samples, hyper_params=training_params)
         estimator.store(catalog_path)
@@ -269,11 +259,7 @@ class MscnEstimator(pb.CardinalityEstimator):
         query: pb.SqlQuery,
         intermediate: pb.TableReference | Iterable[pb.TableReference],
     ) -> pb.Cardinality:
-        intermediate = (
-            [intermediate]
-            if isinstance(intermediate, pb.TableReference)
-            else list(intermediate)
-        )
+        intermediate = [intermediate] if isinstance(intermediate, pb.TableReference) else list(intermediate)
         query_fragment = pb.transform.extract_query_fragment(query, intermediate)
         if not query_fragment:
             raise ValueError(f"Query fragment not found for query {query}")
@@ -367,9 +353,7 @@ class MscnEstimator(pb.CardinalityEstimator):
         training_data: torch.utils.data.Dataset = PandasDataset(training_df)
 
         self.model.train()
-        optimizer = torch.optim.Adam(
-            self.model.parameters(), lr=hyper_params.learning_rate
-        )
+        optimizer = torch.optim.Adam(self.model.parameters(), lr=hyper_params.learning_rate)
 
         data_loader = torch.utils.data.DataLoader(
             training_data,
@@ -393,9 +377,7 @@ class MscnEstimator(pb.CardinalityEstimator):
                 optimizer.step()
 
             epoch_str = str(epoch + 1).rjust(len(str(hyper_params.epochs)))
-            self._log(
-                f"Epoch: {epoch_str} / {hyper_params.epochs} :: loss = {loss_total}"
-            )
+            self._log(f"Epoch: {epoch_str} / {hyper_params.epochs} :: loss = {loss_total}")
             metrics["loss"].append(loss_total)
 
         end_time = time.perf_counter_ns()
@@ -465,9 +447,7 @@ class MscnEstimator(pb.CardinalityEstimator):
         with open(catalog, "r+") as f:
             catalog = json.load(f)
             catalog["mscn_model"] = str(model_file)
-            catalog["hyper_parameters"] = (
-                self._training_params.__json__() if self._training_params else None
-            )
+            catalog["hyper_parameters"] = self._training_params.__json__() if self._training_params else None
             catalog["training_metrics"] = self._training_metrics
             f.seek(0)
             pb.util.to_json_dump(catalog, f)

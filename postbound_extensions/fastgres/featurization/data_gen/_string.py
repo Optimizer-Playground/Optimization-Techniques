@@ -1,17 +1,17 @@
 
 from __future__ import annotations
 
+import hashlib
+from collections import defaultdict
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
-from collections import defaultdict
+
 from tqdm import tqdm
-from dataclasses import dataclass, field
 
+from ..._util import load_json, min_max_encode, save_json
 from .._dbutil import DatabaseConnection
-from ..._util import save_json, load_json, min_max_encode
 from ._statistics import StatisticsComponent
-
-import hashlib
 
 
 class FastgresStringComponent(StatisticsComponent):

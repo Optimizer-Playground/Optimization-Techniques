@@ -1,7 +1,14 @@
-from ..pg_lib._libraries import (PG12_HINTS, PG13_HINTS, PG14_HINTS, PG15_HINTS, PG16_HINTS,
-                                 PG17_HINTS, CORE_HINT_LIBRARY)
-from ._postgres_hints import PARTITION_HINTS, MISC_HINTS, BACKEND_HINTS
 from .._hint_library import HintLibrary
+from ..pg_lib._libraries import (
+    CORE_HINT_LIBRARY,
+    PG12_HINTS,
+    PG13_HINTS,
+    PG14_HINTS,
+    PG15_HINTS,
+    PG16_HINTS,
+    PG17_HINTS,
+)
+from ._postgres_hints import BACKEND_HINTS, MISC_HINTS, PARTITION_HINTS
 
 
 def get_available_library(postgres_version: str,

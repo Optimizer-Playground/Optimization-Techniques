@@ -1,8 +1,11 @@
 from __future__ import annotations
-import numpy as np
-from ._hint_library import HintLibrary
-from ._hint import Hint
+
 from dataclasses import dataclass, field
+
+import numpy as np
+
+from ._hint import Hint
+from ._hint_library import HintLibrary
 
 
 @dataclass(frozen=True)

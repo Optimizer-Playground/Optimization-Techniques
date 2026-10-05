@@ -122,4 +122,4 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 from ._ues import UesEstimationType, UesJoinOrdering, UesOperators, UesOptimizer
 
-__all__ = ["UesJoinOrdering", "UesOperators", "UesOptimizer", "UesEstimationType"]
+__all__ = ["UesEstimationType", "UesJoinOrdering", "UesOperators", "UesOptimizer"]

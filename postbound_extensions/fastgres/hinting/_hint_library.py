@@ -1,7 +1,10 @@
 from __future__ import annotations
-from ._hint import Hint
+
 from dataclasses import dataclass, field
+
 from bidict import bidict
+
+from ._hint import Hint
 
 
 @dataclass(frozen=True)

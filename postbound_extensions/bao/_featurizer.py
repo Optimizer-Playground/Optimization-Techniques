@@ -89,12 +89,8 @@ class BinarizedQep:
 
         elif plan.is_join():
             assert plan.outer_child and plan.inner_child
-            binarized_outer = BinarizedQep.create_for(
-                plan.outer_child, cache_state=cache_state
-            )
-            binarized_inner = BinarizedQep.create_for(
-                plan.inner_child, cache_state=cache_state
-            )
+            binarized_outer = BinarizedQep.create_for(plan.outer_child, cache_state=cache_state)
+            binarized_inner = BinarizedQep.create_for(plan.inner_child, cache_state=cache_state)
             return BinarizedQep.pseudo_join(
                 plan.node_type,
                 binarized_outer,
@@ -107,9 +103,7 @@ class BinarizedQep:
         assert plan.input_node
 
         dummy_child = BinarizedQep.dummy()
-        binarized_input = BinarizedQep.create_for(
-            plan.input_node, cache_state=cache_state
-        )
+        binarized_input = BinarizedQep.create_for(plan.input_node, cache_state=cache_state)
         return BinarizedQep.pseudo_join(
             plan.node_type,
             binarized_input,
@@ -120,9 +114,7 @@ class BinarizedQep:
         )
 
     @staticmethod
-    def scan(
-        node: str, *, cardinality: int, cost: float, cache_pct: float
-    ) -> BinarizedQep:
+    def scan(node: str, *, cardinality: int, cost: float, cache_pct: float) -> BinarizedQep:
         """Transforms the scan node into its binarized equivalent."""
         return BinarizedQep(False, node, None, None, cardinality, cost, cache_pct)
 
@@ -158,11 +150,7 @@ class BinarizedQep:
         return not self.is_dummy and self.outer_child is None
 
     def is_join(self) -> bool:
-        return (
-            self.outer_child is not None
-            and self.inner_child is not None
-            and not self.inner_child.is_dummy
-        )
+        return self.outer_child is not None and self.inner_child is not None and not self.inner_child.is_dummy
 
     def is_intermediate(self) -> bool:
         return self.inner_child is not None and self.inner_child.is_dummy
@@ -175,9 +163,7 @@ class NodeType(IntEnum):
     Dummy = 4
 
 
-FeaturizedNode = collections.namedtuple(
-    "FeaturizedNode", ["node_type", "encoding", "outer_child", "inner_child"]
-)
+FeaturizedNode = collections.namedtuple("FeaturizedNode", ["node_type", "encoding", "outer_child", "inner_child"])
 
 
 def node_features(node: FeaturizedNode) -> np.ndarray:
@@ -292,9 +278,7 @@ class BaoFeaturizer:
     """
 
     @staticmethod
-    def online(
-        database: pb.Database, *, max_runtime_ms: float = 1000 * 60 * 60
-    ) -> BaoFeaturizer:
+    def online(database: pb.Database, *, max_runtime_ms: float = 1000 * 60 * 60) -> BaoFeaturizer:
         """Infers the featurization from the database.
 
         This featurization strategy trades off high generality for potentially larger
@@ -487,9 +471,7 @@ class BaoFeaturizer:
             FunctionTransformer(func=np.log1p, inverse_func=np.expm1),
             MinMaxScaler((self._min_runtime_log, self._max_runtime_log)),
         )
-        self._runtime_pipeline.fit(
-            np.asarray([self._min_runtime, self._max_runtime]).reshape(-1, 1)
-        )
+        self._runtime_pipeline.fit(np.asarray([self._min_runtime, self._max_runtime]).reshape(-1, 1))
 
         self._db = database
 

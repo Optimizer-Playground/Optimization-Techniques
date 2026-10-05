@@ -234,7 +234,6 @@ __all__ = [
     "load_like_repo_json",
     "load_pcf_json",
     "load_range_pcf_json",
-    "load_eq_pcf_json",
     "load_unconditioned_json",
     "trigram_frequency",
     "trigrams",

@@ -1,7 +1,10 @@
 
 from __future__ import annotations
+
+from collections.abc import Iterator
 from dataclasses import dataclass
-from typing import Dict, Set, Iterator, Tuple, Optional, TYPE_CHECKING
+from typing import TYPE_CHECKING
+
 import postbound as pb
 
 if TYPE_CHECKING:
@@ -10,32 +13,32 @@ if TYPE_CHECKING:
 @dataclass(frozen=True)
 class DatabaseSchema:
     """Table -> Column -> Datatype"""
-    _schema: Dict[str, Dict[str, str]]
+    _schema: dict[str, dict[str, str]]
 
     @classmethod
-    def from_dbc(cls, dbc: "pb.postgres.PostgresInterface | DatabaseConnection") -> DatabaseSchema:
+    def from_dbc(cls, dbc: pb.postgres.PostgresInterface | DatabaseConnection) -> DatabaseSchema:
         from ..featurization import DatabaseConnection
         if isinstance(dbc, pb.postgres.PostgresInterface):
             dbc = DatabaseConnection(dbc)
         return cls(dbc.fg_schema)
 
     @property
-    def schema(self) -> Dict[str, Dict[str, str]]:
+    def schema(self) -> dict[str, dict[str, str]]:
         return self._schema
 
-    def all_tables(self) -> Set[str]:
+    def all_tables(self) -> set[str]:
         return set(self._schema.keys())
 
-    def all_columns(self) -> Set[tuple[str, str]]:
+    def all_columns(self) -> set[tuple[str, str]]:
         return {(t, c) for t, cols in self._schema.items() for c in cols}
 
-    def columns_for_table(self, table: str) -> Set[str]:
+    def columns_for_table(self, table: str) -> set[str]:
         return set(self._schema.get(table, {}).keys())
 
-    def get_datatype(self, table: str, column: str) -> Optional[str]:
+    def get_datatype(self, table: str, column: str) -> str | None:
         return self._schema.get(table, {}).get(column, None)
 
-    def __iter__(self) -> Iterator[Tuple[str, str, str]]:
+    def __iter__(self) -> Iterator[tuple[str, str, str]]:
         for table in sorted(self._schema):
             for column in sorted(self._schema[table]):
                 yield table, column, self._schema[table][column]

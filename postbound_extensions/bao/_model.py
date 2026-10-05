@@ -13,7 +13,7 @@ class BaoModel(torch.nn.Module):
     """
 
     def __init__(self, in_channels: int) -> None:
-        super(BaoModel, self).__init__()
+        super().__init__()
 
         self._in_channels = in_channels
         self._model = torch.nn.Sequential(

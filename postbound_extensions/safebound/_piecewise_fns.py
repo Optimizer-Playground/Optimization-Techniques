@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass
-from typing import Optional, Protocol
+from typing import Protocol
 
 import numpy as np
 import postbound as pb
@@ -105,7 +105,7 @@ class DegreeSequence:
     """
 
     @staticmethod
-    def from_mcv(mcv: pb.db.MostCommonValues, *, column: Optional[pb.ColumnReference] = None) -> DegreeSequence:
+    def from_mcv(mcv: pb.db.MostCommonValues, *, column: pb.ColumnReference | None = None) -> DegreeSequence:
         """Creates a new degree sequence for a specific most-common values list.
 
         The column is used by the higher-up processing and should only be omitted for
@@ -114,7 +114,7 @@ class DegreeSequence:
         return DegreeSequence(mcv.frequencies, column=column)
 
     @staticmethod
-    def for_primary_key(n_values: int, *, column: Optional[pb.ColumnReference] = None) -> DegreeSequence:
+    def for_primary_key(n_values: int, *, column: pb.ColumnReference | None = None) -> DegreeSequence:
         """Creates a new degree sequence for a PRIMARY KEY/UNIQUE column.
 
         For such a column, all frequencies are by definition 1. Therefore, the degree sequence can
@@ -129,7 +129,7 @@ class DegreeSequence:
         self,
         degrees: Iterable[int | pb.Cardinality] | NDArray[np.int_],
         *,
-        column: Optional[pb.ColumnReference] = None,
+        column: pb.ColumnReference | None = None,
     ) -> None:
         if not isinstance(degrees, np.ndarray):
             degrees = [int(deg) for deg in degrees if not isinstance(deg, pb.Cardinality) or deg.is_valid()]
@@ -139,7 +139,7 @@ class DegreeSequence:
         self._column = column
 
     @property
-    def column(self) -> Optional[pb.ColumnReference]:
+    def column(self) -> pb.ColumnReference | None:
         """Get the column to which this degree sequence belongs.
 
         The column should always be set and only omitted during debugging/testing.
@@ -276,7 +276,7 @@ class Segment:
         return Segment(0, 0, slope, intercept)
 
     @staticmethod
-    def after(last: Segment, *, slope: float, higher: Optional[float] = 0) -> Segment:
+    def after(last: Segment, *, slope: float, higher: float | None = 0) -> Segment:
         """Creates a new segment that "picks up" after a previous segment.
 
         The lower bound of the segment as well as the intercept are inferred directly based on the
@@ -344,9 +344,7 @@ class PiecewiseConstantFn:
     """
 
     @staticmethod
-    def from_segments(
-        segments: Iterable[Segment], *, column: Optional[pb.ColumnReference] = None
-    ) -> PiecewiseConstantFn:
+    def from_segments(segments: Iterable[Segment], *, column: pb.ColumnReference | None = None) -> PiecewiseConstantFn:
         """Creates a new PCF.
 
         All segments must be constant. Furthermore, it is assumed that segments are already ordered
@@ -363,7 +361,7 @@ class PiecewiseConstantFn:
         return PiecewiseConstantFn(values, bounds, column=column)
 
     @staticmethod
-    def zero(column: Optional[pb.ColumnReference] = None) -> PiecewiseConstantFn:
+    def zero(column: pb.ColumnReference | None = None) -> PiecewiseConstantFn:
         """Creates a new 0-PCF.
 
         This PCF contains a single segment with an intercept of 0 and an upper bound of 0. Use
@@ -376,7 +374,7 @@ class PiecewiseConstantFn:
         values: Iterable[float],
         bounds: Iterable[float],
         *,
-        column: Optional[pb.ColumnReference] = None,
+        column: pb.ColumnReference | None = None,
     ) -> None:
         self.column = column
 
@@ -469,9 +467,7 @@ class PiecewiseConstantFn:
         aligned_self, aligned_other = align_functions(self, other, cut_early=True)
         if self.column is None:
             col = other.column
-        elif other.column is None:
-            col = self.column
-        elif self.column == other.column:
+        elif other.column is None or self.column == other.column:
             col = self.column
         else:
             col = None
@@ -632,9 +628,7 @@ class PiecewiseConstantFn:
         values = aligned_self._values * aligned_other._values
         if self.column is None:
             col = other.column
-        elif other.column is None:
-            col = self.column
-        elif self.column == other.column:
+        elif other.column is None or self.column == other.column:
             col = self.column
         else:
             col = None
@@ -702,7 +696,7 @@ class PiecewiseLinearFn:
     """
 
     @staticmethod
-    def from_segments(segments: Iterable[Segment], column: Optional[pb.ColumnReference] = None) -> PiecewiseLinearFn:
+    def from_segments(segments: Iterable[Segment], column: pb.ColumnReference | None = None) -> PiecewiseLinearFn:
         """Creates a new PCF.
 
         Segments can be either linear or constant. Furthermore, it is assumed that segments are already ordered
@@ -725,7 +719,7 @@ class PiecewiseLinearFn:
         slopes: Iterable[float],
         intercepts: Iterable[float],
         bounds: Iterable[float],
-        column: Optional[pb.ColumnReference] = None,
+        column: pb.ColumnReference | None = None,
     ) -> None:
         self.column = column
 

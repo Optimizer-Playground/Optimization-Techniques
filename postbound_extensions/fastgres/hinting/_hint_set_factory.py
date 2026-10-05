@@ -1,6 +1,7 @@
+from dataclasses import dataclass
+
 from ._hint_library import HintLibrary
 from ._hint_set import HintSet
-from dataclasses import dataclass
 
 
 @dataclass

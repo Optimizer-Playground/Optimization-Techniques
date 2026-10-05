@@ -1,8 +1,8 @@
 
 from collections import deque
+from collections.abc import Collection, Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Iterable, Sequence, Collection
 
 import pandas as pd
 import postbound as pb
@@ -10,12 +10,11 @@ from bidict import bidict
 from postbound.postgres import PostgresExplainPlan
 from tqdm import tqdm
 
-from ._executor import ResultSet, QueryExecutor, no_geqo
-from ._result import LabelingResult
-from ._util import get_neighbors, HintSetStats
 from .._util import prepare_dir
-from ..hinting import CORE_HINT_LIBRARY
-from ..hinting import HintSet, HintSetFactory
+from ..hinting import CORE_HINT_LIBRARY, HintSet, HintSetFactory
+from ._executor import QueryExecutor, ResultSet, no_geqo
+from ._result import LabelingResult
+from ._util import HintSetStats, get_neighbors
 
 
 class FastgresLabelProvider:
@@ -110,14 +109,14 @@ class QueryLabeling:
         self.current_level = 0
         self.best_candidates = bidict()
         self.timeout = self.settings.fls.baseline_timeout
-        self.optimal_candidate: Optional[ResultSet] = None
+        self.optimal_candidate: ResultSet | None = None
         self.current_optimal_time = self.settings.fls.baseline_timeout
 
 
     def break_level(self):
         return self.current_level >= self.settings.fls.level_cap
 
-    def check_plan(self, hs: HintSet) -> tuple[Optional[ResultSet], PostgresExplainPlan]:
+    def check_plan(self, hs: HintSet) -> tuple[ResultSet | None, PostgresExplainPlan]:
         res: ResultSet = self.exec(self.q_string, hs, self.settings.fls.baseline_timeout, explain=True)
         return self.seen_plans.get(res.explain_plan, None), res.explain_plan
 

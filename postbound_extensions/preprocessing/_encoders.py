@@ -4,7 +4,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Iterable, Sequence
 from datetime import date, datetime, time
 from pathlib import Path
-from typing import Optional
+from typing import Self
 
 import numpy as np
 import pandas as pd
@@ -148,7 +148,7 @@ class ColumnEncoder[T](ABC):
     def encode_batch(self, values: Iterable[T]) -> np.ndarray: ...
 
     @abstractmethod
-    def decode(self, vec: np.ndarray) -> Optional[T]: ...
+    def decode(self, vec: np.ndarray) -> T | None: ...
 
     def store(self, target_dir: Path) -> Path:
         if self.values is None:
@@ -185,13 +185,13 @@ class NumericEncoder(ColumnEncoder):
         arr = np.array(values).reshape(-1, 1)
         if prepare_values and arr.dtype == "object":
             # if the array is not of object type, it can't contain None values, so we can skip this step
-            arr[arr == None] = np.nan  # noqa: E711
+            arr[arr == None] = np.nan
             arr = arr.astype(float)
         self.values = arr
         self._min_val = np.nanmin(arr)
         self._max_val = np.nanmax(arr)
 
-    def encode_single(self, value: int | float) -> np.ndarray:
+    def encode_single(self, value: float) -> np.ndarray:
         if self._min_val is None or self._max_val is None:
             raise ValueError("Encoder not fitted yet")
         value = np.nan if value is None else value
@@ -205,7 +205,7 @@ class NumericEncoder(ColumnEncoder):
         encoded = (arr - self._min_val) / (self._max_val - self._min_val)
         return encoded
 
-    def decode(self, vec: np.ndarray) -> Optional[int | float]:
+    def decode(self, vec: np.ndarray) -> int | float | None:
         if self._min_val is None or self._max_val is None:
             raise ValueError("Encoder not fitted yet")
         decoded = vec * (self._max_val - self._min_val) + self._min_val
@@ -221,7 +221,7 @@ class TextEncoder(ColumnEncoder):
     def fit(self, values: Sequence[str], *, prepare_values: bool = True) -> None:
         arr = np.array(values, dtype="object")
         if prepare_values:
-            arr[arr == None] = "__POSTBOUND_NULL_PLACEHOLDER__"  # noqa: E711
+            arr[arr == None] = "__POSTBOUND_NULL_PLACEHOLDER__"
         self.values = arr
         self._max_values = len(values)
 
@@ -236,11 +236,11 @@ class TextEncoder(ColumnEncoder):
         if self.values is None:
             raise ValueError("Encoder not fitted yet")
         arr = np.array(values, dtype="object")
-        arr[arr == None] = "__POSTBOUND_NULL_PLACEHOLDER__"  # noqa: E711
+        arr[arr == None] = "__POSTBOUND_NULL_PLACEHOLDER__"
         idxs = np.searchsorted(self.values, arr)
         return (idxs / self._max_values).reshape(-1, 1)
 
-    def decode(self, vec: np.ndarray) -> Optional[str]:
+    def decode(self, vec: np.ndarray) -> str | None:
         if self.values is None:
             raise ValueError("Encoder not fitted yet")
         idx = int(vec[0][0] * self._max_values)
@@ -261,7 +261,7 @@ def _timestamp(value: datetime | date | None) -> float:
 
 
 class DateTimeEncoder(ColumnEncoder):
-    def __new__(cls, column: pb.BoundColumnReference, dtype: str, *, date_only: bool) -> DateTimeEncoder:
+    def __new__(cls, column: pb.BoundColumnReference, dtype: str, *, date_only: bool) -> Self:
         return super(object).__new__(cls)
 
     def __init__(self, column: pb.BoundColumnReference, dtype: str, *, date_only: bool) -> None:
@@ -290,12 +290,12 @@ class DateTimeEncoder(ColumnEncoder):
         encoded = (arr - self._min_val) / (self._max_val - self._min_val)
         return encoded
 
-    def decode(self, vec: np.ndarray) -> Optional[datetime | date]:
+    def decode(self, vec: np.ndarray) -> datetime | date | None:
         if self._min_val is None or self._max_val is None:
             raise ValueError("Encoder not fitted yet")
         decoded = vec * (self._max_val - self._min_val) + self._min_val
         timestamp = decoded[0][0]
         if np.isnan(timestamp):
             return None
-        dt = datetime.fromtimestamp(timestamp)
+        dt = datetime.fromtimestamp(timestamp)  # noqa -  let's not worry about timezones for now
         return dt.date() if self.date_only else dt

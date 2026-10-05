@@ -8,9 +8,9 @@ from typing import Any
 
 from tqdm import tqdm
 
-from ._statistics import StatisticsComponent
-from .._dbutil import DatabaseConnection
 from ..._util import min_max_encode
+from .._dbutil import DatabaseConnection
+from ._statistics import StatisticsComponent
 
 
 class FastgresMinMaxComponent(StatisticsComponent):
@@ -49,7 +49,7 @@ class FastgresMinMaxComponent(StatisticsComponent):
             obj.dict = json.load(f, cls=obj.MinMaxDecoder)
         return obj
 
-    def transform(self, table: str, column: str, to_encode: int | float) -> int | float:
+    def transform(self, table: str, column: str, to_encode: float) -> int | float:
         min_value, max_value = self.get(table, column)
         if min_value is None or max_value is None:
             return 1.0

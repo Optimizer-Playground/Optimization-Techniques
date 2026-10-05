@@ -1,9 +1,9 @@
 
-from ._featurizer import FastgresFeaturization, EncodingInformation
 from ._dbutil import DatabaseConnection
+from ._featurizer import EncodingInformation, FastgresFeaturization
 
 __all__ = [
-    "FastgresFeaturization",
-    "EncodingInformation",
     "DatabaseConnection",
+    "EncodingInformation",
+    "FastgresFeaturization",
 ]

@@ -27,28 +27,20 @@ def _resolve_ignore_tables(
             continue
 
         table_pattern = re.compile(spec.replace("*", ".*"))
-        matching_tables = [
-            tab for tab in candidate_tables if table_pattern.match(tab.full_name)
-        ]
+        matching_tables = [tab for tab in candidate_tables if table_pattern.match(tab.full_name)]
         ignored.update(matching_tables)
 
     return ignored
 
 
-def _prewarm_tables(
-    tables: set[pb.TableReference], *, pg_instance: pb.postgres.PostgresDatabase
-) -> None:
+def _prewarm_tables(tables: set[pb.TableReference], *, pg_instance: pb.postgres.PostgresDatabase) -> None:
     if not pg_instance.has_extension("pg_prewarm"):
-        print(
-            "pg_prewarm seems to be unavailable. Skipping prewarming.", file=sys.stderr
-        )
+        print("pg_prewarm seems to be unavailable. Skipping prewarming.", file=sys.stderr)
         return
 
     # We start the prewarming with the smallest tables because they are cheap to re-load if the shared buffer is not large
     # enough to fit all tables. Ideally, this enables us to keep the large tables mostly in the buffer.
-    tables_by_size = sorted(
-        tables, key=lambda tab: pg_instance.statistics().total_rows(tab) or -1
-    )
+    tables_by_size = sorted(tables, key=lambda tab: pg_instance.statistics().total_rows(tab) or -1)
     for tab in tables_by_size:
         pg_instance.prewarm_tables(tab)
 
@@ -68,13 +60,11 @@ def main() -> None:
     parser.add_argument(
         "--db-connect",
         "-c",
-        help="Postgres connection string. "
-        "If omitted, the connection must be specified via --db-config.",
+        help="Postgres connection string. If omitted, the connection must be specified via --db-config.",
     )
     parser.add_argument(
         "--db-config",
-        help="Path to a Postgres configuration file. "
-        "If omitted, the connection must be specified via --db-connect.",
+        help="Path to a Postgres configuration file. If omitted, the connection must be specified via --db-connect.",
     )
     parser.add_argument(
         "--n-queries",
@@ -93,8 +83,7 @@ def main() -> None:
         "--max-tables",
         type=int,
         default=None,
-        help="The maximum number of tables to include in a query. "
-        "If omitted, all available tables can be used.",
+        help="The maximum number of tables to include in a query. If omitted, all available tables can be used.",
     )
     parser.add_argument(
         "--min-filters",
@@ -122,14 +111,12 @@ def main() -> None:
         "--projection",
         choices=["star", "countstar"],
         default="star",
-        help="Whether the generated queries "
-        "should feature SELECT * or SELECT COUNT(*) clauses.",
+        help="Whether the generated queries should feature SELECT * or SELECT COUNT(*) clauses.",
     )
     parser.add_argument(
         "--filter-keys",
         action="store_true",
-        help="Whether primary key and foreign key columns should be "
-        "included in the filter predicates.",
+        help="Whether primary key and foreign key columns should be included in the filter predicates.",
     )
     parser.add_argument(
         "--numeric-filters",
@@ -139,8 +126,7 @@ def main() -> None:
     parser.add_argument(
         "--query-prefix",
         default="q-",
-        help="How to name the generated queries. Queries are labelled "
-        "<prefix><number>.",
+        help="How to name the generated queries. Queries are labelled <prefix><number>.",
     )
     parser.add_argument(
         "--output-mode",
@@ -151,9 +137,7 @@ def main() -> None:
         "Each query goes to a separate row, with a label column according to the query prefix and a "
         "query column.",
     )
-    parser.add_argument(
-        "--verbose", action="store_true", help="Print progress information"
-    )
+    parser.add_argument("--verbose", action="store_true", help="Print progress information")
     parser.add_argument(
         "out_path",
         help="File path to write the generated queries to. For plain-mode, this is treated as a "
@@ -172,9 +156,7 @@ def main() -> None:
 
     ignored_tables = _resolve_ignore_tables(args.ignore_tables, pg_instance=pg_instance)
     count_star = args.projection == "countstar"
-    _prewarm_tables(
-        pg_instance.schema().tables() - ignored_tables, pg_instance=pg_instance
-    )
+    _prewarm_tables(pg_instance.schema().tables() - ignored_tables, pg_instance=pg_instance)
 
     query_hashes: set[int] = set()
     generated_queries: list[tuple[str, pb.SqlQuery]] = []
@@ -211,11 +193,8 @@ def main() -> None:
             out_path = pathlib.Path(args.out_path)
             out_path.parent.mkdir(parents=True, exist_ok=True)
             df = pd.DataFrame(
-                [
-                    (label, pb.qal.format_quick(query))
-                    for label, query in generated_queries
-                ],
-                columns=["label", "query"],
+                [(label, pb.qal.format_quick(query)) for label, query in generated_queries],
+                columns=["label", "query"],  # type: ignore
             )
             df.to_csv(out_path, index=False)
 

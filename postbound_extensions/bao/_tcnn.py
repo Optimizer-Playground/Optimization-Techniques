@@ -21,12 +21,12 @@
 from __future__ import annotations
 
 import torch
-import torch.nn as nn
+from torch import nn
 
 
 class BinaryTreeConv(nn.Module):
     def __init__(self, in_channels, out_channels):
-        super(BinaryTreeConv, self).__init__()
+        super().__init__()
 
         self.__in_channels = in_channels
         self.__out_channels = out_channels
@@ -50,7 +50,7 @@ class BinaryTreeConv(nn.Module):
 
 class TreeActivation(nn.Module):
     def __init__(self, activation):
-        super(TreeActivation, self).__init__()
+        super().__init__()
         self.activation = activation
 
     def forward(self, x):

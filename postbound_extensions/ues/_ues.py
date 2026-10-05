@@ -39,7 +39,10 @@ def _is_unique(column: pb.ColumnReference, *, database: pb.Database) -> bool:
 
 
 def _determine_table_types(
-    query: pb.qal.SelectStatement, *, consumed: set[pb.TableReference], schema: pb.db.DatabaseSchema
+    query: pb.qal.SelectStatement,
+    *,
+    consumed: set[pb.TableReference],
+    schema: pb.db.DatabaseSchema,
 ) -> tuple[list[pb.TableReference], Mapping[pb.TableReference, set[pb.TableReference]]]:
     """Determines expanding and filtering tables in the query.
 
@@ -101,7 +104,9 @@ def _determine_table_types(
     return expanding_tables, filter_tables
 
 
-def _determine_join_keys(query: pb.qal.SelectStatement) -> Mapping[pb.TableReference, set[pb.ColumnReference]]:
+def _determine_join_keys(
+    query: pb.qal.SelectStatement,
+) -> Mapping[pb.TableReference, set[pb.ColumnReference]]:
     """For each table in the query, provides the columns that are used in join predicates."""
     result = collections.defaultdict(set)
     for join_pred in query.joins():
@@ -169,7 +174,10 @@ def _update_novel_freqs(
 
 
 def _update_bound_freqs(
-    max_freqs: Mapping[pb.ColumnReference, int], *, bound_tables: set[pb.TableReference], multiplier: int
+    max_freqs: Mapping[pb.ColumnReference, int],
+    *,
+    bound_tables: set[pb.TableReference],
+    multiplier: int,
 ) -> Mapping[pb.ColumnReference, int]:
     """Sets the maximum frequencies of all existing join keys such that they reflect increases after expanding joins.
 
@@ -275,7 +283,11 @@ class UesJoinOrdering(pb.JoinOrdering):
         while expanding_tables:
             upper = {
                 tab: self._filter_bound(
-                    tab, query=query, filter_tables=filter_tables[tab], base_cards=base_cards, max_freqs=max_freqs
+                    tab,
+                    query=query,
+                    filter_tables=filter_tables[tab],
+                    base_cards=base_cards,
+                    max_freqs=max_freqs,
                 )
                 for tab in expanding_tables
             }
@@ -292,7 +304,9 @@ class UesJoinOrdering(pb.JoinOrdering):
                 # Note that _greedy_order_filters() is yet another addition/modification. See its documentation for
                 # more details.
                 initial_filters = self._greedy_order_filters(
-                    filter_tables[initial_tab], filter_tables=filter_tables, base_cards=base_cards
+                    filter_tables[initial_tab],
+                    filter_tables=filter_tables,
+                    base_cards=base_cards,
                 )
                 join_sequence = [initial_tab] + list(initial_filters)
                 join_tree = self._expand_to_join_tree(join_sequence, query=query)
@@ -304,7 +318,11 @@ class UesJoinOrdering(pb.JoinOrdering):
                     query, consumed=join_tree.tables(), schema=self._database.schema()
                 )
                 max_freqs = _update_novel_freqs(
-                    max_freqs, multiplier=1, join_sequence=join_sequence, join_keys=join_keys, query=query
+                    max_freqs,
+                    multiplier=1,
+                    join_sequence=join_sequence,
+                    join_keys=join_keys,
+                    query=query,
                 )
                 continue
 
@@ -329,7 +347,10 @@ class UesJoinOrdering(pb.JoinOrdering):
                         continue
 
                     current_upper = (
-                        min(total_upper / max_freqs[bound_col], upper[candidate] / max_freqs[partner_col])
+                        min(
+                            total_upper / max_freqs[bound_col],
+                            upper[candidate] / max_freqs[partner_col],
+                        )
                         * max_freqs[bound_col]
                         * max_freqs[partner_col]
                     )
@@ -343,7 +364,9 @@ class UesJoinOrdering(pb.JoinOrdering):
                     bound_freq = max_freqs[bound_col]
 
             filter_sequence = self._greedy_order_filters(
-                filter_tables[best_candidate], filter_tables=filter_tables, base_cards=base_cards
+                filter_tables[best_candidate],
+                filter_tables=filter_tables,
+                base_cards=base_cards,
             )
 
             # PostBOUND addition:
@@ -406,10 +429,17 @@ class UesJoinOrdering(pb.JoinOrdering):
         return join_tree
 
     def describe(self) -> pb.util.jsondict:
-        return {"name": "ues", "estimation_type": self._estimation_type, "database": self._database.describe()}
+        return {
+            "name": "ues",
+            "estimation_type": self._estimation_type,
+            "database": self._database.describe(),
+        }
 
     def pre_check(self) -> pb.validation.OptimizationPreCheck:
-        ues_checks = [pb.validation.EquiJoinPreCheck(), pb.validation.CrossProductPreCheck()]
+        ues_checks = [
+            pb.validation.EquiJoinPreCheck(),
+            pb.validation.CrossProductPreCheck(),
+        ]
         return super().pre_check().merge_with(ues_checks)
 
     def _perfect_card_est(self, query: pb.SqlQuery) -> pb.Cardinality:
@@ -419,7 +449,11 @@ class UesJoinOrdering(pb.JoinOrdering):
         return pb.Cardinality.of(card)
 
     def _use_as_outer(
-        self, query: pb.qal.SelectStatement, *, bound: set[pb.TableReference], partners: set[pb.TableReference]
+        self,
+        query: pb.qal.SelectStatement,
+        *,
+        bound: set[pb.TableReference],
+        partners: set[pb.TableReference],
     ) -> bool:
         """Determines, whether `bound` and `partners` should be joined with partners as outer relation.
 
@@ -451,7 +485,10 @@ class UesJoinOrdering(pb.JoinOrdering):
         return join_tree
 
     def _optimize_star_query(
-        self, query: pb.qal.SelectStatement, *, filter_tables: Mapping[pb.TableReference, set[pb.TableReference]]
+        self,
+        query: pb.qal.SelectStatement,
+        *,
+        filter_tables: Mapping[pb.TableReference, set[pb.TableReference]],
     ) -> pb.JoinTree:
         """Greedy join ordering for star queries.
 

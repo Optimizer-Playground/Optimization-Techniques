@@ -1,27 +1,38 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
-from dataclasses import field
+from collections.abc import Collection, Sequence
+from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Sequence, Collection
 
 import numpy as np
 import postbound as pb
-from postbound.qal import CompoundPredicate, AbstractPredicate, UnaryPredicate, InPredicate, BetweenPredicate, \
-    BinaryPredicate, SimpleFilter, LogicalOperator
+from postbound.qal import (
+    AbstractPredicate,
+    BetweenPredicate,
+    BinaryPredicate,
+    CompoundPredicate,
+    InPredicate,
+    LogicalOperator,
+    SimpleFilter,
+    UnaryPredicate,
+)
 from tqdm.contrib.bells import tqdm
 
-from ._dbutil import DatabaseConnection
-from .data_gen import FastgresMinMaxComponent, FastgresStringComponent, FastgresWildcardComponent, StatisticsComponent
 from .._util import load_json, prepare_dir
-from ..context import ContextManager, Context
+from ..context import Context, ContextManager
+from ._dbutil import DatabaseConnection
+from .data_gen import (
+    FastgresMinMaxComponent,
+    FastgresStringComponent,
+    FastgresWildcardComponent,
+    StatisticsComponent,
+)
 
 
 class ModuleError(Exception):
     """Exception raised for errors in a feature module."""
-    pass
 
 
 @dataclass

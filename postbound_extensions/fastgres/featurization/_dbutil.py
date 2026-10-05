@@ -1,9 +1,10 @@
 
+import textwrap
+from collections.abc import Iterable
+from datetime import datetime
+
 import postbound as pb
 from postbound import ColumnReference, TableReference
-from typing import Iterable
-import textwrap
-from datetime import datetime
 from postbound.qal import LogicalOperator
 
 
@@ -43,7 +44,7 @@ class DatabaseConnection:
     def min_max(self, column: ColumnReference) -> tuple[int | float | datetime, int | float | datetime]:
         c_n = column.name
         query = textwrap.dedent(f"""
-                        SELECT MIN({c_n}), MAX({c_n}) 
+                        SELECT MIN({c_n}), MAX({c_n})
                         FROM {column.table.full_name}
                         """)
         self.pbc.cursor().execute(query)
@@ -52,7 +53,7 @@ class DatabaseConnection:
     def column_count(self, column: ColumnReference) -> list[tuple[str, int]]:
         c_n = column.name
         query = textwrap.dedent(f"""
-                SELECT {c_n}, COUNT({c_n}) 
+                SELECT {c_n}, COUNT({c_n})
                 FROM {column.table.full_name}
                 GROUP BY {c_n}
                 """)
@@ -61,7 +62,7 @@ class DatabaseConnection:
 
     def cardinality(self, table: TableReference) -> int:
         query = textwrap.dedent(f"""
-                        SELECT COUNT(*) 
+                        SELECT COUNT(*)
                         FROM {table.full_name}
                         """)
         cursor = self.pbc.cursor().execute(query)

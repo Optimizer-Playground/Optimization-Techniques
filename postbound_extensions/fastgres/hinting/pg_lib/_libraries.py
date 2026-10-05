@@ -1,6 +1,13 @@
-from ..pg_lib._postgres_hints import (CORE_HINTS, PG12_HINTS, PG13_HINTS, PG14_HINTS, PG15_HINTS,
-                                      PG16_HINTS, PG17_HINTS)
 from .._hint_library import HintLibrary
+from ..pg_lib._postgres_hints import (
+                                      CORE_HINTS,
+                                      PG12_HINTS,
+                                      PG13_HINTS,
+                                      PG14_HINTS,
+                                      PG15_HINTS,
+                                      PG16_HINTS,
+                                      PG17_HINTS,
+)
 
 CORE_HINT_LIBRARY = HintLibrary(CORE_HINTS)
 PG_12_LIBRARY = HintLibrary(PG12_HINTS)

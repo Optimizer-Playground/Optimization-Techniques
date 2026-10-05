@@ -2380,7 +2380,7 @@ class SafeBoundCatalog:
         --------
         SafeBoundSpec.default : For details on the default hyperparameters
         """
-        build_start = datetime.now()
+        build_start = datetime.now()  # noqa -  let's not worry about timezones for now
 
         eq_pcfs_repo = build_equality_mcvs(
             catalog_spec,
@@ -2410,7 +2410,7 @@ class SafeBoundCatalog:
             verbose=verbose,
         )
 
-        build_end = datetime.now()
+        build_end = datetime.now()  # noqa -  let's not worry about timezones for now
         construction_time = build_end - build_start
 
         catalog = SafeBoundCatalog(

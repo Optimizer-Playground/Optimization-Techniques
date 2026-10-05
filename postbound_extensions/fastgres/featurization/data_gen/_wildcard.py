@@ -1,17 +1,25 @@
 
 from __future__ import annotations
 
+from collections.abc import Collection, Sequence
 from pathlib import Path
-from typing import Collection, Sequence
 
 import postbound as pb
-from postbound.qal import BinaryPredicate, BetweenPredicate, InPredicate, UnaryPredicate, CompoundPredicate, \
-    AbstractPredicate, LogicalOperator, SimpleFilter
+from postbound.qal import (
+    AbstractPredicate,
+    BetweenPredicate,
+    BinaryPredicate,
+    CompoundPredicate,
+    InPredicate,
+    LogicalOperator,
+    SimpleFilter,
+    UnaryPredicate,
+)
 from tqdm import tqdm
 
-from ._statistics import StatisticsComponent
+from ..._util import load_json, min_max_encode, save_json
 from .._dbutil import DatabaseConnection
-from ..._util import load_json, save_json, min_max_encode
+from ._statistics import StatisticsComponent
 
 
 class WildcardCollector(pb.qal.PredicateVisitor[Collection[pb.qal.SimpleFilter]]):

@@ -1,7 +1,8 @@
 import json
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Optional, Iterable
+from typing import Any
 
 import numpy as np
 import onnx
@@ -11,11 +12,10 @@ from skl2onnx import convert_sklearn
 from skl2onnx.common.data_types import FloatTensorType
 from sklearn.ensemble import GradientBoostingClassifier
 
-from .._util import load_json, save_json, prepare_dir
-from ..context import Context, ContextFactory
-from ..context import ContextManager
-from ..context import DatabaseSchema
+from .._util import load_json, prepare_dir, save_json
+from ..context import Context, ContextFactory, ContextManager, DatabaseSchema
 from ..featurization import FastgresFeaturization
+
 # from ._base import BaseModel
 # from ._context_base import ContextModel
 from ..labeling import FastgresLabelProvider
@@ -25,7 +25,7 @@ class FastgresModel:
 
     def __init__(self, **gb_kwargs):
         self._live_model: GradientBoostingClassifier = GradientBoostingClassifier(**gb_kwargs)
-        self._onnx_model: Optional[onnx.ModelProto] = None
+        self._onnx_model: onnx.ModelProto | None = None
 
     def fit(self, x, y):
         if self._onnx_model is not None:

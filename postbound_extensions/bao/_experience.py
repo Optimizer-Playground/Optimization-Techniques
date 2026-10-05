@@ -23,7 +23,6 @@ import json
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
 
 import pandas as pd
 import postbound as pb
@@ -115,16 +114,10 @@ class BaoExperience(Dataset[tuple[torch.Tensor, torch.Tensor, float]]):
         )
 
     @staticmethod
-    def load_or_build(
-        archive: Path | str, *, featurizer: BaoFeaturizer
-    ) -> BaoExperience:
+    def load_or_build(archive: Path | str, *, featurizer: BaoFeaturizer) -> BaoExperience:
         """Loads experience from archive if it exists. Otherwise, creates a new experience."""
         archive = Path(archive)
-        return (
-            BaoExperience.load(archive, featurizer=featurizer)
-            if archive.is_file()
-            else BaoExperience(featurizer)
-        )
+        return BaoExperience.load(archive, featurizer=featurizer) if archive.is_file() else BaoExperience(featurizer)
 
     def __init__(
         self,
@@ -132,24 +125,20 @@ class BaoExperience(Dataset[tuple[torch.Tensor, torch.Tensor, float]]):
         *,
         sample_window: int = 2000,
         retraining_frequency: int = 100,
-        existing_samples: Optional[Iterable[BaoSample]] = None,
+        existing_samples: Iterable[BaoSample] | None = None,
     ) -> None:
         self._featurizer = featurizer
         self._window = sample_window
         self._retrain_freq = retraining_frequency
 
-        self._storage: collections.deque[BaoSample] = collections.deque(
-            maxlen=self._window
-        )
+        self._storage: collections.deque[BaoSample] = collections.deque(maxlen=self._window)
         if existing_samples is not None:
             self._storage.extend(existing_samples)
 
         self._new_samples = 0
-        self._cache_state: Optional[DatabaseCacheState] = None
+        self._cache_state: DatabaseCacheState | None = None
 
-    def add(
-        self, plan: pb.QueryPlan | BaoSample, runtime_ms: Optional[float] = None
-    ) -> None:
+    def add(self, plan: pb.QueryPlan | BaoSample, runtime_ms: float | None = None) -> None:
         """Store a new sample in the experience.
 
         If the sample is given as a `BaoSample`, the runtime can be omitted. For plain query plans,
@@ -161,9 +150,7 @@ class BaoExperience(Dataset[tuple[torch.Tensor, torch.Tensor, float]]):
             return
 
         if runtime_ms is None:
-            raise ValueError(
-                "runtime_ms is required if plan is supplied as a QueryPlan"
-            )
+            raise ValueError("runtime_ms is required if plan is supplied as a QueryPlan")
         elif not isinstance(plan, pb.QueryPlan):
             raise ValueError("plan must be a QueryPlan")
 
@@ -193,9 +180,7 @@ class BaoExperience(Dataset[tuple[torch.Tensor, torch.Tensor, float]]):
         """Removes all samples from the experience."""
         self._storage.clear()
 
-    def store(
-        self, catalog_path: Path | str, *, experience_path: Optional[Path | str] = None
-    ) -> None:
+    def store(self, catalog_path: Path | str, *, experience_path: Path | str | None = None) -> None:
         """Persists the current experience to disk.
 
         Parameters
@@ -208,9 +193,7 @@ class BaoExperience(Dataset[tuple[torch.Tensor, torch.Tensor, float]]):
         """
         catalog_path = Path(catalog_path)
         catalog_path.parent.mkdir(parents=True, exist_ok=True)
-        experience_path = experience_path or (
-            catalog_path.parent / "experience.parquet"
-        )
+        experience_path = experience_path or (catalog_path.parent / "experience.parquet")
         experience_path = Path(experience_path)
         experience_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -230,8 +213,6 @@ class BaoExperience(Dataset[tuple[torch.Tensor, torch.Tensor, float]]):
 
     def __getitem__(self, index):
         sample = self._storage[index]
-        featurized = self._featurizer.encode_plan(
-            sample.plan, cache_state=self._cache_state
-        )
+        featurized = self._featurizer.encode_plan(sample.plan, cache_state=self._cache_state)
         scaled_runtime = self._featurizer.transform_runtime([(sample.runtime_ms,)])
         return (featurized, scaled_runtime)

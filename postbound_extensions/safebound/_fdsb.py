@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Generator, Iterable, Mapping
 from dataclasses import dataclass
-from typing import Optional, overload
+from typing import overload
 
 import networkx as nx
 import numpy as np
@@ -76,9 +76,7 @@ class AlphaStep:
 
         res = np.ones_like(vals)
         for fn in self._fns:
-            res = (  #
-                res * fn.evaluate_at(vals)  #
-            )  # see https://stackoverflow.com/a/38677336
+            res = res * fn.evaluate_at(vals)  # see https://stackoverflow.com/a/38677336
         return res
 
     def cumulative_at(self, vals: np.ndarray) -> np.ndarray:
@@ -141,7 +139,7 @@ class AlphaStep:
                 continue
 
             if not isinstance(fn, (AlphaStep, BetaStep)):
-                raise ValueError(f"Unknown function type {type(fn).__name__}: {fn}")
+                raise TypeError(f"Unknown function type {type(fn).__name__}: {fn}")
 
             nested_inspect = fn._inspect_internal()
             nested_inspect[0] = f"{padding} +- {nested_inspect[0]}"
@@ -275,9 +273,7 @@ class BetaStep:
         for join in self._dimension_joins:
             fact_pcf, dim_pcf = join.fact_pcf, join.dimension_pcf
             dimension_idx = fact_pcf.invert_cumulative_at(cumulative)
-            res = (  #
-                res * dim_pcf.evaluate_at(dimension_idx)  #
-            )  # see https://stackoverflow.com/a/38677336
+            res = res * dim_pcf.evaluate_at(dimension_idx)  # see https://stackoverflow.com/a/38677336
 
         return res
 
@@ -329,7 +325,7 @@ class BetaStep:
         for dim_join in self._dimension_joins:
             fact_pcf = dim_join.fact_pcf
             if not isinstance(fact_pcf, PiecewiseConstantFn):
-                raise ValueError(f"Expected PiecewiseConstantFn for fact side of dimension join, got {type(fact_pcf)}")
+                raise TypeError(f"Expected PiecewiseConstantFn for fact side of dimension join, got {type(fact_pcf)}")
 
             lines.append(f"{padding}+- fact col {fact_pcf.column}::")
             dim_pcf = dim_join.dimension_pcf
@@ -384,7 +380,7 @@ class BetaStep:
 
     def __repr__(self) -> str:
         components = ", ".join(repr(fn) for fn in self._dimension_joins)
-        return f"BetaStep(relations=[{components}], projection={repr(self._proj)})"
+        return f"BetaStep(relations=[{components}], projection={self._proj!r})"
 
     def __str__(self) -> str:
         components = ", ".join(str(fn) for fn in self._dimension_joins)
@@ -538,7 +534,7 @@ def _select_acyclic_root(join_graph: nx.Graph) -> pb.TableReference:
 
 def decompose_acyclic(
     join_graph: nx.Graph,
-    root: Optional[pb.TableReference] = None,
+    root: pb.TableReference | None = None,
     *,
     statistics: Mapping[pb.ColumnReference, PiecewiseConstantFn],
 ) -> AlphaStep:

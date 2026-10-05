@@ -20,9 +20,9 @@ Modified by: Rico Bergmann
 """
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 from postbound.util import Logger
+from torch import nn
 
 from ..util import wrap_logger
 
@@ -38,7 +38,7 @@ class SetConv(nn.Module):
         hidden_units: int = 256,
         verbose: bool | Logger = False,
     ):
-        super(SetConv, self).__init__()
+        super().__init__()
         log = wrap_logger(verbose)
 
         sample_feats = n_tables
@@ -79,9 +79,7 @@ class SetConv(nn.Module):
         hid_sample = torch.sum(hid_sample, dim=1, keepdim=False)
         sample_norm = sample_mask.sum(1, keepdim=False)
         sample_norm[sample_norm == 0] = float("-inf")
-        hid_sample = (
-            hid_sample / sample_norm
-        )  # Calculate average only over non-masked parts
+        hid_sample = hid_sample / sample_norm  # Calculate average only over non-masked parts
 
         hid_predicate = F.relu(self.predicate_mlp1(predicates))
         hid_predicate = F.relu(self.predicate_mlp2(hid_predicate))

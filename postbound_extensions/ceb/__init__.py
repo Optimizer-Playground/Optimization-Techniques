@@ -15,10 +15,10 @@ from ._ceb import (
 
 __all__ = [
     "ColumnName",
-    "PredicateName",
     "PlaceHolderValue",
     "PlaceholderName",
     "PredicateGenerator",
+    "PredicateName",
     "PredicateType",
     "QueryTemplate",
     "SamplingError",

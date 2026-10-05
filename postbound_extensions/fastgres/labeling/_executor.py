@@ -1,11 +1,10 @@
 from dataclasses import dataclass
-from typing import Optional
 
+import postbound as pb
 from postbound.postgres import PostgresExplainPlan
 
 from .._util import FgPbConverter
 from ..hinting import HintSet
-import postbound as pb
 
 
 @dataclass(frozen=True)
@@ -16,19 +15,19 @@ class ResultSet:
     time: float
     timeout_used: float
     timed_out: bool
-    explain_plan: Optional[PostgresExplainPlan]
+    explain_plan: PostgresExplainPlan | None
 
     def __post_init__(self):
         if not isinstance(self.explain_plan, PostgresExplainPlan) and self.explain_plan is not None:
             raise ValueError("Explain Plan is not a PostgresExplainPlan")
 
-def no_geqo(params: Optional[pb.PlanParameterization] = None) -> pb.PlanParameterization:
+def no_geqo(params: pb.PlanParameterization | None = None) -> pb.PlanParameterization:
     if params is None:
         params = pb.PlanParameterization()
     params.set_system_settings(geqo="off")
     return params
 
-def no_para(params: Optional[pb.PlanParameterization] = None) -> pb.PlanParameterization:
+def no_para(params: pb.PlanParameterization | None = None) -> pb.PlanParameterization:
     if params is None:
         params = pb.PlanParameterization()
     params.set_system_settings(max_parallel_workers_per_gather=0)
@@ -51,11 +50,11 @@ class QueryExecutor:
             self,
             query_str: str,
             hint_set: HintSet,
-            timeout_s: Optional[float] = None,
+            timeout_s: float | None = None,
             explain: bool = False,
             explain_analyze: bool = False,
             *,
-            plan_parameters: Optional[pb.PlanParameterization] = None,
+            plan_parameters: pb.PlanParameterization | None = None,
     ) -> ResultSet:
 
         plan_params = self._plan_params if self._plan_params is not None else None

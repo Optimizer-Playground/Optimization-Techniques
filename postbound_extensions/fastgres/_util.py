@@ -1,14 +1,19 @@
 import json
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Optional, Any
+from typing import Any
 
 from bidict import bidict
-from postbound import PhysicalOperator, ScanOperator, JoinOperator, PhysicalOperatorAssignment
+from postbound import (
+    JoinOperator,
+    PhysicalOperator,
+    PhysicalOperatorAssignment,
+    ScanOperator,
+)
 from postbound.qal import LogicalOperator
-
-from .hinting import HintSetFactory, HintSet, CORE_HINT_LIBRARY, HintLibrary
 from tqdm import tqdm
+
+from .hinting import CORE_HINT_LIBRARY, HintLibrary, HintSet, HintSetFactory
 
 
 def prepare_dir(path: Path) -> None:
@@ -24,10 +29,10 @@ def prepare_dir(path: Path) -> None:
 
 
 def min_max_encode(
-        to_encode: int | float | datetime,
-        min_value: int | float | datetime,
-        max_value: int | float | datetime,
-        offset: int | float | timedelta,
+        to_encode: float | datetime,
+        min_value: float | datetime,
+        max_value: float | datetime,
+        offset: float | timedelta,
         round_values: int = 4
 ) -> int | float:
     return round((to_encode + offset - min_value) / (max_value - min_value + offset), round_values)
@@ -118,7 +123,7 @@ class FgPbConverter:
     def pb_to_fg_hint_set(
             self,
             pb_hs: PhysicalOperatorAssignment,
-            hint_library: Optional[HintLibrary] = CORE_HINT_LIBRARY
+            hint_library: HintLibrary | None = CORE_HINT_LIBRARY
     ) -> HintSet:
 
         db_instructions = [hint.db_instr for hint in hint_library.hint_list]

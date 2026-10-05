@@ -21,12 +21,12 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable
-from typing import Optional, cast
+from typing import cast
 
 import numpy as np
 import torch
 
-type TreeTraversal[NodeT] = Callable[[NodeT], Optional[NodeT]]
+type TreeTraversal[NodeT] = Callable[[NodeT], NodeT | None]
 
 type NodeFlatten[NodeT] = Callable[[NodeT], np.ndarray]
 
@@ -78,7 +78,7 @@ def _flatten[NodeT](
 
     try:
         accum = [np.zeros_like(accum[0])] + accum
-    except Exception:
+    except Exception:  # noqa
         raise TreeConvolutionError("Output of transformer must have a .shape (e.g., numpy array)")
 
     return np.stack(accum)

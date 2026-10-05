@@ -102,7 +102,7 @@ class PostgresSamplerCtl:
             worker = threading.Thread(
                 target=sampling_worker,
                 args=(self._sampler,),
-                kwargs=dict(ctl=self),
+                kwargs={"ctl": self},
                 name="SamplingWorker",
             )
             self._workers.append(worker)
@@ -112,9 +112,7 @@ class PostgresSamplerCtl:
         self._close_backends_nolock()
         self._join_workers_nolock()
 
-    def process_result(
-        self, query: pb.SqlQuery, plan: pb.postgres.PostgresPlan
-    ) -> None:
+    def process_result(self, query: pb.SqlQuery, plan: pb.postgres.PostgresPlan) -> None:
         with self._critical_guard:
             if plan.root.true_cardinality == 0 and not self.allow_zero_tuples:
                 return
@@ -134,9 +132,7 @@ class PostgresSamplerCtl:
             if self._n_generated >= self._n_requested:
                 self.done.set()
 
-    def obtain_pg_backend(
-        self, prev_handle: BackendHandle | None = None
-    ) -> tuple[BackendHandle, psycopg.Connection]:
+    def obtain_pg_backend(self, prev_handle: BackendHandle | None = None) -> tuple[BackendHandle, psycopg.Connection]:
         if self.done.is_set():
             return -1, None  # type: ignore
 
@@ -153,7 +149,7 @@ class PostgresSamplerCtl:
 
             try:
                 prev_conn.close()
-            except Exception:
+            except psycopg.Error:
                 pass
 
         return handle, conn
@@ -203,7 +199,7 @@ def sampling_worker(query_sampler: QuerySampler, *, ctl: PostgresSamplerCtl) -> 
                 # Timeout - do nothing, we just try again
                 conn.rollback()
                 continue
-            except Exception as e:
+            except psycopg.Error as e:
                 # Something went wrong and our connection might be bricked. We obtain a new one
                 # just to be save
                 stack_trace = traceback.format_exc()

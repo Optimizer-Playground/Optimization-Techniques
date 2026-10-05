@@ -32,7 +32,7 @@ def estimate_cardinalities(
     for query in query_iter:
         try:
             card = estimator.calculate_estimate(query, query.tables())
-        except Exception as e:
+        except Exception as e:  # noqa
             if isinstance(e, InterruptedError) or str(e) == "Query interrupted":
                 # DuckDB does not raise an interrupted error but instead a generic exception with interrupted
                 # in the text. What is even weirder, is that execution usually continues with the next query instead

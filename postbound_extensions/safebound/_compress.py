@@ -18,10 +18,7 @@ def valid_compress(ds: DegreeSequence, *, accuracy: float) -> PiecewiseLinearFn:
     for i in range(ds.distinct_values):
         deg = ds[i]
         slope = segments[-1].slope
-        error += (
-            (slope**2) * (deg / slope)  #
-            - (deg**2)  #
-        )
+        error += (slope**2) * (deg / slope) - (deg**2)
 
         if error >= err_threshold:
             next_segment = Segment.after(segments[-1], slope=deg)

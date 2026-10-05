@@ -5,6 +5,7 @@ from __future__ import annotations
 import collections
 import itertools
 import random
+from collections import Counter
 from collections.abc import Generator, Iterable, Mapping, Sequence
 from typing import Any, Literal
 
@@ -280,8 +281,8 @@ class _SampleSpec:
     def derive_from_workload(workload: pb.Workload, *, database: pb.Database) -> _SampleSpec:
         predicate_collector = _PredicateCollector()
         tables: set[pb.TableReference] = set()
-        min_tables, max_tables = float("inf"), 0
-        min_filters, max_filters = float("inf"), 0
+        min_tables, max_tables = 999_999, 0
+        min_filters, max_filters = 999_999, 0
         for query in workload.queries():
             predicate_collector.visit_query_predicates(query)
             tables.update(tab.drop_alias() for tab in query.tables())
@@ -313,7 +314,7 @@ class _SampleSpec:
                 table_specs[tab] = _TableSpec.empty(tab)
                 continue
 
-            filter_columns = {col.column: col for col in cols}
+            filter_columns: Mapping[pb.ColumnReference, _ColSpec] = {col.column: col for col in cols}
             table_specs[tab] = _TableSpec(table=tab, filter_columns=filter_columns)
 
         return _SampleSpec(
@@ -329,7 +330,7 @@ class _SampleSpec:
     def __init__(
         self,
         tables: Mapping[pb.TableReference, _TableSpec],
-        filter_weights: Mapping[pb.ColumnReference, int],
+        filter_weights: Mapping[pb.ColumnReference, int] | Counter[pb.BoundColumnReference],
         joins: nx.Graph,
         min_tables: int,
         max_tables: int,
