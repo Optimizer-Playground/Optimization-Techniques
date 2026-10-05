@@ -13,7 +13,7 @@ from postbound_extensions import sampler
 
 
 def _resolve_ignore_tables(
-    table_specifiers: list[str], *, pg_instance: pb.postgres.PostgresInterface
+    table_specifiers: list[str], *, pg_instance: pb.postgres.PostgresDatabase
 ) -> set[pb.TableReference]:
     if not table_specifiers:
         return set()
@@ -36,7 +36,7 @@ def _resolve_ignore_tables(
 
 
 def _prewarm_tables(
-    tables: set[pb.TableReference], *, pg_instance: pb.postgres.PostgresInterface
+    tables: set[pb.TableReference], *, pg_instance: pb.postgres.PostgresDatabase
 ) -> None:
     if not pg_instance.has_extension("pg_prewarm"):
         print(
@@ -47,7 +47,7 @@ def _prewarm_tables(
     # We start the prewarming with the smallest tables because they are cheap to re-load if the shared buffer is not large
     # enough to fit all tables. Ideally, this enables us to keep the large tables mostly in the buffer.
     tables_by_size = sorted(
-        tables, key=lambda tab: pg_instance.statistics().total_rows(tab)
+        tables, key=lambda tab: pg_instance.statistics().total_rows(tab) or -1
     )
     for tab in tables_by_size:
         pg_instance.prewarm_tables(tab)
@@ -186,8 +186,6 @@ def main() -> None:
         max_tables=args.max_tables,
         min_filters=args.min_filters,
         max_filters=args.max_filters,
-        filter_key_columns=args.filter_keys,
-        numeric_filters=args.numeric_filters,
     )
     for i in range(1, args.n_queries + 1):
         if args.verbose and i > 0 and i % 10 == 0:

@@ -21,7 +21,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable
-from typing import Optional
+from typing import Optional, cast
 
 import numpy as np
 import torch
@@ -37,16 +37,12 @@ class TreeConvolutionError(Exception):
     pass
 
 
-def _is_leaf[NodeT](
-    x: NodeT, left_child: TreeTraversal[NodeT], right_child: TreeTraversal[NodeT]
-) -> bool:
+def _is_leaf[NodeT](x: NodeT, left_child: TreeTraversal[NodeT], right_child: TreeTraversal[NodeT]) -> bool:
     has_left = left_child(x) is not None
     has_right = right_child(x) is not None
 
     if has_left != has_right:
-        raise TreeConvolutionError(
-            "All nodes must have both a left and a right child or no children"
-        )
+        raise TreeConvolutionError("All nodes must have both a left and a right child or no children")
 
     return not has_left
 
@@ -60,14 +56,11 @@ def _flatten[NodeT](
     """turns a tree into a flattened vector, preorder"""
 
     if not callable(transformer):
-        raise TreeConvolutionError(
-            "Transformer must be a function mapping a tree node to a vector"
-        )
+        raise TreeConvolutionError("Transformer must be a function mapping a tree node to a vector")
 
     if not callable(left_child) or not callable(right_child):
         raise TreeConvolutionError(
-            "left_child and right_child must be a function mapping a "
-            + "tree node to its child, or None"
+            "left_child and right_child must be a function mapping a " + "tree node to its child, or None"
         )
 
     accum: list[np.ndarray] = []
@@ -86,9 +79,7 @@ def _flatten[NodeT](
     try:
         accum = [np.zeros_like(accum[0])] + accum
     except Exception:
-        raise TreeConvolutionError(
-            "Output of transformer must have a .shape (e.g., numpy array)"
-        )
+        raise TreeConvolutionError("Output of transformer must have a .shape (e.g., numpy array)")
 
     return np.stack(accum)
 
@@ -103,8 +94,7 @@ def _preorder_indexes[NodeT](
 
     if not callable(left_child) or not callable(right_child):
         raise TreeConvolutionError(
-            "left_child and right_child must be a function mapping a "
-            + "tree node to its child, or None"
+            "left_child and right_child must be a function mapping a tree node to its child, or None"
         )
 
     if _is_leaf(root, left_child, right_child):
@@ -116,14 +106,12 @@ def _preorder_indexes[NodeT](
             return rightmost(tree[2])
         return tree
 
-    left_subtree = _preorder_indexes(
-        left_child(root), left_child, right_child, idx=idx + 1
-    )
+    left = cast(NodeT, left_child(root))
+    right = cast(NodeT, right_child(root))
+    left_subtree = _preorder_indexes(left, left_child, right_child, idx=idx + 1)
 
     max_index_in_left = rightmost(left_subtree)
-    right_subtree = _preorder_indexes(
-        right_child(root), left_child, right_child, idx=max_index_in_left + 1
-    )
+    right_subtree = _preorder_indexes(right, left_child, right_child, idx=max_index_in_left + 1)
 
     return (idx, left_subtree, right_subtree)
 
@@ -141,8 +129,7 @@ def _tree_conv_indexes[NodeT](
 
     if not callable(left_child) or not callable(right_child):
         raise TreeConvolutionError(
-            "left_child and right_child must be a function mapping a "
-            + "tree node to its child, or None"
+            "left_child and right_child must be a function mapping a " + "tree node to its child, or None"
         )
 
     index_tree = _preorder_indexes(root, left_child, right_child)
@@ -169,8 +156,7 @@ def _pad_and_combine(xs: list[np.ndarray]) -> np.ndarray:
     for itm in xs:
         if itm.dtype == np.dtype("object"):
             raise TreeConvolutionError(
-                "Transformer outputs could not be unified into an array. "
-                + "Are they all the same size?"
+                "Transformer outputs could not be unified into an array. " + "Are they all the same size?"
             )
 
     second_dim = xs[0].shape[1]
@@ -196,11 +182,7 @@ def prepare_trees[NodeT](
 ) -> tuple[torch.Tensor, torch.Tensor]:
     flat_trees = [_flatten(x, transformer, left_child, right_child) for x in trees]
     flat_trees = _pad_and_combine(flat_trees)
-    flat_trees = (
-        torch.Tensor(flat_trees)
-        if not isinstance(flat_trees, torch.Tensor)
-        else flat_trees
-    )
+    flat_trees = torch.Tensor(flat_trees) if not isinstance(flat_trees, torch.Tensor) else flat_trees
 
     # flat trees is now batch x max tree nodes x channels
     flat_trees = flat_trees.transpose(1, 2)

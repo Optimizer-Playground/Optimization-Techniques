@@ -12,13 +12,6 @@ import postbound as pb
 from torch.utils.data import Dataset
 
 
-def simplify_pred(pred: pb.qal.AbstractPredicate) -> pb.qal.SimpleFilter | None:
-    try:
-        return pb.qal.SimpleFilter.attempt_wrap(pred)
-    except Exception:
-        return None
-
-
 def distinct_values_query(col: pb.ColumnReference) -> pb.SqlQuery:
     """Creates an SQL query to load all distinct values for a specific table.
 
@@ -31,11 +24,7 @@ def distinct_values_query(col: pb.ColumnReference) -> pb.SqlQuery:
     from_clause = pb.qal.From.create_for(table)
     orderby_clause = pb.qal.OrderBy.create_for(col)
 
-    return pb.qal.ImplicitSqlQuery(
-        select_clause=select_clause,
-        from_clause=from_clause,
-        orderby_clause=orderby_clause,
-    )
+    return pb.qal.as_query(select_clause, from_clause, orderby_clause)
 
 
 def min_max_values_query(col: pb.ColumnReference) -> pb.SqlQuery:
@@ -45,13 +34,10 @@ def min_max_values_query(col: pb.ColumnReference) -> pb.SqlQuery:
 
     min_col = pb.qal.FunctionExpression.create_min(col)
     max_col = pb.qal.FunctionExpression.create_max(col)
-    select_clause = pb.qal.Select([pb.qal.BaseProjection(min_col), pb.qal.BaseProjection(max_col)])
+    select_clause = pb.qal.Select([pb.qal.Projection(min_col), pb.qal.Projection(max_col)])
     from_clause = pb.qal.From.create_for(table)
 
-    return pb.qal.ImplicitSqlQuery(
-        select_clause=select_clause,
-        from_clause=from_clause,
-    )
+    return pb.qal.as_query(select_clause, from_clause)
 
 
 def wrap_logger(logger: bool | pb.util.Logger) -> pb.util.Logger:
@@ -106,8 +92,8 @@ class PandasDataset(Dataset):
     def __len__(self) -> int:
         return len(self.df)
 
-    def __getitem__(self, idx: int):
-        return list(self.df.iloc[idx])
+    def __getitem__(self, index: int):
+        return list(self.df.iloc[index])
 
 
 def _noop_parser[T](value: T) -> T:

@@ -4,7 +4,6 @@ import threading
 import traceback
 from collections.abc import Generator
 from pathlib import Path
-from typing import Optional
 
 import pandas as pd
 import postbound as pb
@@ -68,7 +67,7 @@ class PostgresSamplerCtl:
         n_workers: int,
         pg_connect: str,
         allow_zero_tuples: bool = False,
-        timeout_ms: Optional[float] = None,
+        timeout_ms: float | None = None,
         verbose: bool = False,
     ) -> None:
         self.done = threading.Event()
@@ -114,7 +113,7 @@ class PostgresSamplerCtl:
         self._join_workers_nolock()
 
     def process_result(
-        self, query: pb.SqlQuery, plan: pb.postgres.PostgresExplainPlan
+        self, query: pb.SqlQuery, plan: pb.postgres.PostgresPlan
     ) -> None:
         with self._critical_guard:
             if plan.root.true_cardinality == 0 and not self.allow_zero_tuples:
@@ -136,7 +135,7 @@ class PostgresSamplerCtl:
                 self.done.set()
 
     def obtain_pg_backend(
-        self, prev_handle: Optional[BackendHandle] = None
+        self, prev_handle: BackendHandle | None = None
     ) -> tuple[BackendHandle, psycopg.Connection]:
         if self.done.is_set():
             return -1, None  # type: ignore
@@ -199,9 +198,7 @@ def sampling_worker(query_sampler: QuerySampler, *, ctl: PostgresSamplerCtl) -> 
                 result_set = cur.fetchone()
                 if result_set is None:
                     continue
-                ctl.process_result(
-                    query, pb.postgres.PostgresExplainPlan(result_set[0])
-                )
+                ctl.process_result(query, pb.postgres.PostgresPlan(result_set[0]))
             except psycopg.errors.QueryCanceled:
                 # Timeout - do nothing, we just try again
                 conn.rollback()

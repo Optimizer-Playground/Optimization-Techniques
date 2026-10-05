@@ -7,13 +7,12 @@ from collections.abc import Callable, Generator, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Optional, Protocol, overload
+from typing import Any, Protocol, overload
 
 import numpy as np
 import postbound as pb
 import postbound.qal
 from postbound.qal import (
-    BaseProjection,
     CommonTableExpression,
     DirectTableSource,
     From,
@@ -21,13 +20,14 @@ from postbound.qal import (
     JoinTableSource,
     JoinType,
     OrderBy,
+    Projection,
     Select,
     SubqueryTableSource,
     Where,
     WithQuery,
 )
 
-from ..util import make_json_parser, simplify_pred, wrap_logger
+from ..util import make_json_parser, wrap_logger
 from ._compress import valid_compress
 from ._piecewise_fns import DegreeSequence, PiecewiseConstantFn, load_pcf_json
 
@@ -166,7 +166,7 @@ class _CatalogVisitor(pb.qal.PredicateVisitor[None]):
         self._log = log
 
     def visit_binary_predicate(self, predicate: pb.qal.BinaryPredicate, *args, **kwargs) -> None:
-        simplified = simplify_pred(predicate)
+        simplified = pb.qal.SimpleFilter.attempt_wrap(predicate)
         if simplified is None:
             return
         assert pb.ColumnReference.assert_bound(simplified.column)
@@ -174,22 +174,22 @@ class _CatalogVisitor(pb.qal.PredicateVisitor[None]):
         join_map = kwargs["join_map"]
 
         match simplified.operation:
-            case pb.qal.LogicalOperator.Equal:
+            case pb.qal.BinaryOperator.Equal:
                 for join_col in join_map[filter_col.table]:
                     self._log(f"Detected equality-conditioned PCF on {join_col} for {simplified}")
                     self.spec.equality_cols[join_col].add(filter_col)
 
             case (
-                pb.qal.LogicalOperator.Less
-                | pb.qal.LogicalOperator.LessEqual
-                | pb.qal.LogicalOperator.Greater
-                | pb.qal.LogicalOperator.GreaterEqual
+                pb.qal.BinaryOperator.Less
+                | pb.qal.BinaryOperator.LessEqual
+                | pb.qal.BinaryOperator.Greater
+                | pb.qal.BinaryOperator.GreaterEqual
             ):
                 for join_col in join_map[filter_col.table]:
                     self._log(f"Detected range-conditioned PCF on {join_col} for {simplified}")
                     self.spec.range_cols[join_col].add(filter_col)
 
-            case pb.qal.LogicalOperator.Like | pb.qal.LogicalOperator.ILike:
+            case pb.qal.BinaryOperator.Like | pb.qal.BinaryOperator.ILike:
                 for join_col in join_map[filter_col.table]:
                     self._log(f"Detected like-conditioned PCF on {join_col} for {simplified}")
                     self.spec.like_cols[join_col].add(filter_col)
@@ -202,7 +202,7 @@ class _CatalogVisitor(pb.qal.PredicateVisitor[None]):
         # even for BETWEEN predicates we perform the simplification check.
         # This makes sure that the predicate contains a simple range, i.e. BETWEEN 24 AND 42
         # instead more sophisticated stuff like BETWEEN 42 * 42 AND R.b
-        simplified = simplify_pred(predicate)
+        simplified = pb.qal.SimpleFilter.attempt_wrap(predicate)
         if simplified is None:
             return
         assert pb.ColumnReference.assert_bound(simplified.column)
@@ -217,7 +217,7 @@ class _CatalogVisitor(pb.qal.PredicateVisitor[None]):
         # even for IN predicates we perform the simplification check.
         # This makes sure that the predicate contains a simple range, i.e. IN (1, 2, 3)
         # instead more sophisticated stuff like IN(SELECT b FROM R)
-        simplified = simplify_pred(predicate)
+        simplified = pb.qal.SimpleFilter.attempt_wrap(predicate)
         if simplified is None:
             return
         assert pb.ColumnReference.assert_bound(simplified.column)
@@ -293,7 +293,7 @@ def catalog_from_workload(
         join_map = _build_join_map(query)
         visitor.visit_query_predicates(query, join_map=join_map)
         join_cols = pb.util.set_union(pred.columns() for pred in query.joins())
-        spec.unconditioned_cols |= {col.drop_table_alias() for col in join_cols}  # type: ignore
+        spec.unconditioned_cols |= {col.drop_table_alias() for col in join_cols}
     return spec
 
 
@@ -302,7 +302,12 @@ def _normalize_table(table: pb.TableReference) -> pb.TableReference:
     normalized_alias = table.alias.lower()
     normalized_schema = table.schema.lower()
     normalized_catalog = table.catalog.lower()
-    return pb.TableReference(normalized_name, normalized_alias, catalog=normalized_catalog, schema=normalized_schema)
+    return pb.TableReference(
+        normalized_name,
+        normalized_alias,
+        catalog=normalized_catalog,
+        schema=normalized_schema,
+    )
 
 
 @overload
@@ -386,7 +391,7 @@ def catalog_from_schema(schema: pb.db.DatabaseSchema, verbose: bool | pb.util.Lo
 
 def fetch_raw_ds(column: pb.ColumnReference, *, database: pb.Database) -> DegreeSequence:
     """Loads an unconditioned and uncompressed degree sequence for a specific column from the database."""
-    mcv_list = database.statistics().most_common_values(column, k=-1, emulated=True)
+    mcv_list = pb.db.PreciseStatistics(database).most_common_values(column, k=-1)
     return DegreeSequence.from_mcv(mcv_list, column=column)
 
 
@@ -425,12 +430,7 @@ def fetch_correlated_ds(
     from_clause = pb.qal.From.create_for(on.table)
     where_clause = pb.qal.Where(predicate)
     group_clause = pb.qal.GroupBy.create_for(on)
-    sql = pb.SqlQuery(
-        select_clause=select_clause,
-        from_clause=from_clause,
-        where_clause=where_clause,
-        groupby_clause=group_clause,
-    )
+    sql = pb.qal.as_query(select_clause, from_clause, where_clause, group_clause)
 
     result_set = database.execute_query(sql, raw=True)
     if not result_set:
@@ -460,11 +460,7 @@ def fetch_column_values(
     else:
         where_clause = None
 
-    sql = pb.SqlQuery(
-        select_clause=select_clause,
-        from_clause=from_clause,
-        where_clause=where_clause,
-    )
+    sql = pb.qal.as_query(select_clause, from_clause, where_clause)
 
     # we cannot use result set simplification here because the table might contain
     # just a single row. In that case, simplification would unwrap the column
@@ -473,7 +469,7 @@ def fetch_column_values(
     return [row[0] for row in result_set]
 
 
-def fetch_column_distribution[T](column: pb.BoundColumnReference, database: pb.Database) -> list[tuple[T, int]]:
+def fetch_column_distribution(column: pb.BoundColumnReference, database: pb.Database) -> list[tuple[Any, int]]:
     """Builds an ordered list of (value, frequency) pairs of all distinct values in the column.
 
     In contrast to an MCV list, the column distribution is ordered by column value and not by value
@@ -481,21 +477,16 @@ def fetch_column_distribution[T](column: pb.BoundColumnReference, database: pb.D
     """
     select_clause = pb.qal.Select(
         [
-            pb.qal.BaseProjection.column(column),
-            pb.qal.BaseProjection.count_star(),
+            pb.qal.Projection.column(column),
+            pb.qal.Projection.count_star(),
         ]
     )
     from_clause = pb.qal.From.create_for(column.table)
     group_clause = pb.qal.GroupBy.create_for(column)
     order_clause = pb.qal.OrderBy.create_for(column, ascending=True, nulls_first=True)
-    sql = pb.SqlQuery(
-        select_clause=select_clause,
-        from_clause=from_clause,
-        groupby_clause=group_clause,
-        orderby_clause=order_clause,
-    )
+    sql = pb.qal.as_query(select_clause, from_clause, group_clause, order_clause)
 
-    return database.execute_query(sql, raw=True)
+    return database.execute_query(sql, raw=True)  # type: ignore
 
 
 def fetch_non_mcv_ds(
@@ -508,8 +499,8 @@ def fetch_non_mcv_ds(
 ) -> PiecewiseConstantFn:
     freq_select = pb.qal.Select(
         [
-            pb.qal.BaseProjection.column(on),
-            pb.qal.BaseProjection(
+            pb.qal.Projection.column(on),
+            pb.qal.Projection(
                 pb.qal.WindowExpression(
                     pb.qal.FunctionExpression.create_count(),
                     partitioning=[pb.qal.ColumnExpression(column)],
@@ -524,8 +515,8 @@ def fetch_non_mcv_ds(
     freq_col = pb.ColumnReference("freq", freq_cte.target_table)
     pos_select = pb.qal.Select(
         [
-            pb.qal.BaseProjection.column(on.bind_to(freq_cte.target_table)),
-            pb.qal.BaseProjection(
+            pb.qal.Projection.column(on.bind_to(freq_cte.target_table)),
+            pb.qal.Projection(
                 pb.qal.WindowExpression("row_number", ordering=pb.qal.OrderBy.create_for(freq_col)),
                 "pos",
             ),
@@ -642,7 +633,7 @@ class EqualityConditionsRepo:
         *,
         filter_col: pb.ColumnReference,
         filter_val: Any,
-    ) -> Optional[PiecewiseConstantFn]:
+    ) -> PiecewiseConstantFn | None:
         """Retrieves the PCF for a join column based on the condition *filter_col = filter_val*.
 
         If the repository does not contain a PCF conditioned on the filter column, *None* is
@@ -729,7 +720,7 @@ def build_equality_mcvs(
     for join_col, filter_cols in spec.equality_cols.items():
         for filter_col in filter_cols:
             log(f"Fetching MCV for {filter_col}")
-            mcv = database.statistics().most_common_values(filter_col, k=-1, emulated=True)
+            mcv = pb.db.PreciseStatistics(database).most_common_values(filter_col, k=None)
             correlated_pcfs: dict[Any, PiecewiseConstantFn] = {}
 
             for val in mcv.values[:mcv_size]:
@@ -814,9 +805,9 @@ class RangeConditionedPCF[T: _HistogramKey]:
         range_col: pb.ColumnReference,
         lower_bound: T,
         upper_bound: T,
-        lower_child: Optional[RangeConditionedPCF[T]] = None,
-        upper_child: Optional[RangeConditionedPCF[T]] = None,
-        cutoff_point: Optional[T] = None,
+        lower_child: RangeConditionedPCF[T] | None = None,
+        upper_child: RangeConditionedPCF[T] | None = None,
+        cutoff_point: T | None = None,
     ) -> None:
         self._pcf = pcf
         self._lo, self._hi = lower_bound, upper_bound
@@ -833,7 +824,7 @@ class RangeConditionedPCF[T: _HistogramKey]:
     def range_col(self) -> pb.ColumnReference:
         return self._range_col
 
-    def get_range(self, lower: T, upper: T) -> Optional[PiecewiseConstantFn]:
+    def get_range(self, lower: T, upper: T) -> PiecewiseConstantFn | None:
         """Retrieves the PCF for a specific range of values.
 
         A matching PCF must be enclosed by a single bucket of the histogram. If there exists no such
@@ -864,7 +855,7 @@ class RangeConditionedPCF[T: _HistogramKey]:
         # we have the best-matching PCF
         return self._pcf
 
-    def get_less(self, value: T, *, inclusive: bool = False) -> Optional[PiecewiseConstantFn]:
+    def get_less(self, value: T, *, inclusive: bool = False) -> PiecewiseConstantFn | None:
         """Obtains the PCF for all values less than (or equal to) a given value.
 
         Use the `inclusive` flag to distinguish between open and closed ranges (i.e. strict less-than
@@ -888,7 +879,7 @@ class RangeConditionedPCF[T: _HistogramKey]:
         """
         return self.get_range(self._lo, value)
 
-    def get_greater(self, value: T, *, inclusive: bool = False) -> Optional[PiecewiseConstantFn]:
+    def get_greater(self, value: T, *, inclusive: bool = False) -> PiecewiseConstantFn | None:
         """Obtains the PCF for all values greater than (or equal to) a given value.
 
         Use the `inclusive` flag to distinguish between open and closed ranges (i.e. strict
@@ -1135,7 +1126,7 @@ class RangeConditionsRepo:
         *,
         range_col: pb.ColumnReference,
         between: tuple[T, T],
-    ) -> Optional[PiecewiseConstantFn]:
+    ) -> PiecewiseConstantFn | None:
         """Retrieves the PCF for a join column based on the condition *range_col BETWEEN lo AND hi*.
 
         The range must be given as a tuple of the form *(lo, hi)*.
@@ -1166,7 +1157,7 @@ class RangeConditionsRepo:
         *,
         range_col: pb.ColumnReference,
         bound: T,
-    ) -> Optional[PiecewiseConstantFn]:
+    ) -> PiecewiseConstantFn | None:
         """Retrieves the PCF for a join column based on the condition *range_col <= bound*.
 
         If the repository does not contain a PCF conditioned on the filter column, *None* is
@@ -1197,7 +1188,7 @@ class RangeConditionsRepo:
         *,
         range_col: pb.ColumnReference,
         bound: T,
-    ) -> Optional[PiecewiseConstantFn]:
+    ) -> PiecewiseConstantFn | None:
         """Retrieves the PCF for a join column based on the condition *range_col < bound*.
 
         If the repository does not contain a PCF conditioned on the filter column, *None* is
@@ -1228,7 +1219,7 @@ class RangeConditionsRepo:
         *,
         range_col: pb.ColumnReference,
         bound: T,
-    ) -> Optional[PiecewiseConstantFn]:
+    ) -> PiecewiseConstantFn | None:
         """Retrieves the PCF for a join column based on the condition *range_col >= bound*.
 
         If the repository does not contain a PCF conditioned on the filter column, *None* is
@@ -1259,7 +1250,7 @@ class RangeConditionsRepo:
         *,
         range_col: pb.ColumnReference,
         bound: T,
-    ) -> Optional[PiecewiseConstantFn]:
+    ) -> PiecewiseConstantFn | None:
         """Retrieves the PCF for a join column based on the condition *range_col > bound*.
 
         If the repository does not contain a PCF conditioned on the filter column, *None* is
@@ -1361,22 +1352,27 @@ def build_histogram_hierarchy[T: _HistogramKey](
 
     unique_join_col = database.schema().is_primary_key(join_col)
     lo, hi = values[0], values[-1]
+    lo_null, hi_null = False, False
+
     if lo == hi:
         # We are processing a value that is so frequent, it has an entire bucket for its own
         # Our "range predicate" should simply filter on this value.
         if lo is None:
-            range_pred = pb.qal.as_predicate(range_col, "is", None)
+            range_pred = pb.qal.as_predicate(range_col, "is null")
+            lo_null = True
         else:
             range_pred = pb.qal.as_predicate(range_col, "=", lo)
     else:
         # We are processing a proper range
         if lo is None:
-            lo_pred = pb.qal.as_predicate(range_col, "is", None)
+            lo_pred = pb.qal.as_predicate(range_col, "is null")
+            lo_null = True
         else:
             lo_pred = pb.qal.as_predicate(range_col, ">=", lo)
 
         if hi is None:
-            hi_pred = pb.qal.as_predicate(range_col, "is", None)
+            hi_pred = pb.qal.as_predicate(range_col, "is null")
+            hi_null = True
         else:
             # Greater-equals is the correct operation here!
             # Our bisection logic below already ensures that all ranges are disjunct
@@ -1384,11 +1380,9 @@ def build_histogram_hierarchy[T: _HistogramKey](
             # bucket values.
             hi_pred = pb.qal.as_predicate(range_col, "<=", hi)
 
-        if lo_pred.operation == pb.qal.LogicalOperator.Is and hi_pred.operation == pb.qal.LogicalOperator.Is:
+        if lo_null and hi_null:
             range_pred = lo_pred
-        elif lo_pred.operation == pb.qal.LogicalOperator.Is:
-            range_pred = pb.qal.CompoundPredicate.create_or([lo_pred, hi_pred])
-        elif hi_pred.operation == pb.qal.LogicalOperator.Is:
+        elif lo_null or hi_null:
             range_pred = pb.qal.CompoundPredicate.create_or([lo_pred, hi_pred])
         else:
             range_pred = pb.qal.CompoundPredicate.create_and([lo_pred, hi_pred])
@@ -1397,7 +1391,11 @@ def build_histogram_hierarchy[T: _HistogramKey](
     pcf = fetch_correlated_ds(range_pred, on=join_col, database=database, accuracy=accuracy)
     if len(values) == 1 or current_level >= max_level:
         return RangeConditionedPCF(
-            pcf, unique_join_col=unique_join_col, range_col=range_col, lower_bound=lo, upper_bound=hi
+            pcf,
+            unique_join_col=unique_join_col,
+            range_col=range_col,
+            lower_bound=lo,
+            upper_bound=hi,
         )
 
     cumulative = np.cumsum(frequencies)
@@ -1407,7 +1405,11 @@ def build_histogram_hierarchy[T: _HistogramKey](
     if cutoff_idx == 0 or cutoff_idx == len(values):
         # we cannot split the histogram any further, since all values are in one bucket
         return RangeConditionedPCF(
-            pcf, unique_join_col=unique_join_col, range_col=range_col, lower_bound=lo, upper_bound=hi
+            pcf,
+            unique_join_col=unique_join_col,
+            range_col=range_col,
+            lower_bound=lo,
+            upper_bound=hi,
         )
     cutoff_point = values[cutoff_idx]
 
@@ -1634,7 +1636,7 @@ class LikeConditionsRepo:
         *,
         like_col: pb.ColumnReference,
         like_val: str,
-    ) -> Optional[PiecewiseConstantFn]:
+    ) -> PiecewiseConstantFn | None:
         """Retrieves the PCF for a join column based on the condition *filter_col LIKE filter_val*.
 
         If the repository does not contain a PCF conditioned on the filter column, *None* is
@@ -1789,15 +1791,17 @@ def build_frequent_trigrams(
     )
     trigrams_select = Select(
         [
-            BaseProjection.column(on),
-            BaseProjection(substring_fn, "trigram"),
-            BaseProjection.create_window("count", partitioning=[trigram_col], target_name="trigram_freq"),
+            Projection.column(on),
+            Projection(substring_fn, "trigram"),
+            Projection.create_window("count", partitioning=[trigram_col], target_name="trigram_freq"),
         ]
     )
     series_fn = pb.qal.as_func_expr(
-        "generate_series", 1, pb.qal.as_math_expr(pb.qal.as_func_expr("length", like_col), "-", 2)
+        "generate_series",
+        1,
+        pb.qal.as_math_expr(pb.qal.as_func_expr("length", like_col), "-", 2),
     )
-    lateral_select = Select(BaseProjection(pb.qal.as_func_expr("unnest", series_fn), "pos"))
+    lateral_select = Select(Projection(pb.qal.as_func_expr("unnest", series_fn), "pos"))
     trigrams_join = JoinTableSource(
         DirectTableSource(on.table),
         SubqueryTableSource(pb.qal.as_query(lateral_select), lateral=True),
@@ -1808,9 +1812,9 @@ def build_frequent_trigrams(
 
     freq_select = Select(
         [
-            BaseProjection.column(on.bind_to(trigrams_cte.target_table)),
-            BaseProjection.column(trigram_col.bind_to(trigrams_cte.target_table)),
-            BaseProjection.create_window(
+            Projection.column(on.bind_to(trigrams_cte.target_table)),
+            Projection.column(trigram_col.bind_to(trigrams_cte.target_table)),
+            Projection.create_window(
                 "dense_rank",
                 ordering=OrderBy.create_for(
                     trigram_freq_col.bind_to(trigrams_cte.target_table),
@@ -1826,8 +1830,8 @@ def build_frequent_trigrams(
     outer_cte = CommonTableExpression([trigrams_cte, freq_cte])
     outer_select = Select(
         [
-            BaseProjection.column(trigram_col.bind_to(freq_cte.target_table)),
-            BaseProjection.count_star(target_name="freq"),
+            Projection.column(trigram_col.bind_to(freq_cte.target_table)),
+            Projection.count_star(target_name="freq"),
         ]
     )
     outer_from = From.create_for(freq_cte.target_table)
@@ -1873,15 +1877,17 @@ def build_rare_trigrams(
     )
     trigrams_select = Select(
         [
-            BaseProjection.column(on),
-            BaseProjection(substring_fn, "trigram"),
-            BaseProjection.create_window("count", partitioning=[trigram_col], target_name="trigram_freq"),
+            Projection.column(on),
+            Projection(substring_fn, "trigram"),
+            Projection.create_window("count", partitioning=[trigram_col], target_name="trigram_freq"),
         ]
     )
     series_fn = pb.qal.as_func_expr(
-        "generate_series", 1, pb.qal.as_math_expr(pb.qal.as_func_expr("length", like_col), "-", 2)
+        "generate_series",
+        1,
+        pb.qal.as_math_expr(pb.qal.as_func_expr("length", like_col), "-", 2),
     )
-    lateral_select = Select(BaseProjection(pb.qal.as_func_expr("unnest", series_fn), "pos"))
+    lateral_select = Select(Projection(pb.qal.as_func_expr("unnest", series_fn), "pos"))
     trigrams_join = JoinTableSource(
         DirectTableSource(on.table),
         SubqueryTableSource(pb.qal.as_query(lateral_select), lateral=True),
@@ -1892,9 +1898,9 @@ def build_rare_trigrams(
 
     freq_select = Select(
         [
-            BaseProjection.column(on.bind_to(trigrams_cte.target_table)),
-            BaseProjection.column(trigram_col.bind_to(trigrams_cte.target_table)),
-            BaseProjection.create_window(
+            Projection.column(on.bind_to(trigrams_cte.target_table)),
+            Projection.column(trigram_col.bind_to(trigrams_cte.target_table)),
+            Projection.create_window(
                 "dense_rank",
                 ordering=OrderBy.create_for(
                     trigram_freq_col.bind_to(trigrams_cte.target_table),
@@ -2033,7 +2039,7 @@ def build_unconditioned_pcfs(
     pcfs: dict[pb.ColumnReference, PiecewiseConstantFn] = {}
     for col in spec.unconditioned_cols:
         log(f"Building unconditioned PCF on {col}")
-        mcv = database.statistics().most_common_values(col, k=-1, emulated=True)
+        mcv = pb.db.PreciseStatistics(database).most_common_values(col, k=None)
         ds = DegreeSequence.from_mcv(mcv, column=col)
         compressed = valid_compress(ds, accuracy=accuracy)
         pcfs[col] = compressed.deriv()
@@ -2083,7 +2089,7 @@ class _Predicate2PCF(pb.qal.PredicateVisitor[PiecewiseConstantFn]):
         catalog: SafeBoundCatalog,
         *,
         log: pb.util.Logger,
-        callback: Optional[Callable[[pb.qal.AbstractPredicate, PiecewiseConstantFn], None]] = None,
+        callback: Callable[[pb.qal.AbstractPredicate, PiecewiseConstantFn], None] | None = None,
     ) -> None:
         self._catalog = catalog
         self._callback = callback or (lambda predicate, pcf: None)
@@ -2091,21 +2097,21 @@ class _Predicate2PCF(pb.qal.PredicateVisitor[PiecewiseConstantFn]):
 
     def visit_binary_predicate(self, predicate: pb.qal.BinaryPredicate, *args, **kwargs) -> PiecewiseConstantFn:
         join_col = kwargs["join_col"]
-        simplified = simplify_pred(predicate)
+        simplified = pb.qal.SimpleFilter.attempt_wrap(predicate)
         if simplified is None:
             pcf = self._catalog.lookup_unconditioned(join_col)
             self._callback(predicate, pcf)
             return pcf
 
         match simplified.operation:
-            case pb.qal.LogicalOperator.Equal | pb.qal.LogicalOperator.Is:
+            case pb.qal.BinaryOperator.Equal | pb.qal.UnaryOperator.IsNull:
                 pcf = self._catalog.lookup_eq_conditioned(
                     join_col,
                     filter_col=simplified.column,
                     filter_val=simplified.value,
                 )
 
-            case pb.qal.LogicalOperator.Less:
+            case pb.qal.BinaryOperator.Less:
                 pcf = self._catalog.lookup_range_conditioned(
                     join_col,
                     range_col=simplified.column,
@@ -2113,7 +2119,7 @@ class _Predicate2PCF(pb.qal.PredicateVisitor[PiecewiseConstantFn]):
                     upper_inclusive=False,
                 )
 
-            case pb.qal.LogicalOperator.LessEqual:
+            case pb.qal.BinaryOperator.LessEqual:
                 pcf = self._catalog.lookup_range_conditioned(
                     join_col,
                     range_col=simplified.column,
@@ -2121,7 +2127,7 @@ class _Predicate2PCF(pb.qal.PredicateVisitor[PiecewiseConstantFn]):
                     upper_inclusive=True,
                 )
 
-            case pb.qal.LogicalOperator.Greater:
+            case pb.qal.BinaryOperator.Greater:
                 pcf = self._catalog.lookup_range_conditioned(
                     join_col,
                     range_col=simplified.column,
@@ -2129,7 +2135,7 @@ class _Predicate2PCF(pb.qal.PredicateVisitor[PiecewiseConstantFn]):
                     lower_inclusive=False,
                 )
 
-            case pb.qal.LogicalOperator.GreaterEqual:
+            case pb.qal.BinaryOperator.GreaterEqual:
                 pcf = self._catalog.lookup_range_conditioned(
                     join_col,
                     range_col=simplified.column,
@@ -2137,7 +2143,7 @@ class _Predicate2PCF(pb.qal.PredicateVisitor[PiecewiseConstantFn]):
                     lower_inclusive=True,
                 )
 
-            case pb.qal.LogicalOperator.Like | pb.qal.LogicalOperator.ILike:
+            case pb.qal.BinaryOperator.Like | pb.qal.BinaryOperator.ILike:
                 assert isinstance(simplified.value, str)
                 pcf = self._catalog.lookup_like_conditioned(
                     join_col,
@@ -2146,10 +2152,10 @@ class _Predicate2PCF(pb.qal.PredicateVisitor[PiecewiseConstantFn]):
                 )
 
             case (
-                pb.qal.LogicalOperator.NotEqual
-                | pb.qal.LogicalOperator.IsNot
-                | pb.qal.LogicalOperator.NotLike
-                | pb.qal.LogicalOperator.NotILike
+                pb.qal.BinaryOperator.NotEqual
+                | pb.qal.UnaryOperator.IsNotNull
+                | pb.qal.BinaryOperator.NotLike
+                | pb.qal.BinaryOperator.NotILike
             ):
                 self._log(
                     "SafeBound does not support negation predicates. "
@@ -2169,7 +2175,7 @@ class _Predicate2PCF(pb.qal.PredicateVisitor[PiecewiseConstantFn]):
 
     def visit_between_predicate(self, predicate: pb.qal.BetweenPredicate, *args, **kwargs) -> PiecewiseConstantFn:
         join_col = kwargs["join_col"]
-        simplified = simplify_pred(predicate)
+        simplified = pb.qal.SimpleFilter.attempt_wrap(predicate)
         if simplified is None:
             return self._catalog.lookup_unconditioned(join_col)
         assert isinstance(simplified.value, tuple)
@@ -2187,7 +2193,7 @@ class _Predicate2PCF(pb.qal.PredicateVisitor[PiecewiseConstantFn]):
 
     def visit_in_predicate(self, predicate: pb.qal.InPredicate, *args, **kwargs) -> PiecewiseConstantFn:
         join_col = kwargs["join_col"]
-        simplified = simplify_pred(predicate)
+        simplified = pb.qal.SimpleFilter.attempt_wrap(predicate)
         if simplified is None:
             return self._catalog.lookup_unconditioned(join_col)
         assert isinstance(simplified.value, Iterable)
@@ -2488,7 +2494,7 @@ class SafeBoundCatalog:
         archive: Path | str,
         *,
         database: pb.Database,
-        workload: Optional[pb.Workload] = None,
+        workload: pb.Workload | None = None,
         spec: SafeBoundSpec = SafeBoundSpec.default(),
         verbose: bool | pb.util.Logger = False,
     ) -> SafeBoundCatalog:
@@ -2545,7 +2551,7 @@ class SafeBoundCatalog:
         self._log = wrap_logger(verbose)
 
     @property
-    def construction_time(self) -> Optional[timedelta]:
+    def construction_time(self) -> timedelta | None:
         """Returns the time it took to build the catalog, or None if it is unknown."""
         return self._construction_time
 
@@ -2562,7 +2568,7 @@ class SafeBoundCatalog:
         self,
         query: pb.SqlQuery,
         *,
-        trace_callback: Optional[Callable[[pb.qal.AbstractPredicate, PiecewiseConstantFn], None]] = None,
+        trace_callback: Callable[[pb.qal.AbstractPredicate, PiecewiseConstantFn], None] | None = None,
     ) -> Mapping[pb.ColumnReference, PiecewiseConstantFn]:
         """Fetches all PCFs for a specific query.
 
@@ -2604,7 +2610,7 @@ class SafeBoundCatalog:
         join_col: pb.ColumnReference,
         filters: pb.qal.AbstractPredicate | None,
         *,
-        trace_callback: Optional[Callable[[pb.qal.AbstractPredicate, PiecewiseConstantFn], None]] = None,
+        trace_callback: Callable[[pb.qal.AbstractPredicate, PiecewiseConstantFn], None] | None = None,
     ) -> PiecewiseConstantFn:
         """Loads the best-matching PCF for a single (filtered) join column.
 

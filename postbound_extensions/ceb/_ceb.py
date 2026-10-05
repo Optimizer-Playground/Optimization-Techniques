@@ -20,10 +20,11 @@ import random
 import tomllib
 from collections.abc import Iterable
 from pathlib import Path
-from typing import Any, Literal, Optional
+from typing import Any, Literal
 
 import numpy as np
 import postbound as pb
+from postbound.qal import SqlQuery
 
 # we introduce a bunch of type aliases to prevent types like dict[str, str]
 TemplatedQuery = str
@@ -135,14 +136,14 @@ class PredicateGenerator:
         sampling_method: Literal["uniform", "weighted"],
         target_columns: list[ColumnName],
         pred_type: list[PredicateType],
-        sql_query: Optional[str] = None,
-        list_allowed_values: Optional[list[PlaceHolderValue]] = None,
+        sql_query: str | None = None,
+        list_allowed_values: list[PlaceHolderValue] | None = None,
         in_pred_min_samples: int = 1,
-        in_pred_max_samples: Optional[int] = None,
-        count_column_idx: Optional[int] = None,
-        dependencies: Optional[list[PredicateName]] = None,
-        max_tries: Optional[int] = None,
-        db_connection: Optional[pb.Database] = None,
+        in_pred_max_samples: int | None = None,
+        count_column_idx: int | None = None,
+        dependencies: list[PredicateName] | None = None,
+        max_tries: int | None = None,
+        db_connection: pb.Database | None = None,
     ) -> None:
         self.name = name
 
@@ -722,7 +723,7 @@ def generate_raw_workload(
     *,
     queries_per_template: int,
     template_pattern: str = "*.toml",
-    db_connection: Optional[pb.Database] = None,
+    db_connection: pb.Database | None = None,
 ) -> dict[str, str]:
     """Produces an unoptimized workload based on a number of CEB templates.
 
@@ -799,10 +800,10 @@ def generate_workload(
     path: str | Path,
     *,
     queries_per_template: int,
-    name: Optional[str] = None,
+    name: str | None = None,
     template_pattern: str = "*.toml",
-    db_connection: Optional[pb.Database] = None,
-) -> pb.Workload[str]:
+    db_connection: pb.Database | None = None,
+) -> pb.Workload[str, pb.SqlQuery]:
     """Produces a full workload based on a number of CEB templates.
 
     Parameters
@@ -845,7 +846,7 @@ def generate_workload(
 
 
 def persist_workload(
-    path: str | Path, workload: pb.Workload[str] | dict[str, str]
+    path: str | Path, workload: pb.Workload[str, SqlQuery] | dict[str, str]
 ) -> None:
     """Stores all queries of a workload with one query per file in a specific directory.
 

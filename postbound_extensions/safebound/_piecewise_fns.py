@@ -241,13 +241,13 @@ class Segment:
     This assumes that the requested x value falls in the interval [lower, higher).
     """
 
-    lower: int
+    lower: float
     """The smallest x value in this segment.
 
     See the general documentation on Segment for open vs. closed intervals.
     """
 
-    higher: int
+    higher: float
     """The largest x value in this segment.
 
     See the general documentation on Segment for open vs. closed intervals.
@@ -276,7 +276,7 @@ class Segment:
         return Segment(0, 0, slope, intercept)
 
     @staticmethod
-    def after(last: Segment, *, slope: float, higher: Optional[int] = 0) -> Segment:
+    def after(last: Segment, *, slope: float, higher: Optional[float] = 0) -> Segment:
         """Creates a new segment that "picks up" after a previous segment.
 
         The lower bound of the segment as well as the intercept are inferred directly based on the
@@ -290,7 +290,7 @@ class Segment:
         return Segment(last.higher, higher, slope, intercept)
 
     @property
-    def width(self) -> int:
+    def width(self) -> float:
         """Get the width of the interval [lower, higher]."""
         return self.higher - self.lower
 
@@ -354,7 +354,7 @@ class PiecewiseConstantFn:
         will be closed using the intercept of the current segment.
         """
         values: list[float] = []
-        bounds: list[int] = []
+        bounds: list[float] = []
         for seg in segments:
             if not seg.is_constant():
                 raise ValueError("All segments must be constant")
@@ -374,7 +374,7 @@ class PiecewiseConstantFn:
     def __init__(
         self,
         values: Iterable[float],
-        bounds: Iterable[int],
+        bounds: Iterable[float],
         *,
         column: Optional[pb.ColumnReference] = None,
     ) -> None:
@@ -711,7 +711,7 @@ class PiecewiseLinearFn:
         """
         slopes: list[float] = []
         intercepts: list[float] = []
-        bounds: list[int] = []
+        bounds: list[float] = []
         for seg in segments:
             slopes.append(seg.slope)
             intercepts.append(seg.intercept)
@@ -724,7 +724,7 @@ class PiecewiseLinearFn:
         *,
         slopes: Iterable[float],
         intercepts: Iterable[float],
-        bounds: Iterable[int],
+        bounds: Iterable[float],
         column: Optional[pb.ColumnReference] = None,
     ) -> None:
         self.column = column

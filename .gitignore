@@ -218,22 +218,23 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 
+# MacOS
+.DS_Store
+
 # Project-specific stuff
 localtest*
 .pg-connect*.toml
-*.prof
 .query_cache*.json
-<<<<<<< Updated upstream
-models/
-generated/
-=======
 *.duckdb
+
 /generated/
 /models/
 /results/
 /workloads/
->>>>>>> Stashed changes
 
+*.prof
+
+# FASTgres stuff
 /tests/
 /queries/
 /postbound_extensions/fastgres/generated/
