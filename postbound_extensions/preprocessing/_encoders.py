@@ -116,9 +116,10 @@ class ColumnEncoder[T](ABC):
 
         return enc
 
-    def __new__(cls, column: pb.BoundColumnReference, dtype: str):
-        if cls is not ColumnEncoder:
-            return super().__new__(cls)
+    @staticmethod
+    def initialize(column: pb.ColumnReference, dtype: str) -> ColumnEncoder:
+        if not pb.ColumnReference.assert_bound(column):
+            raise pb.UnboundColumnError(column)
 
         match dtype.lower():
             case "integer" | "smallint" | "bigint":

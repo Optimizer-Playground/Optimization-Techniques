@@ -447,9 +447,7 @@ def default_hint_sets() -> list[pb.PhysicalOperatorAssignment]:
     return arms
 
 
-class BaoOptimizer(
-    pb.CompleteOptimizationAlgorithm, pb.OperatorSelection, pb.CostModel
-):
+class BaoOptimizer(pb.CompleteOptimizationAlgorithm, pb.OperatorSelection, pb.CostModel):
     """Bao is a learned query optimizer that uses hint sets to select optimal candidate plans.
 
     Bao sits on top of a native database system and steers its native optimizer with hint sets.
@@ -560,18 +558,13 @@ class BaoOptimizer(
             catalog = json.load(f)
 
         featurizer = BaoFeaturizer.pre_built(catalog["featurizer"], database=database)
-        experience = BaoExperience.load(
-            catalog["experience"]["catalog"], featurizer=featurizer
-        )
+        experience = BaoExperience.load(catalog["experience"]["catalog"], featurizer=featurizer)
 
         weights = torch.load(catalog["tcnn_model"])
         model = BaoModel(featurizer.out_shape)
         model.load_state_dict(weights)
 
-        hint_sets = [
-            pb.opt.read_operator_assignment_json(hints)
-            for hints in catalog["hint_sets"]
-        ]
+        hint_sets = [pb.opt.read_operator_assignment_json(hints) for hints in catalog["hint_sets"]]
 
         bao = BaoOptimizer(
             database,
@@ -657,9 +650,7 @@ class BaoOptimizer(
     ) -> None:
         super().__init__()
         self._db = target_db
-        self._hint_sets = (
-            list(hint_sets) if hint_sets is not None else default_hint_sets()[:5]
-        )
+        self._hint_sets = list(hint_sets) if hint_sets is not None else default_hint_sets()[:5]
         self._featurizer = featurizer or BaoFeaturizer.online(self._db)
         self._experience = experience or BaoExperience(
             self._featurizer,
@@ -689,10 +680,7 @@ class BaoOptimizer(
     def optimize_query(self, query: pb.SqlQuery) -> pb.QueryPlan:
         cache_state = DatabaseCacheState(self._db)
         plans = [self._generate_plan(query, hint_set) for hint_set in self._hint_sets]
-        featurized = [
-            self._featurizer.encode_plan(plan, cache_state=cache_state)
-            for plan in plans
-        ]
+        featurized = [self._featurizer.encode_plan(plan, cache_state=cache_state) for plan in plans]
 
         predictions = self._tcnn(featurized)
         idxmin = int(torch.argmin(predictions).item())
@@ -705,22 +693,14 @@ class BaoOptimizer(
         self, query: pb.SqlQuery, join_order: pb.JoinTree | None
     ) -> pb.PhysicalOperatorAssignment:
         cache_state = DatabaseCacheState(self._db)
-        plans = [
-            self._generate_plan(query, hint_set, join_order=join_order)
-            for hint_set in self._hint_sets
-        ]
+        plans = [self._generate_plan(query, hint_set, join_order=join_order) for hint_set in self._hint_sets]
 
-        featurized = [
-            self._featurizer.encode_plan(plan, cache_state=cache_state)
-            for plan in plans
-        ]
+        featurized = [self._featurizer.encode_plan(plan, cache_state=cache_state) for plan in plans]
         predictions = self._tcnn(featurized)
 
         idxmin = int(torch.argmin(predictions).item())
         hint_set = self._hint_sets[idxmin]
-        self._log(
-            f"Selected arm {idxmin} ({_stringify_hint_set(hint_set)}) for query {query}"
-        )
+        self._log(f"Selected arm {idxmin} ({_stringify_hint_set(hint_set)}) for query {query}")
         return hint_set
 
     def estimate_cost(self, query: pb.SqlQuery, plan: pb.QueryPlan) -> pb.Cost:
@@ -729,9 +709,7 @@ class BaoOptimizer(
         prediction = self._tcnn([featurized])
         return prediction.item()
 
-    def add_experience(
-        self, plan: pb.QueryPlan, runtime_ms: float | None = None
-    ) -> None:
+    def add_experience(self, plan: pb.QueryPlan, runtime_ms: float | None = None) -> None:
         """Records a new experience sample, possibly triggering retraining.
 
         If the retraining threshold is reached, a new TCNN model is retrained (provided that it is
@@ -768,8 +746,7 @@ class BaoOptimizer(
         runtime_column: str = "runtime_ms",
         timeout_ms: float | None = None,
         from_scratch: bool = False,
-        hint_sets: Callable[[str, pb.SqlQuery], Iterable[pb.PhysicalOperatorAssignment]]
-        | None = None,
+        hint_sets: Callable[[str, pb.SqlQuery], Iterable[pb.PhysicalOperatorAssignment]] | None = None,
     ) -> None:
         """Performs a batch training of the TCNN.
 
@@ -827,38 +804,26 @@ class BaoOptimizer(
             self._tcnn = BaoModel(self._featurizer.out_shape)
 
         if isinstance(workload, pd.DataFrame):
-            self._retrain_offline(
-                workload, plan_col=plan_column, runtime_col=runtime_column
-            )
+            self._retrain_offline(workload, plan_col=plan_column, runtime_col=runtime_column)
             return
 
         self._log("Gathering query plans for calibration queries")
-        query_iter = (
-            tqdm(workload.entries(), desc="Training query", unit="q")
-            if self._verbose
-            else workload.entries()
-        )
+        query_iter = tqdm(workload.entries(), desc="Training query", unit="q") if self._verbose else workload.entries()
 
         if timeout_ms and not isinstance(self._db, pb.db.TimeoutSupport):
             raise ValueError("Target database system does not provide timeout support.")
 
         if timeout_ms:
             assert isinstance(self._db, pb.db.TimeoutSupport)
-            executor = functools.partial(
-                self._db.execute_with_timeout, timeout=1000 * timeout_ms
-            )
+            executor = functools.partial(self._db.execute_with_timeout, timeout=1000 * timeout_ms)
         else:
             executor = functools.partial(self._db.execute_query, raw=True)
 
         for label, query in query_iter:
-            selected_hint_sets = (
-                hint_sets(label, query) if hint_sets else self._hint_sets
-            )
+            selected_hint_sets = hint_sets(label, query) if hint_sets else self._hint_sets
 
             for hint_set in selected_hint_sets:
-                query = self._db.hinting().generate_hints(
-                    query, physical_operators=hint_set
-                )
+                query = self._db.hinting().generate_hints(query, physical_operators=hint_set)
                 query = pb.transform.as_explain_analyze(query)
 
                 result_set = executor(query)
@@ -867,6 +832,9 @@ class BaoOptimizer(
 
                 raw_plan = result_set
                 plan = self._db.optimizer().parse_plan(raw_plan, query=query)
+                if plan is None:
+                    continue
+
                 runtime_s = plan.execution_time
                 self._experience.add(plan, runtime_s * 1000)
 
@@ -888,9 +856,11 @@ class BaoOptimizer(
         >>> bao = ...
         >>> pb.bench.execute_workload(workload, on=bao, exec_callback=bao.bench_feedback)
         """
-        if result.status != "ok":
+        if result.status != "ok" or result.query_result is None:
             return
         query_plan = self._db.optimizer().parse_plan(result.query_result)
+        if query_plan is None:
+            return
         self.add_experience(query_plan, 1000 * result.execution_time)
 
     def store(self, archive_dir: Path | str) -> Path:
@@ -965,14 +935,10 @@ class BaoOptimizer(
         *,
         join_order: pb.JoinTree | None = None,
     ) -> pb.QueryPlan:
-        hinted_query = self._db.hinting().generate_hints(
-            query, join_order=join_order, physical_operators=hint_set
-        )
+        hinted_query = self._db.hinting().generate_hints(query, join_order=join_order, physical_operators=hint_set)
         return self._db.optimizer().query_plan(hinted_query)
 
-    def _retrain_offline(
-        self, samples: pd.DataFrame, *, plan_col: str, runtime_col: str
-    ) -> None:
+    def _retrain_offline(self, samples: pd.DataFrame, *, plan_col: str, runtime_col: str) -> None:
         """Utility to prepare and invoke training based on offline samples."""
         if isinstance(samples[plan_col].iloc[0], pb.QueryPlan):
             plans = samples[plan_col]

@@ -476,7 +476,7 @@ class MscnFeaturizer:
 
             dtype = encoder_entry["dtype"]
             archive_file = encoder_entry["archive_file"]
-            encoder = ColumnEncoder(col, dtype)
+            encoder = ColumnEncoder.initialize(col, dtype)
             encoder.load(Path(archive_file))
             column_encoders[col] = encoder
 

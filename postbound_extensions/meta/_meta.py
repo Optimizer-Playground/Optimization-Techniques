@@ -81,7 +81,7 @@ def load_enumerator(mod_path: str | Path) -> pb.PlanEnumerator:
     return enumerator
 
 
-def load_join_order_optimizer(mod_path: str | Path) -> pb.JoinOrderOptimization:
+def load_join_order_optimizer(mod_path: str | Path) -> pb.JoinOrdering:
     """Loads a `JoinOrderOptimization` instance from a Python module.
 
     The target module must contain exactly one optimizer instance. The return value of this function is the
@@ -94,13 +94,13 @@ def load_join_order_optimizer(mod_path: str | Path) -> pb.JoinOrderOptimization:
     DO NOT USE THIS FUNCTION WITH UNTRUSTED CODE!!!
     """
     mod_path = Path(mod_path)
-    optimizer = _load_target(mod_path, pb.JoinOrderOptimization)
+    optimizer = _load_target(mod_path, pb.JoinOrdering)
     if optimizer is None:
         raise ValueError(f"Module {mod_path} needs to contain exactly one JoinOrderOptimization instance.")
     return optimizer
 
 
-def load_operator_selection(mod_path: str | Path) -> pb.PhysicalOperatorSelection:
+def load_operator_selection(mod_path: str | Path) -> pb.OperatorSelection:
     """Loads a `PhysicalOperatorSelection` instance from a Python module.
 
     The target module must contain exactly one operator selection instance. The return value of this function is the
@@ -113,7 +113,7 @@ def load_operator_selection(mod_path: str | Path) -> pb.PhysicalOperatorSelectio
     DO NOT USE THIS FUNCTION WITH UNTRUSTED CODE!!!
     """
     mod_path = Path(mod_path)
-    operator_selection = _load_target(mod_path, pb.PhysicalOperatorSelection)
+    operator_selection = _load_target(mod_path, pb.OperatorSelection)
     if operator_selection is None:
         raise ValueError(f"Module {mod_path} needs to contain exactly one PhysicalOperatorSelection instance.")
     return operator_selection

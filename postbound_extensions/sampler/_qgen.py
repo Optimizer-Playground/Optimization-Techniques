@@ -110,9 +110,7 @@ class _TableSpec:
         for col_info in tab_info.columns:
             if col_info.indexed:
                 continue
-            filter_cols[col_info.column] = _ColSpec.full(
-                col_info.column, database=database, operators=operators
-            )
+            filter_cols[col_info.column] = _ColSpec.full(col_info.column, database=database, operators=operators)
         return _TableSpec(table=table, filter_columns=filter_cols)
 
     @staticmethod
@@ -133,13 +131,9 @@ class _TableSpec:
 
 class _PredicateCollector(pb.qal.PredicateVisitor[None]):
     def __init__(self):
-        self.column_filters: Mapping[
-            pb.BoundColumnReference, set[pb.qal.BinaryOperator]
-        ] = collections.defaultdict(set)
+        self.column_filters: Mapping[pb.BoundColumnReference, set[pb.qal.BinaryOperator]] = collections.defaultdict(set)
         self.joins: set[tuple[pb.BoundColumnReference, pb.BoundColumnReference]] = set()
-        self.filter_weights: collections.Counter[pb.BoundColumnReference] = (
-            collections.Counter()
-        )
+        self.filter_weights: collections.Counter[pb.BoundColumnReference] = collections.Counter()
 
     def visit_binary_predicate(self, predicate: pb.qal.BinaryPredicate) -> None:
         if predicate.is_filter():
@@ -228,9 +222,7 @@ class _PredicateCollector(pb.qal.PredicateVisitor[None]):
         if len(columns) != 2:
             return
         col1, col2 = columns
-        if not pb.ColumnReference.assert_bound(
-            col1
-        ) or not pb.ColumnReference.assert_bound(col2):
+        if not pb.ColumnReference.assert_bound(col1) or not pb.ColumnReference.assert_bound(col2):
             return
         if col2 < col1:
             col1, col2 = col2, col1
@@ -285,9 +277,7 @@ class _SampleSpec:
         )
 
     @staticmethod
-    def derive_from_workload(
-        workload: pb.Workload, *, database: pb.Database
-    ) -> _SampleSpec:
+    def derive_from_workload(workload: pb.Workload, *, database: pb.Database) -> _SampleSpec:
         predicate_collector = _PredicateCollector()
         tables: set[pb.TableReference] = set()
         min_tables, max_tables = float("inf"), 0
@@ -362,9 +352,7 @@ class _SampleSpec:
     def n_filter_columns(self) -> int:
         return sum(len(tab_spec.filter_columns) for tab_spec in self.tables.values())
 
-    def filterable_cols_on(
-        self, tables: Sequence[pb.TableReference]
-    ) -> Sequence[pb.ColumnReference]:
+    def filterable_cols_on(self, tables: Sequence[pb.TableReference]) -> Sequence[pb.ColumnReference]:
         return pb.util.flatten(self.tables[tab].filter_columns.keys() for tab in tables)
 
     def __getitem__(self, key: pb.ColumnReference) -> _ColSpec:
@@ -422,13 +410,9 @@ def _draw_filter_value(
     if isinstance(database, pb.postgres.PostgresDatabase):
         # even though the BERNOUILLI sampling method would be "more uniform", we opt for SYSTEM sampling due to its much
         # lower execution time.
-        query_template = (
-            f"SELECT DISTINCT {col_name} FROM {tab_name} TABLESAMPLE SYSTEM(1)"
-        )
+        query_template = f"SELECT DISTINCT {col_name} FROM {tab_name} TABLESAMPLE SYSTEM(1)"
     elif isinstance(database, pb.duckdb.DuckDBDatabase):
-        query_template = (
-            f"SELECT DISTINCT {col_name} FROM {tab_name} USING SAMPLE 1 ROWS"
-        )
+        query_template = f"SELECT DISTINCT {col_name} FROM {tab_name} USING SAMPLE 1 ROWS"
     else:
         query_template = f"SELECT DISTINCT {col_name} FROM {tab_name}"
 
@@ -448,9 +432,7 @@ def _draw_filter_value(
     return (True, value)
 
 
-def _draw_filter_pred(
-    col: _ColSpec, *, database: pb.Database
-) -> pb.qal.AbstractPredicate | None:
+def _draw_filter_pred(col: _ColSpec, *, database: pb.Database) -> pb.qal.AbstractPredicate | None:
     operator = random.choice(col.allowed_ops)
 
     # LIKE operators can only be applied to text columns.
@@ -602,9 +584,7 @@ def generate_query(
         if n_filters != len(filter_cols):
             continue
 
-        filter_preds = [
-            _draw_filter_pred(spec[col], database=target_db) for col in filter_cols
-        ]
+        filter_preds = [_draw_filter_pred(spec[col], database=target_db) for col in filter_cols]
         if any(pred is None for pred in filter_preds):
             continue
 
