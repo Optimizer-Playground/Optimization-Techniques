@@ -344,10 +344,13 @@ def catalog_from_schema(schema: pb.db.DatabaseSchema, verbose: bool | pb.util.Lo
         like_cols: set[pb.BoundColumnReference] = set()
 
         key_cols: set[pb.BoundColumnReference] = set()
-        pk_col = schema.primary_key_column(table)
-        if pk_col is not None:
-            pk_col = _normalize_column(pk_col)
-            key_cols.add(pk_col)
+        primary_key = schema.primary_key_of(table)
+        if primary_key is None or not primary_key.is_simple():
+            logger(f"Skipping table {table} - no simple primary key found")
+            continue
+
+        pk_col = _normalize_column(primary_key.simplify())
+        key_cols.add(pk_col)
 
         for col in schema.columns(table):
             col = _normalize_column(col)

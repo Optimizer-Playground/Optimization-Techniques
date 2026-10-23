@@ -33,9 +33,10 @@ statistics are used.
 """
 
 
-def _is_unique(column: pb.ColumnReference, *, database: pb.Database) -> bool:
+def _is_unique(column: pb.ColumnReference, *, database_or_schema: pb.Database | pb.db.DatabaseSchema) -> bool:
     """Checks, if it can be guaranteed that each value in the column appears exactly once."""
-    return database.schema().is_primary_key(column)
+    schema = database_or_schema if isinstance(database_or_schema, pb.db.DatabaseSchema) else database_or_schema.schema()
+    return schema.is_primary_key(column) or schema.is_unique(column)
 
 
 def _determine_table_types(
@@ -87,8 +88,8 @@ def _determine_table_types(
             expanding_tables.append(lhs_tab)
             continue
 
-        lhs_unique = schema.is_primary_key(simplified.lhs)
-        rhs_unique = schema.is_primary_key(simplified.rhs)
+        lhs_unique = _is_unique(simplified.lhs, database_or_schema=schema)
+        rhs_unique = _is_unique(simplified.rhs, database_or_schema=schema)
 
         if lhs_unique and rhs_unique:
             filter_tables[lhs_tab].add(rhs_tab)
@@ -534,7 +535,8 @@ class UesJoinOrdering(pb.JoinOrdering):
 
                 all_candidates.append(candidate)
                 if any(
-                    _is_unique(join_col, database=self._database) for join_col in candidate_joins.columns_of(candidate)
+                    _is_unique(join_col, database_or_schema=self._database)
+                    for join_col in candidate_joins.columns_of(candidate)
                 ):
                     filtering_candidates.append(candidate)
 
@@ -555,7 +557,7 @@ class UesJoinOrdering(pb.JoinOrdering):
         if not pb.ColumnReference.assert_bound(column):
             raise pb.UnboundColumnError(column)
 
-        if _is_unique(column, database=self._database):
+        if _is_unique(column, database_or_schema=self._database):
             return 1
 
         mcv = self._stats.most_common_values(column)

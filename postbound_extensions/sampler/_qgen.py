@@ -255,7 +255,10 @@ class _SampleSpec:
         for _, _, data in schema_graph.edges(data=True):
             fkeys: Sequence[pb.db.ForeignKeyRef] = data["foreign_keys"]
             for fkey in fkeys:
-                fk_col, ref_col = fkey.fk_col, fkey.referenced_col
+                if not fkey.is_simple():
+                    continue
+
+                fk_col, ref_col = fkey.simplify_fk_cols(), fkey.simplify_referenced_cols()
                 join_graph.add_edge(
                     fk_col.table,
                     ref_col.table,
