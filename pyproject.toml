@@ -36,7 +36,11 @@ where = ["."]
 include = ["postbound_extensions*"]
 
 [tool.ty.src]
-exclude = ["postbound_extensions/fastgres/**", "postbound_extensions/ceb/**"]
+exclude = [
+    "postbound_extensions/fastgres/**",
+    "postbound_extensions/ceb/**",
+    "/**/reference-implementation/**",
+]
 
 [tool.ruff]
 line-length = 120
@@ -49,5 +53,5 @@ exclude = ["postbound_extensions/fastgres/**"]
 extend-immutable-calls = [
     "postbound_extensions.safebound._catalog.SafeBoundSpec.default",
     "postbound_extensions.mscn._estimator.MscnHyperParams.default",
-    "postbound.Cardinality.unknown"
+    "postbound.Cardinality.unknown",
 ]

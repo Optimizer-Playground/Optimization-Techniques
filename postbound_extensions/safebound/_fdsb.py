@@ -41,20 +41,21 @@ class AlphaStep:
         self._fns: tuple[FunctionLike, ...] = tuple(relations)
         if len(self._fns) < 2:
             raise ValueError("alpha-step requires at least two PCFs to join")
-        self._combined: FunctionLike | None = None
-        if all(isinstance(rel, PiecewiseConstantFn) for rel in self._fns):
-            self._combined = self._fns[0]
-            for pcf in self._fns[1:]:
-                self._combined *= pcf  # type: ignore - guarded by the isinstance() check above
-            self._n_distinct = self._combined.n_distinct
-        else:
-            self._combined = None
-            self._n_distinct = min(fn.n_distinct for fn in self._fns)
+
+        self._combined = self._fns[0].output_pcf()
+        for fn in self._fns[1:]:
+            self._combined *= fn.output_pcf()
+
+        self._n_distinct = self._combined.n_distinct
 
     @property
     def n_distinct(self) -> int:
         """Get the number of distinct values in the output PCF."""
         return self._n_distinct
+
+    def output_pcf(self) -> PiecewiseConstantFn:
+        """Provides the output PCF of this alpha step."""
+        return self._combined
 
     def columns(self) -> set[pb.ColumnReference]:
         """Provides all join columns that are part of this alpha step, including nested steps."""
@@ -71,13 +72,7 @@ class AlphaStep:
         Since all join columns are by definition equality-joined, this output frequency boils down
         to the multiplication of all frequencies at the same index.
         """
-        if self._combined is not None:
-            return self._combined.evaluate_at(vals)
-
-        res = np.ones_like(vals)
-        for fn in self._fns:
-            res = res * fn.evaluate_at(vals)  # see https://stackoverflow.com/a/38677336
-        return res
+        return self._combined.evaluate_at(vals)
 
     def cumulative_at(self, vals: np.ndarray) -> np.ndarray:
         """Computes the cumulative output frequencies of the given PCF indexes.
@@ -86,14 +81,7 @@ class AlphaStep:
         cumulative frequencies (i.e. including all higher-frequency values) instead of the
         frequencies at the specific indexes.
         """
-        if self._combined is not None:
-            return self._combined.cumulative_at(vals)
-
-        max_val = np.max(vals)
-        extended_vals = np.arange(max_val + 1)
-        evals = self.evaluate_at(extended_vals)
-        cumulative = np.cumsum(evals)
-        return cumulative[vals]
+        return self._combined.cumulative_at(vals)
 
     def invert_cumulative_at(self, vals: np.ndarray) -> np.ndarray:
         """Computes the PCF indexes that reach the given cumulative frequencies.
@@ -102,26 +90,11 @@ class AlphaStep:
         cumulative frequencies at specific indexes, it computes the indexes at specific cumulative
         frequencies.
         """
-        if self._combined is not None:
-            return self._combined.invert_cumulative_at(vals)
-
-        # TODO: can we be smarter here than to just materialize everything?
-        # Maybe we could do some binary search-style approximation of where
-        # we need to start materializing.
-        # E.g., start with n_distinct / 2 and determine the cumulative value
-        # Then, bisect and evaluate 3/4 * n_distinct and 1/4 * n_distinct, etc.
-        cumulative = self.cumulative_at(np.arange(self._n_distinct))
-        idx = np.searchsorted(cumulative, vals)
-        return np.where(idx >= self._n_distinct, 0, idx)
+        return self._combined.invert_cumulative_at(vals)
 
     def cardinality(self) -> int:
         """Computes the upper bound of the output relation's cardinality."""
-        if self._combined is not None:
-            return self._combined.cardinality()
-
-        vals = np.arange(self.n_distinct)
-        total_freqs = self(vals)
-        return np.sum(total_freqs)
+        return self._combined.cardinality()
 
     def inspect(self) -> str:
         """Provides a human-readable representation of this alpha step as well as its inputs."""
@@ -246,11 +219,16 @@ class BetaStep:
         self._dimension_joins = tuple(pcfs)
         if len(self._dimension_joins) < 1:
             raise ValueError("At least one dimension join required for a beta step!")
+        self._combined = self._materialize_output()
 
     @property
     def n_distinct(self) -> int:
         """Get the number of distinct values in the output PCF."""
         return self._proj.n_distinct
+
+    def output_pcf(self) -> PiecewiseConstantFn:
+        """Provides the output PCF of this beta step."""
+        return self._combined
 
     def columns(self) -> set[pb.ColumnReference]:
         """Provides all join columns that are part of this alpha step, including nested steps."""
@@ -267,15 +245,7 @@ class BetaStep:
         The beta step basically computes the frequency increase on the projected PCF based on the
         frequency increases caused by each dimension join.
         """
-        res = self._proj.evaluate_at(vals)
-        cumulative = self._proj.cumulative_at(vals)
-
-        for join in self._dimension_joins:
-            fact_pcf, dim_pcf = join.fact_pcf, join.dimension_pcf
-            dimension_idx = fact_pcf.invert_cumulative_at(cumulative)
-            res = res * dim_pcf.evaluate_at(dimension_idx)  # see https://stackoverflow.com/a/38677336
-
-        return res
+        return self._combined.evaluate_at(vals)
 
     def cumulative_at(self, vals: np.ndarray) -> np.ndarray:
         """Computes the cumulative output frequencies of the given PCF indexes.
@@ -284,11 +254,7 @@ class BetaStep:
         cumulative frequencies (i.e. including all higher-frequency values) instead of the
         frequencies at the specific indexes.
         """
-        max_val = np.max(vals)
-        extended_vals = np.arange(max_val + 1)
-        evals = self.evaluate_at(extended_vals)
-        cumulative = np.cumsum(evals)
-        return cumulative[vals]
+        return self._combined.cumulative_at(vals)
 
     def invert_cumulative_at(self, vals: np.ndarray) -> np.ndarray:
         """Computes the PCF indexes that reach the given cumulative frequencies.
@@ -297,19 +263,53 @@ class BetaStep:
         cumulative frequencies at specific indexes, it computes the indexes at specific cumulative
         frequencies.
         """
-        cumulative = self.cumulative_at(np.arange(self.n_distinct))
-        idx = np.searchsorted(cumulative, vals)
-        return np.where(idx >= self.n_distinct, 0, idx)
+        return self._combined.invert_cumulative_at(vals)
 
     def cardinality(self) -> int:
         """Computes the upper bound of the output relation's cardinality."""
-        cards = self.evaluate_at(np.arange(self.n_distinct))
-        return np.sum(cards)
+        return self._combined.cardinality()
 
     def inspect(self) -> str:
         """Provides a human-readable representation of this beta step as well as its inputs."""
         lines = self._inspect_internal()
         return "\n".join(lines)
+
+    def _frequencies_at(self, indexes: np.ndarray) -> np.ndarray:
+        res = self._proj.evaluate_at(indexes)
+        cumulative = self._proj.cumulative_at(indexes)
+
+        for join in self._dimension_joins:
+            fact_pcf, dim_pcf = join.fact_pcf, join.dimension_pcf
+
+            # Rows of the projection beyond the total of the fact column have no join partner (e.g. their fact join
+            # key is NULL). They do not contribute to the output.
+            in_range = cumulative <= fact_pcf.cardinality()
+            dimension_idx = fact_pcf.invert_cumulative_at(cumulative)
+
+            res = res * np.where(in_range, dim_pcf.evaluate_at(dimension_idx), 0)
+
+        return res
+
+    def _materialize_output(self) -> PiecewiseConstantFn:
+        breaks = [self._proj.bounds]
+
+        for join in self._dimension_joins:
+            fact, dimension = join.fact_pcf.output_pcf(), join.dimension_pcf.output_pcf()
+            cumulative = fact.cumulative_at(np.concat((fact.bounds, dimension.bounds)))
+            indexes = self._proj.invert_cumulative_at(cumulative[cumulative <= self._proj.cardinality()])
+            breaks.append(indexes)
+
+        breaks_arr = np.concat(breaks)
+        sample_points = breaks_arr[(breaks_arr > 0) & (breaks_arr <= self._proj.n_distinct)]
+        sample_points = np.unique(sample_points)
+
+        if len(sample_points) == 0:
+            return PiecewiseConstantFn.zero()
+
+        mid_points = (np.concat(([0], sample_points[:-1])) + sample_points) / 2
+        frequencies = self._frequencies_at(mid_points)
+
+        return PiecewiseConstantFn(frequencies, bounds=sample_points)
 
     def _inspect_internal(self) -> list[str]:
         padding = "  "
@@ -532,6 +532,22 @@ def _select_acyclic_root(join_graph: nx.Graph) -> pb.TableReference:
     return next(node for node in join_graph.nodes if join_graph.degree[node] == 1)
 
 
+def _prune_dangling_joins(join_graph: nx.Graph) -> nx.Graph:
+    """Removes all join nodes that are connected to only one table.
+
+    This can happen as part of networkx's spanning tree iterator, which must keep the join nodes. Once a join is
+    ignored, we must also ignore the node itself.
+    """
+    danling = [
+        node
+        for node, data in join_graph.nodes.data(True)
+        if join_graph.degree[node] == 1 and data["node_type"] == "join"
+    ]
+    pruned = join_graph.copy()
+    pruned.remove_nodes_from(danling)
+    return pruned
+
+
 def decompose_acyclic(
     join_graph: nx.Graph,
     root: pb.TableReference | None = None,
@@ -615,7 +631,7 @@ def fdsb_graph(query: pb.SqlQuery) -> nx.Graph:
 
     for i, eqc in enumerate(pb.qal.determine_join_equivalence_classes(joins)):
         join_graph.add_node(i, node_type="join")
-        join_graph.add_edges_from((i, col, {"join_col": col}) for col in eqc)
+        join_graph.add_edges_from((i, col.table, {"join_col": col}) for col in eqc)
     return join_graph
 
 
@@ -678,6 +694,7 @@ def fdsb(
 
     best_bound = np.inf
     for acyclic in nx.SpanningTreeIterator(join_graph):
+        acyclic = _prune_dangling_joins(acyclic)
         root = _select_acyclic_root(acyclic)
         decomposed = decompose_acyclic(acyclic, root, statistics=statistics)
         cardinality = decomposed.cardinality()

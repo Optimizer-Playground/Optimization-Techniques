@@ -27,6 +27,10 @@ class FunctionLike(Protocol):
         """Get the number of distinct values in the output."""
         ...
 
+    def output_pcf(self) -> PiecewiseConstantFn:
+        """Provides the PCF that is computed by this function."""
+        ...
+
     def columns(self) -> set[pb.ColumnReference]:
         """Provides all join columns that are part of this function, including nested steps."""
         ...
@@ -303,13 +307,6 @@ class Segment:
         span = self.higher - self.lower
         return self.slope * span + self.intercept
 
-    def invert(self) -> Segment:
-        """Computes the inverse segment.
-
-        This segment uses the same interval, but slope and and intercept are inverted.
-        """
-        return Segment(self.lower, self.higher, 1 / self.slope, -self.intercept)
-
     def __call__(self, i: int) -> int:
         if not self.lower <= i < self.higher:
             raise ValueError(f"i={i} is out of bounds for segment [{self.lower}, {self.higher})")
@@ -415,9 +412,16 @@ class PiecewiseConstantFn:
         """Get the number of distinct values in the output PCF."""
         return self._num_distinct
 
+    def output_pcf(self) -> PiecewiseConstantFn:
+        return self
+
     def columns(self) -> set[pb.ColumnReference]:
         """Provides all join columns that are part of this alpha step, including nested steps."""
         return set() if self.column is None else {self.column}
+
+    def is_zero(self) -> bool:
+        """Checks whether this PCF is a 0-PCF."""
+        return list(self._bounds) == [0]
 
     def cardinality(self) -> int:
         """Computes the upper bound of the output relation's cardinality."""
@@ -431,22 +435,6 @@ class PiecewiseConstantFn:
         widths = np.diff(np.concat(([0], self._bounds)))
         intercepts = np.cumsum(widths * self._values)
         return PiecewiseLinearFn(slopes=self._values, intercepts=intercepts, bounds=self._bounds)
-
-    def cut_at(self, n_distinct: int) -> PiecewiseConstantFn:
-        """Cuts the PCF after the first `n_distinct` values.
-
-        If the PCF contains less than `n_distinct` values in total, it is returned as-is.
-        Note that we are using *values* here, not *segments*. Each segment typically spans multiple
-        values.
-        """
-        if self._num_distinct < n_distinct:
-            return self
-
-        cum_widths = np.cumsum(self._widths)
-        cutoff = np.searchsorted(cum_widths, n_distinct)
-        values = self._values[cutoff + 1]
-        bounds = np.concat((self._bounds[:cutoff], [n_distinct]))
-        return PiecewiseConstantFn(values, bounds)
 
     def align_with(self, other: PiecewiseConstantFn) -> tuple[PiecewiseConstantFn, PiecewiseConstantFn]:
         """Provides two aligned versions of the PCFs as (algined_self, aligned_other).
@@ -464,18 +452,79 @@ class PiecewiseConstantFn:
         segments with the same intercepts. While those could be merged into a single segment, we
         currently do not perform such an optimization.
         """
-        aligned_self, aligned_other = align_functions(self, other, cut_early=True)
+        if self.is_zero() and other.is_zero():
+            return self
+
+        aligned_self, aligned_other = align_functions(self, other, cut_early=False)
         if self.column is None:
             col = other.column
         elif other.column is None or self.column == other.column:
             col = self.column
         else:
             col = None
-        return PiecewiseConstantFn(
-            np.min([aligned_self._values, aligned_other._values], axis=0),
-            aligned_self._bounds,
-            column=col,
-        )
+
+        # Even if our segments are aligned, calculating the minimum is more complicated than just computing the
+        # per-segment minimum of the PCFs.
+        # The reason is somewhat hidden at the end of section 3.3 (valid compression) of the SafeBound paper: for
+        # compressed sequences, it is no longer guaranteed that every segment dominates the original values.
+        # This remains true only for the _cumulative_ degree sequence. Therefore, we need to base our min algorithm on
+        # the cumulative values.
+        # Sadly, working with the cumulative values is a bit harder: Cumulative segments are represented as linear
+        # functions. Such functions can intersect, thereby changing which function is the smaller one within a segment.
+        # If this situation occurs, we need to split the segment into two smaller ones and assign the smaller function
+        # to each.
+        # Our algorithm works by computing the linear functions for each segment and than checking the intersection
+        # point. If it falls within the segment, we need to split it. Otherwise, we can just use the smaller function.
+
+        values: list[float] = []
+        bounds: list[float] = []
+        lo = 0
+        for i, hi in enumerate(aligned_self._bounds):
+            if hi <= lo:
+                # skip zero-width segments from alignment fiwth a single zero PCF
+                continue
+
+            seg_start_self = aligned_self._cumulative[i - 1] if i else 0
+            seg_start_other = aligned_other._cumulative[i - 1] if i else 0
+
+            seg_end_self, seg_end_other = aligned_self._cumulative[i], aligned_other._cumulative[i]
+
+            slope_self = (seg_end_self - seg_start_self) / aligned_self._widths[i]
+            slope_other = (seg_end_other - seg_start_other) / aligned_other._widths[i]
+
+            if slope_self == slope_other:
+                # The lines are parallel, so they do not cross. Just use the smaller one.
+                target_val = (
+                    aligned_self._values[i]
+                    if aligned_self._cumulative[i] < aligned_other._cumulative[i]
+                    else aligned_other._values[i]
+                )
+                values.append(target_val)
+                bounds.append(hi)
+                lo = hi
+                continue
+
+            crossover_point = lo + (seg_start_other - seg_start_self) / (slope_self - slope_other)
+            if lo < crossover_point < hi:
+                # The lines cross inside the segment, split it into two segments.
+                min_before = aligned_self._values[i] if seg_start_self < seg_start_other else aligned_other._values[i]
+                min_after = aligned_self._values[i] if seg_end_self < seg_end_other else aligned_other._values[i]
+                values.extend([min_before, min_after])
+                bounds.extend([crossover_point, hi])
+                lo = hi
+                continue
+
+            # The lines do not cross within the segment, just use the smaller one.
+            target_val = (
+                aligned_self._values[i]
+                if aligned_self._cumulative[i] < aligned_other._cumulative[i]
+                else aligned_other._values[i]
+            )
+            values.append(target_val)
+            bounds.append(hi)
+            lo = hi
+
+        return PiecewiseConstantFn(values, bounds=bounds, column=col)
 
     def expand_by(self, n: int | PiecewiseConstantFn) -> PiecewiseConstantFn:
         """Expands a single-segment PCF to cover an additonal `n` values.
@@ -503,7 +552,7 @@ class PiecewiseConstantFn:
         if not isinstance(vals, np.ndarray):
             vals = np.asarray(vals)
 
-        idx = np.searchsorted(self._bounds, vals)
+        idx = np.searchsorted(self._bounds, vals, side="left")
         out_of_bounds = idx >= len(self._values)
         clipped = np.where(out_of_bounds, 0, idx)
         return np.where(
@@ -522,26 +571,18 @@ class PiecewiseConstantFn:
         if not isinstance(vals, np.ndarray):
             vals = np.asarray(vals)
 
-        idx = np.searchsorted(self._bounds, vals)
-        out_of_bounds = idx >= len(self._values)
-        clipped_upper = np.where(out_of_bounds, 0, idx)
-        in_initial_bucket = idx == 0
-        clipped_lower = np.where(in_initial_bucket, 1, clipped_upper)
+        vals = np.minimum(vals, self._num_distinct)  # clip to max distinct values
 
-        cumulative_until_idx = np.where(
-            in_initial_bucket | out_of_bounds,
-            0,  # out of bounds
-            self._cumulative[clipped_lower - 1],
-        )
+        idx = np.searchsorted(self._bounds, vals, side="left")
+        prev_idx = idx - 1
 
-        bucket_vals = np.where(out_of_bounds, 0, self._values[clipped_upper])
-        in_bucket = np.where(
-            out_of_bounds,
-            0,  # mask
-            (self._cum_widths[clipped_upper] - vals) * bucket_vals,
-        )
+        cumulative_before = np.where(idx == 0, 0, self._cumulative[prev_idx])
+        bound_before = np.where(idx == 0, 0, self._bounds[prev_idx])
 
-        return cumulative_until_idx + in_bucket
+        bucket_pos = vals - bound_before
+        bucket_freq = bucket_pos * self._values[idx]
+
+        return cumulative_before + bucket_freq
 
     def invert_cumulative_at(self, vals: np.ndarray) -> np.ndarray:
         """Computes the PCF indexes that reach the given cumulative frequencies.
@@ -553,19 +594,20 @@ class PiecewiseConstantFn:
         if not isinstance(vals, np.ndarray):
             vals = np.asarray(vals)
 
-        idx = np.searchsorted(self._cumulative, vals)
-        out_of_bounds = idx >= len(self._values)
-        clipped_upper = np.where(out_of_bounds, 0, idx)
-        in_initial_bucket = idx == 0
-        clipped_lower = np.where(in_initial_bucket, 1, clipped_upper)
+        total_card = self._cumulative[-1]
+        vals = np.minimum(vals, total_card)
 
-        freq_until_bucket = np.where(in_initial_bucket | out_of_bounds, 0, self._cum_widths[clipped_lower - 1])
+        idx = np.searchsorted(self._cumulative, vals, side="left")
 
-        prev_bucket_freq = np.where(in_initial_bucket, 0, self._cumulative[clipped_lower - 1])
-        per_elem_freq = np.where(out_of_bounds, 1, self._values[clipped_upper])  # use 1 to prevent division by 0
-        in_bucket_freq = (vals - prev_bucket_freq) / per_elem_freq
+        cumulative_before = np.where(idx == 0, 0, self._cumulative[idx - 1])
+        bucket_total = vals - cumulative_before
+        bucket_freq = self._values[idx]
 
-        return np.where(out_of_bounds, 0, freq_until_bucket + in_bucket_freq)
+        in_bucket_pos = np.divide(
+            bucket_total, bucket_freq, out=np.zeros_like(bucket_total, dtype=float), where=bucket_freq > 0
+        )
+        bound_offset = np.where(idx == 0, 0, self._bounds[idx - 1])
+        return bound_offset + in_bucket_pos
 
     def inspect(self) -> str:
         """Provides a human-readable representation of the PCF."""
@@ -756,28 +798,8 @@ class PiecewiseLinearFn:
         """Computes the derivative of the PLF, which yields a piecewise constant function."""
         return PiecewiseConstantFn(self._slopes, self._bounds, column=self.column)
 
-    def invert(self) -> PiecewiseLinearFn:
-        """Computes the inverse of the PLF.
-
-        The inverse is computed by inverting each segment individually and aligning their intercepts.
-        """
-        return PiecewiseLinearFn(
-            slopes=1 / self._slopes,
-            intercepts=-1 * self._intercepts,
-            bounds=self._bounds,
-            column=self.column,
-        )
-
     def __len__(self) -> int:
         return len(self._slopes)
-
-    def __call__(self, vals: np.ndarray) -> np.ndarray:
-        idx = np.searchsorted(self._bounds, vals)
-        return np.where(
-            idx >= self._num_distinct,
-            0,  # too few distinct values
-            self._slopes[idx] * vals + self._intercepts[idx],
-        )
 
 
 def align_functions(

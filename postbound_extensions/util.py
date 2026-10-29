@@ -100,7 +100,35 @@ def _noop_parser[T](value: T) -> T:
     return value
 
 
-def _date_parser(d: str) -> date:
+def _int_parser(value: int | str) -> int | None:
+    match value:
+        case "null":
+            return None
+        case int():
+            return value
+        case _:
+            return int(value)
+
+
+def _float_parser(value: float | str) -> float | None:
+    match value:
+        case "null":
+            return None
+        case float():
+            return value
+        case _:
+            return float(value)
+
+
+def _timestamp_parser(ts: str) -> datetime | None:
+    if ts == "null":
+        return None
+    return datetime.fromisoformat(ts)
+
+
+def _date_parser(d: str) -> date | None:
+    if d == "null":
+        return None
     return datetime.fromisoformat(d).date()
 
 
@@ -113,10 +141,14 @@ def make_json_parser(column_dtype: str) -> Callable[[Any], Any]:
     column_dtype = column_dtype.lower()
     match column_dtype:
         case "timestamp" | "timestamp with time zone" | "timestamp without time zone":
-            return datetime.fromisoformat
+            return _timestamp_parser
         case "date":
             return _date_parser
-        case "varchar" | "character varying" | "text" | "integer":
+        case "integer" | "bigint" | "smallint":
+            return _int_parser
+        case "float" | "double precision" | "real":
+            return _float_parser
+        case "varchar" | "character varying" | "text":
             return _noop_parser
         case _:
             raise ValueError(f"Missing JSON parser for column type {column_dtype}")

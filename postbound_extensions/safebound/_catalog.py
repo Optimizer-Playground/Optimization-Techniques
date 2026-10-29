@@ -189,7 +189,7 @@ class _CatalogVisitor(pb.qal.PredicateVisitor[None]):
                     self._log(f"Detected range-conditioned PCF on {join_col} for {simplified}")
                     self.spec.range_cols[join_col].add(filter_col)
 
-            case pb.qal.BinaryOperator.Like | pb.qal.BinaryOperator.ILike:
+            case pb.qal.BinaryOperator.Like:
                 for join_col in join_map[filter_col.table]:
                     self._log(f"Detected like-conditioned PCF on {join_col} for {simplified}")
                     self.spec.like_cols[join_col].add(filter_col)
@@ -232,34 +232,16 @@ class _CatalogVisitor(pb.qal.PredicateVisitor[None]):
         # SafeBound does not handle unary predicates
         pass
 
-    def visit_not_predicate(
-        self,
-        predicate: pb.qal.CompoundPredicate,
-        child_predicate: pb.qal.AbstractPredicate,
-        *args,
-        **kwargs,
-    ) -> None:
+    def visit_not_predicate(self, predicate: pb.qal.NotPredicate, *args, **kwargs) -> None:
         # SafeBound does not handle NOT predicates
         pass
 
-    def visit_or_predicate(
-        self,
-        predicate: pb.qal.CompoundPredicate,
-        components: Sequence[pb.qal.AbstractPredicate],
-        *args,
-        **kwargs,
-    ) -> None:
-        for child in components:
+    def visit_or_predicate(self, predicate: pb.qal.OrPredicate, *args, **kwargs) -> None:
+        for child in predicate.children:
             child.accept_visitor(self, *args, **kwargs)
 
-    def visit_and_predicate(
-        self,
-        predicate: pb.qal.CompoundPredicate,
-        components: Sequence[pb.qal.AbstractPredicate],
-        *args,
-        **kwargs,
-    ) -> None:
-        for child in components:
+    def visit_and_predicate(self, predicate: pb.qal.AndPredicate, *args, **kwargs) -> None:
+        for child in predicate.children:
             child.accept_visitor(self, *args, **kwargs)
 
 
@@ -276,7 +258,7 @@ def _build_join_map(
 
 
 def catalog_from_workload(
-    workload: pb.Workload,
+    workload: pb.Workload[Any, pb.SqlQuery],
     verbose: bool | pb.util.Logger = False,
 ) -> CatalogSpec:
     """Infers the conditioned PCFs to build based on the predicates of workload queries.
@@ -289,11 +271,21 @@ def catalog_from_workload(
     logger = wrap_logger(verbose)
     spec = CatalogSpec.empty()
     visitor = _CatalogVisitor(spec, log=logger)
+
     for query in workload.queries():
+        predicates = query.predicates()
+        if predicates is None:
+            continue
+
         join_map = _build_join_map(query)
-        visitor.visit_query_predicates(query, join_map=join_map)
+        visitor.visit_query_predicates(predicates, join_map=join_map)
+
         join_cols = pb.util.set_union(pred.columns() for pred in query.joins())
+        if not pb.ColumnReference.all_bound(join_cols):
+            raise ValueError("All join columns must be bound to a table")
+
         spec.unconditioned_cols |= {col.drop_table_alias() for col in join_cols}
+
     return spec
 
 
@@ -429,54 +421,33 @@ def fetch_correlated_ds(
     --------
     valid_compress : The compression algorithm used to compress the degree sequence.
     """
+    on_filter = pb.qal.as_predicate(on, "IS NOT NULL")
+
     select_clause = pb.qal.Select.count_star()
     from_clause = pb.qal.From.create_for(on.table)
-    where_clause = pb.qal.Where(predicate)
+    where_clause = pb.qal.Where(pb.qal.AndPredicate([predicate, on_filter]))
     group_clause = pb.qal.GroupBy.create_for(on)
     sql = pb.qal.as_query(select_clause, from_clause, where_clause, group_clause)
 
     result_set = database.execute_query(sql, raw=True)
     if not result_set:
-        raise ValueError(f"No matches for correlated query {sql}")
+        # all matching rows have a NULL join key
+        return PiecewiseConstantFn.zero(column=on)
 
     ds = DegreeSequence([row[0] for row in result_set], column=on)
     piecewiese_linear = valid_compress(ds, accuracy=accuracy)
     return piecewiese_linear.deriv()
 
 
-def fetch_column_values(
-    column: pb.BoundColumnReference,
-    database: pb.Database,
-    *,
-    drop_null: bool = False,
-) -> list:
-    """Loads all values of a column.
-
-    Columns are not filtered by any predicate, but NULL values can optionally be dropped. No
-    ordering or duplicate elimination is performed.
-    """
-    select_clause = pb.qal.Select.create_for(column)
-    from_clause = pb.qal.From.create_for(column.table)
-    if drop_null:
-        no_null = pb.qal.as_predicate(column, "is not", None)
-        where_clause = pb.qal.Where(no_null)
-    else:
-        where_clause = None
-
-    sql = pb.qal.as_query(select_clause, from_clause, where_clause)
-
-    # we cannot use result set simplification here because the table might contain
-    # just a single row. In that case, simplification would unwrap the column
-    # value completely.
-    result_set = database.execute_query(sql, raw=True)
-    return [row[0] for row in result_set]
-
-
-def fetch_column_distribution(column: pb.BoundColumnReference, database: pb.Database) -> list[tuple[Any, int]]:
+def fetch_column_distribution(
+    column: pb.BoundColumnReference, database: pb.Database, *, exclude_nulls: bool = False
+) -> list[tuple[Any, int]]:
     """Builds an ordered list of (value, frequency) pairs of all distinct values in the column.
 
     In contrast to an MCV list, the column distribution is ordered by column value and not by value
     frequency.
+
+    The treatment of NULL values can be controlled via `exclude_nulls`.
     """
     select_clause = pb.qal.Select(
         [
@@ -485,11 +456,78 @@ def fetch_column_distribution(column: pb.BoundColumnReference, database: pb.Data
         ]
     )
     from_clause = pb.qal.From.create_for(column.table)
+    where_clause = pb.qal.Where(pb.qal.as_predicate(column, "IS NOT NULL")) if exclude_nulls else None
     group_clause = pb.qal.GroupBy.create_for(column)
     order_clause = pb.qal.OrderBy.create_for(column, ascending=True, nulls_first=True)
-    sql = pb.qal.as_query(select_clause, from_clause, group_clause, order_clause)
+    sql = pb.qal.as_query(select_clause, from_clause, where_clause, group_clause, order_clause)
 
     return database.execute_query(sql, raw=True)  # type: ignore
+
+
+def fetch_mcv_ds(
+    column: pb.BoundColumnReference,
+    *,
+    on: pb.BoundColumnReference,
+    database: pb.Database,
+    num_mcv: int,
+    accuracy: float = 0.01,
+) -> Mapping[Any, PiecewiseConstantFn]:
+    filter_col = column.name
+    join_col = on.name
+    table = column.table.full_name
+
+    # CAREFUL: the template below must mirror the SQL query that is used for fetch_non_mcv_ds, especially the
+    # computation of frequent/infrequent values. Otherwise, some values might end up in both degree sequences or in
+    # neither one. MAKE SURE TO ALWAYS KEEP THE TWO IN SYNC!!
+    #
+    # NB: we opt for an explicit template rather than PostBOUND's query construction logic because the latter would
+    # shadow the actual implementation too much and the query is already quite complicated as it is. This should make
+    # it easier to debug in the future.
+
+    sql_template = f"""
+        WITH frequencies AS (
+            SELECT
+                "{join_col}",
+                "{filter_col}",
+                count(*) over (partition by "{filter_col}") as filter_freq
+            FROM "{table}"
+            WHERE "{join_col}" is not null
+                AND "{filter_col}" is not null
+        ), ranked AS (
+            SELECT
+                "{join_col}",
+                "{filter_col}",
+                filter_freq,
+                dense_rank() over (order by filter_freq desc, "{filter_col}" desc) as filter_rank
+            FROM frequencies
+        ), mcv_vals AS (
+            SELECT "{join_col}",
+                "{filter_col}",
+                count(*) AS freq,
+                row_number() over (partition by "{filter_col}" order by count(*) desc) as rnk
+            FROM ranked
+            WHERE filter_rank <= {num_mcv}
+            GROUP BY "{join_col}", "{filter_col}"
+        )
+        SELECT "{filter_col}", freq
+        FROM mcv_vals
+        ORDER BY "{filter_col}" asc, rnk asc;
+    """
+
+    result_set = database.execute_query(sql_template, raw=True)
+    if not result_set:
+        return {}
+
+    collector = collections.defaultdict(list)
+    for filter_val, freq in result_set:
+        collector[filter_val].append(freq)
+
+    mcv_ds = {
+        filter_val: valid_compress(DegreeSequence(frequencies, column=on), accuracy=accuracy).deriv()
+        for filter_val, frequencies in collector.items()
+    }
+
+    return mcv_ds
 
 
 def fetch_non_mcv_ds(
@@ -500,43 +538,55 @@ def fetch_non_mcv_ds(
     num_mcv: int,
     accuracy: float = 0.01,
 ) -> PiecewiseConstantFn:
-    freq_select = pb.qal.Select(
-        [
-            pb.qal.Projection.column(on),
-            pb.qal.Projection(
-                pb.qal.WindowExpression(
-                    pb.qal.FunctionExpression.create_count(),
-                    partitioning=[pb.qal.ColumnExpression(column)],
-                ),
-                "freq",
-            ),
-        ]
-    )
-    freq_from = pb.qal.From.create_for(on.table)
-    freq_cte = pb.qal.WithQuery(pb.qal.build_query([freq_select, freq_from]), "frequencies")
+    filter_col = column.name
+    join_col = on.name
+    table = column.table.full_name
 
-    freq_col = pb.ColumnReference("freq", freq_cte.target_table)
-    pos_select = pb.qal.Select(
-        [
-            pb.qal.Projection.column(on.bind_to(freq_cte.target_table)),
-            pb.qal.Projection(
-                pb.qal.WindowExpression("row_number", ordering=pb.qal.OrderBy.create_for(freq_col)),
-                "pos",
-            ),
-        ]
-    )
-    pos_from = pb.qal.From.create_for(freq_cte.target_table)
-    pos_cte = pb.qal.WithQuery(pb.qal.build_query([pos_select, pos_from]), "positions")
+    # CAREFUL: the template below must mirror the SQL query that is used for fetch_mcv_ds, especially the
+    # computation of frequent/infrequent values. Otherwise, some values might end up in both degree sequences or in
+    # neither one. MAKE SURE TO ALWAYS KEEP THE TWO IN SYNC!!
+    #
+    # NB: we opt for an explicit template rather than PostBOUND's query construction logic because the latter would
+    # shadow the actual implementation too much and the query is already quite complicated as it is. This should make
+    # it easier to debug in the future.
 
-    pos_col = pb.ColumnReference("pos", pos_cte.target_table)
-    agg_with = pb.qal.CommonTableExpression([freq_cte, pos_cte])
-    agg_select = pb.qal.Select.count_star()
-    agg_from = pb.qal.From.create_for(pos_cte.target_table)
-    agg_where = pb.qal.Where(pb.qal.as_predicate(pos_col, ">=", num_mcv))
-    agg_group = pb.qal.GroupBy.create_for(on.bind_to(pos_cte.target_table))
-    sql = pb.qal.build_query([agg_with, agg_select, agg_from, agg_where, agg_group])
+    sql_template = f"""
+        WITH frequencies AS (
+            SELECT
+                "{join_col}",
+                "{filter_col}",
+                count(*) over (partition by "{filter_col}") as filter_freq
+            FROM "{table}"
+            WHERE "{join_col}" is not null
+                AND "{filter_col}" is not null
+        ), ranked AS (
+            SELECT
+                "{join_col}",
+                "{filter_col}",
+                filter_freq,
+                dense_rank() over (order by filter_freq desc, "{filter_col}" desc) as filter_rank
+            FROM frequencies
+        ), rare_vals AS (
+            SELECT
+                "{join_col}",
+                "{filter_col}",
+                count(*) AS freq,
+                row_number() over (partition by "{filter_col}" order by count(*) desc) as rnk
+            FROM ranked
+            WHERE filter_rank > {num_mcv}
+            GROUP BY "{join_col}", "{filter_col}"
+        ), aggregated AS (
+            SELECT rnk,
+                max(freq) as freq
+            FROM rare_vals
+            GROUP BY rnk
+        )
+        SELECT freq
+        FROM aggregated
+        ORDER BY rnk asc
+    """
 
-    result_set = database.execute_query(sql, raw=True)
+    result_set = database.execute_query(sql_template, raw=True)
     if not result_set:
         return PiecewiseConstantFn.zero(column=on)
 
@@ -561,7 +611,7 @@ class EqualityConditionedPCF[T]:
     def __init__(
         self,
         equality_col: pb.ColumnReference,
-        functions: dict[T, PiecewiseConstantFn],
+        functions: Mapping[T, PiecewiseConstantFn],
         unconditioned: PiecewiseConstantFn,
     ) -> None:
         self._col = equality_col
@@ -722,17 +772,10 @@ def build_equality_mcvs(
 
     for join_col, filter_cols in spec.equality_cols.items():
         for filter_col in filter_cols:
-            log(f"Fetching MCV for {filter_col}")
-            mcv = pb.db.PreciseStatistics(database).most_common_values(filter_col, k=None)
-            correlated_pcfs: dict[Any, PiecewiseConstantFn] = {}
-
-            for val in mcv.values[:mcv_size]:
-                operator = "is" if val is None else "="
-                wrapped_val = pb.qal.StaticValueExpression("*") if val == "*" else val
-                pred = pb.qal.as_predicate(filter_col, operator, wrapped_val)
-                log(f"Building conditioned PCF for {join_col} on {pred}")
-                pcf = fetch_correlated_ds(pred, on=join_col, accuracy=accuracy, database=database)
-                correlated_pcfs[val] = pcf
+            log(f"Building MCV PCFs for {join_col} on {filter_col}")
+            correlated_pcfs = fetch_mcv_ds(
+                filter_col, on=join_col, database=database, num_mcv=mcv_size, accuracy=accuracy
+            )
 
             log(f"Building non-mcv PCF for {join_col} on {filter_col}")
             non_mcv_pcf = fetch_non_mcv_ds(
@@ -1355,40 +1398,23 @@ def build_histogram_hierarchy[T: _HistogramKey](
 
     unique_join_col = database.schema().is_primary_key(join_col)
     lo, hi = values[0], values[-1]
-    lo_null, hi_null = False, False
 
     if lo == hi:
         # We are processing a value that is so frequent, it has an entire bucket for its own
         # Our "range predicate" should simply filter on this value.
-        if lo is None:
-            range_pred = pb.qal.as_predicate(range_col, "is null")
-            lo_null = True
-        else:
-            range_pred = pb.qal.as_predicate(range_col, "=", lo)
+        range_pred = pb.qal.as_predicate(range_col, "=", lo)
     else:
         # We are processing a proper range
-        if lo is None:
-            lo_pred = pb.qal.as_predicate(range_col, "is null")
-            lo_null = True
-        else:
-            lo_pred = pb.qal.as_predicate(range_col, ">=", lo)
 
-        if hi is None:
-            hi_pred = pb.qal.as_predicate(range_col, "is null")
-            hi_null = True
-        else:
-            # Greater-equals is the correct operation here!
-            # Our bisection logic below already ensures that all ranges are disjunct
-            # If we would do a strict-greater check here (as the histograms will do), we would loose the final
-            # bucket values.
-            hi_pred = pb.qal.as_predicate(range_col, "<=", hi)
+        lo_pred = pb.qal.as_predicate(range_col, ">=", lo)
 
-        if lo_null and hi_null:
-            range_pred = lo_pred
-        elif lo_null or hi_null:
-            range_pred = pb.qal.CompoundPredicate.create_or([lo_pred, hi_pred])
-        else:
-            range_pred = pb.qal.CompoundPredicate.create_and([lo_pred, hi_pred])
+        # Greater-equals is the correct operation here!
+        # Our bisection logic below already ensures that all ranges are disjunct
+        # If we would do a strict-greater check here (as the histograms will do), we would loose the final
+        # bucket values.
+        hi_pred = pb.qal.as_predicate(range_col, "<=", hi)
+
+        range_pred = pb.qal.CompoundPredicate.create_and([lo_pred, hi_pred])
 
     log(f"Loading range-conditioned PCF for {join_col} on bucket {range_pred}")
     pcf = fetch_correlated_ds(range_pred, on=join_col, database=database, accuracy=accuracy)
@@ -1404,16 +1430,9 @@ def build_histogram_hierarchy[T: _HistogramKey](
     cumulative = np.cumsum(frequencies)
     total_card = cumulative[-1]
     cutoff_card = total_card // 2
+
     cutoff_idx = np.searchsorted(cumulative, cutoff_card, side="right")
-    if cutoff_idx == 0 or cutoff_idx == len(values):
-        # we cannot split the histogram any further, since all values are in one bucket
-        return RangeConditionedPCF(
-            pcf,
-            unique_join_col=unique_join_col,
-            range_col=range_col,
-            lower_bound=lo,
-            upper_bound=hi,
-        )
+    cutoff_idx = max(cutoff_idx, 1)
     cutoff_point = values[cutoff_idx]
 
     lower_vals = values[:cutoff_idx]
@@ -1493,7 +1512,7 @@ def build_histograms(
     for join_col, filter_cols in spec.range_cols.items():
         for range_col in filter_cols:
             log(f"Loading column distribution for {join_col} conditioned on {range_col}")
-            filter_distribution = fetch_column_distribution(range_col, database)
+            filter_distribution = fetch_column_distribution(range_col, database, exclude_nulls=True)
             values, frequencies = zip(*filter_distribution)
             histogram = build_histogram_hierarchy(
                 np.array(frequencies),
@@ -1626,7 +1645,7 @@ class LikeConditionsRepo:
     Parameters
     ----------
     join_pcfs : dict[pb.ColumnReference, Sequence[LikeConditionedPCF]]
-        A mapping from join column to the equality-conditioned PCFs for that column. Each PCF should
+        A mapping from join column to the like-conditioned PCFs for that column. Each PCF should
         be conditioned on a different filter column.
     """
 
@@ -1661,10 +1680,11 @@ class LikeConditionsRepo:
         if target_pcf is None:
             return None
 
-        components = like_val.split("%")
+        pct_components = like_val.split("%")
+        components = pb.util.flatten(comp.split("_") for comp in pct_components)
         final_pcf: PiecewiseConstantFn | None = None
         for val in components:
-            if not val:
+            if not val or len(val) < 3:
                 continue
             elif final_pcf is None:
                 final_pcf = target_pcf.get(val)
@@ -1698,80 +1718,6 @@ class LikeConditionsRepo:
             entry = {"column": col, "pcfs": pcfs}
             jsonized.append(entry)
         return {"pcfs": jsonized}
-
-
-def trigram_frequency(documents: list[str], *, mcv_size: int) -> tuple[list[str], list[str]]:
-    """Determines frequent and infrequent 3-grams for a collection of text documents.
-
-    The `documents` are the full texts that will be split into 3-grams. For each unique 3-gram, its
-    total frequency in the corpus is determined. Afterwards, the `mcv_size` many most frequent
-    3-grams are considered as "frequent", while all remaining 3-grams are considered "infrequent".
-
-    The individual 3-grams are returned as a pair (frequent 3-grams, infrequent 3-grams).
-    """
-    counter = collections.Counter()
-    for txt in documents:
-        for gram in trigrams(txt):
-            counter[gram] += 1
-
-    frequent_grams = [elem for elem, _ in counter.most_common(mcv_size)]
-    # see https://docs.python.org/3/library/collections.html#counter-objects for the weird syntax
-    rare_grams = [elem for elem, _ in counter.most_common()[: -mcv_size - 1 : -1]]
-
-    return frequent_grams, rare_grams
-
-
-def build_trigram_pcf(
-    frequent_trigrams: list[str],
-    rare_trigrams: list[str],
-    *,
-    join_col: pb.BoundColumnReference,
-    like_col: pb.BoundColumnReference,
-    accuracy: float,
-    database: pb.Database,
-    log: pb.util.Logger,
-) -> LikeConditionedPCF:
-    """Constructs the LIKE-conditioned PCFs for a specific (join column, filter column) pair.
-
-    This is basically just a helper for `build_3grams` that fetches the correlated PCFs for all
-    frequent/infrequent 3-grams.
-
-    Parameters
-    ----------
-    frequent_trigrams : list[str]
-        The list of 3-grams that are considered "frequent" and thus get their own PCF.
-    rare_trigrams : list[str]
-        The list of 3-grams that are considered "infrequent" and thus get merged into the
-        a single PCF.
-    join_col : pb.BoundColumnReference
-        The join column that the resulting PCFs should be defined on. This is required to fetch the
-        correlated degree sequences from the database and to construct the resulting PCFs.
-    like_col : pb.BoundColumnReference
-        The filter column that the resulting PCFs should be conditioned on. This is required to
-        fetch the correlated degree sequences from the database and to construct the resulting PCFs.
-    accuracy : float
-        The accuracy to use when compressing the raw degree sequences into PCFs. This corresponds to
-        the *c* parameter in the original SafeBound paper.
-    database : pb.Database
-        The database to fetch the degree sequences from.
-    log : pb.util.Logger
-        A logger to log the progress of the histogram construction. This can be a dummy log if
-        logging is disabled.
-    """
-    frequent_pcfs: dict[str, PiecewiseConstantFn] = {}
-
-    for trigram in frequent_trigrams:
-        log(f"Building like-conditioned PCF for {join_col} on {like_col} for 3-gram '{trigram}'")
-        like_pred = pb.qal.as_predicate(like_col, "LIKE", f"%{trigram}%")
-        frequent_pcfs[trigram] = fetch_correlated_ds(like_pred, on=join_col, accuracy=accuracy, database=database)
-
-    rare_pcf = PiecewiseConstantFn.zero()
-    for trigram in rare_trigrams:
-        log(f"Building like-conditioned PCF for {join_col} on {like_col} for rare 3-gram '{trigram}'")
-        like_pred = pb.qal.as_predicate(like_col, "LIKE", f"%{trigram}%")
-        rare_pcf += fetch_correlated_ds(like_pred, on=join_col, accuracy=accuracy, database=database)
-
-    return LikeConditionedPCF(frequent_pcfs, unconditioned=rare_pcf, like_col=like_col)
 
 
 def build_frequent_trigrams(
@@ -1811,7 +1757,8 @@ def build_frequent_trigrams(
         join_type=JoinType.CrossJoin,
     )
     trigrams_from = From(trigrams_join)
-    trigrams_cte = WithQuery(pb.qal.as_query(trigrams_select, trigrams_from), "trigrams")
+    trigrams_where = Where(pb.qal.as_predicate(on, "IS NOT NULL"))
+    trigrams_cte = WithQuery(pb.qal.as_query(trigrams_select, trigrams_from, trigrams_where), "trigrams")
 
     freq_select = Select(
         [
@@ -1821,6 +1768,7 @@ def build_frequent_trigrams(
                 "dense_rank",
                 ordering=OrderBy.create_for(
                     trigram_freq_col.bind_to(trigrams_cte.target_table),
+                    trigram_col.bind_to(trigrams_cte.target_table),
                     ascending=False,
                 ),
                 target_name="trigram_pos",
@@ -1897,7 +1845,8 @@ def build_rare_trigrams(
         join_type=JoinType.CrossJoin,
     )
     trigrams_from = From(trigrams_join)
-    trigrams_cte = WithQuery(pb.qal.as_query(trigrams_select, trigrams_from), "trigrams")
+    trigrams_where = Where(pb.qal.as_predicate(on, "IS NOT NULL"))
+    trigrams_cte = WithQuery(pb.qal.as_query(trigrams_select, trigrams_from, trigrams_where), "trigrams")
 
     freq_select = Select(
         [
@@ -1907,6 +1856,7 @@ def build_rare_trigrams(
                 "dense_rank",
                 ordering=OrderBy.create_for(
                     trigram_freq_col.bind_to(trigrams_cte.target_table),
+                    trigram_col.bind_to(trigrams_cte.target_table),
                     ascending=False,
                 ),
                 target_name="trigram_pos",
@@ -2107,7 +2057,7 @@ class _Predicate2PCF(pb.qal.PredicateVisitor[PiecewiseConstantFn]):
             return pcf
 
         match simplified.operation:
-            case pb.qal.BinaryOperator.Equal | pb.qal.UnaryOperator.IsNull:
+            case pb.qal.BinaryOperator.Equal:
                 pcf = self._catalog.lookup_eq_conditioned(
                     join_col,
                     filter_col=simplified.column,
@@ -2146,7 +2096,7 @@ class _Predicate2PCF(pb.qal.PredicateVisitor[PiecewiseConstantFn]):
                     lower_inclusive=True,
                 )
 
-            case pb.qal.BinaryOperator.Like | pb.qal.BinaryOperator.ILike:
+            case pb.qal.BinaryOperator.Like:
                 assert isinstance(simplified.value, str)
                 pcf = self._catalog.lookup_like_conditioned(
                     join_col,
@@ -2214,16 +2164,13 @@ class _Predicate2PCF(pb.qal.PredicateVisitor[PiecewiseConstantFn]):
     def visit_unary_predicate(self, predicate: pb.qal.UnaryPredicate, *args, **kwargs) -> PiecewiseConstantFn:
         join_col = kwargs["join_col"]
         self._log(f"Falling back to unconditioned PCF for unary predicate {predicate} on join column {join_col}")
-
         pcf = self._catalog.lookup_unconditioned(join_col)
-
         self._callback(predicate, pcf)
         return pcf
 
     def visit_not_predicate(
         self,
-        predicate: pb.qal.CompoundPredicate,
-        child_predicate: pb.qal.AbstractPredicate,
+        predicate: pb.qal.NotPredicate,
         *args,
         **kwargs,
     ) -> PiecewiseConstantFn:
@@ -2237,14 +2184,13 @@ class _Predicate2PCF(pb.qal.PredicateVisitor[PiecewiseConstantFn]):
 
     def visit_or_predicate(
         self,
-        predicate: pb.qal.CompoundPredicate,
-        components: Sequence[pb.qal.AbstractPredicate],
+        predicate: pb.qal.OrPredicate,
         *args,
         **kwargs,
     ) -> PiecewiseConstantFn:
         pcf = PiecewiseConstantFn.zero()
 
-        for child in components:
+        for child in predicate.children:
             child_pcf = child.accept_visitor(self, *args, **kwargs)
             pcf += child_pcf
 
@@ -2253,12 +2199,11 @@ class _Predicate2PCF(pb.qal.PredicateVisitor[PiecewiseConstantFn]):
 
     def visit_and_predicate(
         self,
-        predicate: pb.qal.CompoundPredicate,
-        components: Sequence[pb.qal.AbstractPredicate],
+        predicate: pb.qal.AndPredicate,
         *args,
         **kwargs,
     ) -> PiecewiseConstantFn:
-        head, tail = components[0], components[1:]
+        head, tail = predicate.children[0], predicate.children[1:]
         pcf = head.accept_visitor(self, *args, **kwargs)
 
         for child in tail:
