@@ -1,15 +1,16 @@
 
 from collections import deque
-from collections.abc import Collection, Iterable, Sequence
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import postbound as pb
-from bidict import bidict
-from postbound.postgres import PostgresExplainPlan
+from postbound.postgres import PostgresPlan
 from tqdm import tqdm
 
+from .._mapping import BidirectionalMap
 from .._util import prepare_dir
 from ..hinting import CORE_HINT_LIBRARY, HintSet, HintSetFactory
 from ._executor import QueryExecutor, ResultSet, no_geqo
@@ -19,12 +20,12 @@ from ._util import HintSetStats, get_neighbors
 
 class FastgresLabelProvider:
 
-    def __init__(self, label_path: Path | str):
-        self._label_path = label_path
-        if isinstance(self._label_path, str):
-            self._label_path = Path(self._label_path)
-        self._df = pd.read_csv(self._label_path)
-        self._dict = dict()
+    def __init__(self, label_path: Path | str | pd.DataFrame):
+        self._label_path = None if isinstance(label_path, pd.DataFrame) else Path(label_path)
+        self._df = (label_path.copy() if isinstance(label_path, pd.DataFrame)
+                    else pd.read_csv(label_path, dtype={"query_name": str}))
+        self._df["query_name"] = self._df["query_name"].astype(str)
+        self._dict: dict[str, int] = {}
         self._build_label_dict()
 
     @property
@@ -36,17 +37,17 @@ class FastgresLabelProvider:
         for query_name, hint_set_int in filtered[["query_name", "hint_set_int"]].itertuples(index=False, name=None):
             self._dict[query_name] = hint_set_int
             if query_name.endswith(".sql"):
-                self._dict[query_name.rstrip(".sql")] = hint_set_int
+                self._dict[query_name.removesuffix(".sql")] = hint_set_int
 
 
     def get_label(self, query_name: str) -> int:
         return self._dict[query_name]
 
-    def get_labels(self, query_names: Sequence[str]) -> Collection[int]:
+    def get_labels(self, query_names: Sequence[str]) -> np.ndarray:
         labels = list()
         for query_name in query_names:
             labels.append(self._dict[query_name])
-        return labels
+        return np.asarray(labels)
 
 
 ExperienceStore = dict[int, HintSetStats]
@@ -70,7 +71,9 @@ class FastLabelSettings:
 
 class WorkloadLabelSettings:
 
-    def __init__(self, query_path: Path | str, db_string: str, *, label_settings: FastLabelSettings):
+    def __init__(self, query_path: Path | str | None = None, db_string: str | None = None, *,
+                 label_settings: FastLabelSettings, workload: pb.Workload | None = None,
+                 database: pb.postgres.PostgresDatabase | None = None):
         if isinstance(query_path, str):
             query_path = Path(query_path)
         self._query_path = query_path
@@ -78,8 +81,15 @@ class WorkloadLabelSettings:
 
         self.fls = label_settings
 
-        self.workload = pb.Workload.read(self._query_path)
-        self.dbc = pb.postgres.connect(application_name="FastLabel", connect_string=db_string)
+        if workload is None and query_path is None:
+            raise ValueError("Provide a workload or a query directory for labeling")
+        self.dbc = database if database is not None else pb.postgres.connect(
+            application_name="FastLabel", connect_string=db_string or "")
+        if workload is not None:
+            self.workload = workload
+        else:
+            assert self._query_path is not None
+            self.workload = pb.workloads.read_workload(self._query_path)
         self.plan_params = no_geqo()
         self.qex = QueryExecutor(self.dbc, plan_params=no_geqo())
         self.hsf = HintSetFactory(CORE_HINT_LIBRARY)
@@ -107,7 +117,7 @@ class QueryLabeling:
         self.restrictions = set()
         self.seen_plans = dict()
         self.current_level = 0
-        self.best_candidates = bidict()
+        self.best_candidates: BidirectionalMap[int, ResultSet] = BidirectionalMap()
         self.timeout = self.settings.fls.baseline_timeout
         self.optimal_candidate: ResultSet | None = None
         self.current_optimal_time = self.settings.fls.baseline_timeout
@@ -116,8 +126,10 @@ class QueryLabeling:
     def break_level(self):
         return self.current_level >= self.settings.fls.level_cap
 
-    def check_plan(self, hs: HintSet) -> tuple[ResultSet | None, PostgresExplainPlan]:
+    def check_plan(self, hs: HintSet) -> tuple[ResultSet | None, PostgresPlan]:
         res: ResultSet = self.exec(self.q_string, hs, self.settings.fls.baseline_timeout, explain=True)
+        if res.explain_plan is None:
+            raise TimeoutError(f"Could not obtain an EXPLAIN plan for query {self.q_name}")
         return self.seen_plans.get(res.explain_plan, None), res.explain_plan
 
     def eval_hs(self, hs: HintSet, timeout: float) -> tuple[ResultSet, bool]:
@@ -164,6 +176,8 @@ class QueryLabeling:
             self.timeout = self.current_optimal_time
 
     def check_es(self) -> bool:
+        if self.optimal_candidate is None:
+            raise ValueError("Evaluate a candidate before checking early stopping")
         optimal_candidate_level = self.best_candidates.inverse[self.optimal_candidate]
         return abs(optimal_candidate_level - self.current_level) >= self.settings.fls.early_stopping_threshold
 
@@ -185,7 +199,7 @@ class QueryLabeling:
             is_opt = True if self.optimal_candidate == query_result else False
             chosen = True if query_result in self.best_candidates.inverse else False
             writable_result = LabelingResult(
-                query_name=self.q_name.rstrip(".sql"),
+                query_name=self.q_name.removesuffix(".sql"),
                 hint_set_int=query_result.hint_set_int,
                 binary_rep=hs.bin_rep,
                 measured_time=query_result.time,

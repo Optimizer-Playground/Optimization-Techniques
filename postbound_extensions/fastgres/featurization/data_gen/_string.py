@@ -5,7 +5,7 @@ import hashlib
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 from tqdm import tqdm
 
@@ -15,7 +15,7 @@ from ._statistics import StatisticsComponent
 
 
 class FastgresStringComponent(StatisticsComponent):
-    skipped_string_columns = {
+    skipped_string_columns: ClassVar[dict[str, list[str]]] = {
         "account": ["display_name"],
         "answer": ["title", "body"],
         "question": ["title", "tagstring", "body"],
@@ -30,7 +30,7 @@ class FastgresStringComponent(StatisticsComponent):
         _classes: list[str] = field(default_factory=list)
         _encoder: dict[str, int] = field(default_factory=dict)
 
-        def fit_encoder(self, y: list[str], sorty_by: list[int]) -> FastgresStringComponent.FastgresLabelEncoder:
+        def fit_encoder(self, y: list[str | None], sorty_by: list[int]) -> FastgresStringComponent.FastgresLabelEncoder:
             if len(y) != len(sorty_by):
                 raise ValueError("Length of y and sorty_by must be the same.")
 
@@ -43,7 +43,7 @@ class FastgresStringComponent(StatisticsComponent):
             self._encoder = {key: idx for idx, key in enumerate(sorted_keys)}
             return self
 
-        def transform(self, values: str | list[str]) -> list[int]:
+        def transform(self, values: str | list[str]) -> list[float]:
             if isinstance(values, str):
                 values = [values]
             offset = 1
@@ -129,7 +129,7 @@ class FastgresStringComponent(StatisticsComponent):
         }
         return obj
 
-    def transform(self, table: str, column: str, values: str | list[str], skipped: dict) -> list[int]:
+    def transform(self, table: str, column: str, values: str | list[str] | None, skipped: dict) -> list[float]:
         if values is None:
             return [0]
         if isinstance(values, str):
@@ -140,7 +140,10 @@ class FastgresStringComponent(StatisticsComponent):
 
     @staticmethod
     def is_skipped(table: str, column: str, skipped_columns: dict):
-        return table in skipped_columns and column in skipped_columns[table]["columns"]
+        columns = skipped_columns.get(table, [])
+        if isinstance(columns, dict):
+            columns = columns.get("columns", [])
+        return column in columns
 
     @staticmethod
     def hash_character(value: str):

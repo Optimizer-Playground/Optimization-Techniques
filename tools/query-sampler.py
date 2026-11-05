@@ -33,9 +33,7 @@ def shutdown_pg(signum, frame, *, sampler_ctl: sampler.PostgresSamplerCtl) -> No
 def main() -> None:
     global infinite
 
-    parser = argparse.ArgumentParser(
-        description=description, formatter_class=argparse.RawDescriptionHelpFormatter
-    )
+    parser = argparse.ArgumentParser(description=description, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument(
         "--n-queries",
         "-n",
@@ -44,9 +42,7 @@ def main() -> None:
         help="Number of queries to generate. If --infinite is given, this is interpreted as the batch size. "
         "Default: 1000",
     )
-    parser.add_argument(
-        "--infinite", action="store_true", help="Generate samples until interrupted."
-    )
+    parser.add_argument("--infinite", action="store_true", help="Generate samples until interrupted.")
     parser.add_argument(
         "--min-tables",
         type=int,
@@ -111,9 +107,7 @@ def main() -> None:
         help="Cancel queries that run for longer than --timeout (full) seconds. "
         "By default, queries run until completion.",
     )
-    parser.add_argument(
-        "--verbose", "-v", action="store_true", help="Print log messages."
-    )
+    parser.add_argument("--verbose", "-v", action="store_true", help="Print log messages.")
     parser.add_argument("out", type=Path, help="Output file to store the results.")
 
     args = parser.parse_args()
@@ -161,9 +155,7 @@ def main() -> None:
     )
 
     out_file.parent.mkdir(parents=True, exist_ok=True)
-    signal.signal(
-        signal.SIGINT, functools.partial(shutdown_pg, sampler_ctl=sampler_ctl)
-    )
+    signal.signal(signal.SIGINT, functools.partial(shutdown_pg, sampler_ctl=sampler_ctl))
     atexit.register(sampler_ctl.shutdown)
 
     if args.infinite:

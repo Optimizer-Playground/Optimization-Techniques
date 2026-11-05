@@ -1,12 +1,14 @@
 from .._hint_library import HintLibrary
 from ..pg_lib._postgres_hints import (
-                                      CORE_HINTS,
-                                      PG12_HINTS,
-                                      PG13_HINTS,
-                                      PG14_HINTS,
-                                      PG15_HINTS,
-                                      PG16_HINTS,
-                                      PG17_HINTS,
+    CORE_HINTS,
+    PG12_HINTS,
+    PG13_HINTS,
+    PG14_HINTS,
+    PG15_HINTS,
+    PG16_HINTS,
+    PG17_HINTS,
+    PG18_HINTS,
+    PG19_HINTS,
 )
 
 CORE_HINT_LIBRARY = HintLibrary(CORE_HINTS)
@@ -16,3 +18,5 @@ PG_14_LIBRARY = HintLibrary(PG14_HINTS)
 PG_15_LIBRARY = HintLibrary(PG15_HINTS)
 PG_16_LIBRARY = HintLibrary(PG16_HINTS)
 PG_17_LIBRARY = HintLibrary(PG17_HINTS)
+PG_18_LIBRARY = HintLibrary(PG18_HINTS)
+PG_19_LIBRARY = HintLibrary(PG19_HINTS)

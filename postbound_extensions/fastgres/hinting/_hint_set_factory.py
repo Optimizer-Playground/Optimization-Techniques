@@ -29,4 +29,14 @@ class HintSetFactory:
         return HintSet.from_disabled_set(disabled_instructions, self.hint_library)
 
     def default_hint_set(self):
+        """Return the all-enabled starting point used by FastLabel's search."""
         return self.hint_set(2**self.hint_library.size-1)
+
+    def database_default_hint_set(self):
+        """Return the defaults declared by the library.
+
+        For example, a PG19 library with miscellaneous hints starts with JIT off.
+        Hint bits still encode actual on/off values; their meaning is unchanged.
+        """
+        defaults = sum(1 << i for i, hint in self.hint_library.hint_dict.items() if hint.db_instr_val)
+        return self.hint_set(defaults)

@@ -236,6 +236,13 @@ localtest*
 
 # FASTgres stuff
 /tests/
+# Keep the portable FastGRES compatibility tests while ignoring local experiments.
+#!/tests/
+#/tests/*
+#!/tests/fastgres/
+#/tests/fastgres/*
+#!/tests/fastgres/test_postbound_023.py
+#!/tests/fastgres/test_public_interface.py
 /queries/
 /postbound_extensions/fastgres/generated/
 /.idea

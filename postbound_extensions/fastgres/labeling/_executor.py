@@ -1,7 +1,7 @@
 from dataclasses import dataclass
 
 import postbound as pb
-from postbound.postgres import PostgresExplainPlan
+from postbound.postgres import PostgresDatabase, PostgresPlan
 
 from .._util import FgPbConverter
 from ..hinting import HintSet
@@ -13,13 +13,13 @@ class ResultSet:
     hint_set_int: int
     hinted_query: str
     time: float
-    timeout_used: float
+    timeout_used: float | None
     timed_out: bool
-    explain_plan: PostgresExplainPlan | None
+    explain_plan: PostgresPlan | None
 
     def __post_init__(self):
-        if not isinstance(self.explain_plan, PostgresExplainPlan) and self.explain_plan is not None:
-            raise ValueError("Explain Plan is not a PostgresExplainPlan")
+        if not isinstance(self.explain_plan, PostgresPlan) and self.explain_plan is not None:
+            raise ValueError("Explain Plan is not a PostgresPlan")
 
 def no_geqo(params: pb.PlanParameterization | None = None) -> pb.PlanParameterization:
     if params is None:
@@ -35,7 +35,7 @@ def no_para(params: pb.PlanParameterization | None = None) -> pb.PlanParameteriz
 
 
 class QueryExecutor:
-    def __init__(self, db_conn: pb.postgres.PostgresInterface, plan_params: pb.PlanParameterization):
+    def __init__(self, db_conn: PostgresDatabase, plan_params: pb.PlanParameterization | None):
         self.db = db_conn
         self.converter = FgPbConverter()
         self._plan_params = plan_params
@@ -79,11 +79,12 @@ class QueryExecutor:
                 timeout=timeout_s if timeout_s is not None else None
             )
             result_time_s = self.db.last_query_runtime()
-            writeable_result = PostgresExplainPlan(result[0])
+            writeable_result = PostgresPlan(result) if explain or explain_analyze else None
+            timed_out = False
         except TimeoutError:
-            result = None
-            result_time_s = timeout_s
+            result_time_s = timeout_s if timeout_s is not None else self.db.last_query_runtime()
             writeable_result = None
+            timed_out = True
 
         query_result = ResultSet(
             query=query_str,
@@ -91,7 +92,7 @@ class QueryExecutor:
             hinted_query=str(hinted_query),
             time=result_time_s,
             timeout_used=timeout_s,
-            timed_out=(result is None),
+            timed_out=timed_out,
             explain_plan=writeable_result,
         )
 

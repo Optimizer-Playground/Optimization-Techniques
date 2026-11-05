@@ -16,9 +16,9 @@ class DatabaseSchema:
     _schema: dict[str, dict[str, str]]
 
     @classmethod
-    def from_dbc(cls, dbc: pb.postgres.PostgresInterface | DatabaseConnection) -> DatabaseSchema:
+    def from_dbc(cls, dbc: pb.postgres.PostgresDatabase | DatabaseConnection) -> DatabaseSchema:
         from ..featurization import DatabaseConnection
-        if isinstance(dbc, pb.postgres.PostgresInterface):
+        if isinstance(dbc, pb.postgres.PostgresDatabase):
             dbc = DatabaseConnection(dbc)
         return cls(dbc.fg_schema)
 

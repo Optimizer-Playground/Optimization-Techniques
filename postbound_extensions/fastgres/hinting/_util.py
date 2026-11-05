@@ -21,12 +21,20 @@ def get_hint_abbreviations():
             "enable_memoize": "Mem",
             # pg15/16
             "enable_presorted_aggregate": "PSort-Agg",
+            # pg17
+            "enable_group_by_reordering": "Group-Reorder",
+            # pg18
+            "enable_distinct_reordering": "Distinct-Reorder",
+            "enable_self_join_elimination": "Self-J-Elim",
+            # pg19
+            "enable_eager_aggregate": "Eager-Agg",
             # partitions
             "enable_partitionwise_aggregate": "Part-Agg",
             "enable_partitionwise_join": "Part-J",
             "enable_partition_pruning": "Part-P",
             # multi backend
             "enable_async_append": "Async-A",
-            "geqo": "GEQO"
+            "geqo": "GEQO",
+            "jit": "JIT",
         }
     return abbreviations

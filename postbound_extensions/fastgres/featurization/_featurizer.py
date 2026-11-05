@@ -5,23 +5,26 @@ from collections.abc import Collection, Sequence
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
+from typing import ClassVar
 
 import numpy as np
 import postbound as pb
 from postbound.qal import (
-    AbstractPredicate,
+    AndPredicate,
     BetweenPredicate,
+    BinaryOperator,
     BinaryPredicate,
-    CompoundPredicate,
     InPredicate,
-    LogicalOperator,
+    NotPredicate,
+    OrPredicate,
     SimpleFilter,
+    UnaryOperator,
     UnaryPredicate,
 )
 from tqdm.contrib.bells import tqdm
 
-from .._util import load_json, prepare_dir
-from ..context import Context, ContextManager
+from .._util import load_json, prepare_dir, save_json
+from ..context import ContextManager, DatabaseSchema
 from ._dbutil import DatabaseConnection
 from .data_gen import (
     FastgresMinMaxComponent,
@@ -42,6 +45,14 @@ class EncodingInformation:
     label_encoders: FastgresStringComponent
     wildcard_dict: FastgresWildcardComponent
     skipped_columns: dict
+
+    def store(self, directory: Path | str) -> None:
+        """Persist all encodings, including the skipped-column policy."""
+        directory = Path(directory)
+        prepare_dir(directory)
+        for component in (self.min_max_dict, self.label_encoders, self.wildcard_dict):
+            component.save(directory)
+        save_json(self.skipped_columns, directory / "skipped.json")
 
     @staticmethod
     def load_skipped_columns(path: Path):
@@ -104,6 +115,7 @@ class EncodingInformation:
             save_dir = Path(save_dir)
         prepare_dir(save_dir)
         [module.save(save_dir) for module in [enc.min_max_dict, enc.label_encoders, enc.wildcard_dict]]
+        save_json(skipped_columns, save_dir / "skipped.json")
         return enc
 
 
@@ -143,52 +155,57 @@ class FastgresPredicatesCollector(
     def visit_in_predicate(
             self, predicate: InPredicate, *args, **kwargs
     ) -> Collection[SimpleFilter]:
-        if SimpleFilter.can_wrap(predicate) and predicate.is_filter():
+        # NOT IN used to arrive through the unsupported NOT visitor. Keep excluding it.
+        if predicate.operator == BinaryOperator.In and SimpleFilter.can_wrap(predicate) and predicate.is_filter():
             return [SimpleFilter.wrap(predicate)]
         return []
 
     def visit_unary_predicate(
             self, predicate: UnaryPredicate, *args, **kwargs
     ) -> Collection[SimpleFilter]:
+        # Before PostBOUND 0.23 these were binary IS/IS NOT predicates.
+        if (predicate.operator in (UnaryOperator.IsNull, UnaryOperator.IsNotNull)
+                and SimpleFilter.can_wrap(predicate) and predicate.is_filter()):
+            return [SimpleFilter.wrap(predicate)]
         return []
 
     def visit_not_predicate(
-            self, predicate: CompoundPredicate, child_predicate: AbstractPredicate, *args, **kwargs
+            self, predicate: NotPredicate, *args, **kwargs
     ) -> Collection[SimpleFilter]:
         return []
 
     def visit_or_predicate(
-            self, predicate: CompoundPredicate, components: Sequence[AbstractPredicate], *args, **kwargs
+            self, predicate: OrPredicate, *args, **kwargs
     ) -> Collection[SimpleFilter]:
         return []
 
     def visit_and_predicate(
-            self, predicate: CompoundPredicate, components: Sequence[AbstractPredicate], *args, **kwargs
+            self, predicate: AndPredicate, *args, **kwargs
     ) -> Collection[SimpleFilter]:
-        return pb.util.flatten(pred.accept_visitor(self) for pred in components)
+        return [item for child in predicate.children for item in child.accept_visitor(self)]
 
 
 class FastgresFeaturization:
-    surjective_operator_map = {
-        LogicalOperator.Equal: (0., 0., 1.),
-        LogicalOperator.NotEqual: (1., 1., 0.),
-        LogicalOperator.Less: (1., 0., 0.),
-        LogicalOperator.LessEqual: (1., 0., 1.),
-        LogicalOperator.Greater: (0., 1., 0.),
-        LogicalOperator.GreaterEqual: (0., 1., 1.),
-        LogicalOperator.Like: (1., 1., 1.),
-        LogicalOperator.NotLike: (1., 1., 0.),
+    surjective_operator_map: ClassVar[dict[BinaryOperator | UnaryOperator, tuple[float, float, float]]] = {
+        BinaryOperator.Equal: (0., 0., 1.),
+        BinaryOperator.NotEqual: (1., 1., 0.),
+        BinaryOperator.Less: (1., 0., 0.),
+        BinaryOperator.LessEqual: (1., 0., 1.),
+        BinaryOperator.Greater: (0., 1., 0.),
+        BinaryOperator.GreaterEqual: (0., 1., 1.),
+        BinaryOperator.Like: (1., 1., 1.),
+        BinaryOperator.NotLike: (1., 1., 0.),
 
-        LogicalOperator.ILike: (1., 1., 1.),  # Workaround for current FG implementation
-        LogicalOperator.NotILike: (1., 1., 0.),
+        BinaryOperator.ILike: (1., 1., 1.),  # Workaround for current FG implementation
+        BinaryOperator.NotILike: (1., 1., 0.),
 
-        LogicalOperator.In: (0., 0., 1.),
-        LogicalOperator.Exists: (0., 0., 0.),
+        BinaryOperator.In: (0., 0., 1.),
+        UnaryOperator.Exists: (0., 0., 0.),
 
-        LogicalOperator.Is: (0., 0., 1.),  # Currently unsupported
-        LogicalOperator.IsNot: (1., 1., 0.),
+        UnaryOperator.IsNull: (0., 0., 1.),
+        UnaryOperator.IsNotNull: (1., 1., 0.),
 
-        LogicalOperator.Between: (0., 0., 1.)
+        BinaryOperator.Between: (0., 0., 1.)
     }
 
     @dataclass
@@ -218,72 +235,101 @@ class FastgresFeaturization:
 
     def __init__(
             self,
-            dbc: DatabaseConnection | pb.postgres.PostgresInterface,
+            dbc: DatabaseConnection | pb.postgres.PostgresDatabase | None,
             context: ContextManager,
             *,
-            enc_info: EncodingInformation = None,
-            enc_dir: Path | str = None,
+            enc_info: EncodingInformation | None = None,
+            enc_dir: Path | str | None = None,
+            db_schema: DatabaseSchema | None = None,
     ):
-        if isinstance(dbc, pb.postgres.PostgresInterface):
+        if dbc is None and db_schema is None:
+            raise ValueError("A database connection or stored schema is required for featurization")
+        if isinstance(dbc, pb.postgres.PostgresDatabase):
             dbc = DatabaseConnection(dbc)
         if enc_info is None and enc_dir is None:
             raise ValueError("Either enc_info or enc_dir must be provided")
         if enc_info is not None:
             self.statistics = enc_info
         else:
+            assert enc_dir is not None
             if isinstance(enc_dir, str):
                 enc_dir = Path(enc_dir)
             self.statistics = EncodingInformation.load_encoding_info(enc_dir)
         self.dbc = dbc
+        self.db_schema = db_schema
         self.ctx_manager = context
 
     def transform_single(self, query: pb.SqlQuery, **kwargs) -> np.ndarray:
-        simple_predicates: Collection[SimpleFilter] = query.where_clause.predicate.accept_visitor(
-            FastgresPredicatesCollector()
+        if not isinstance(query, pb.qal.SelectStatement):
+            raise ValueError("FastGRES only supports SELECT statements")
+        simple_predicates = (
+            query.where_clause.root.accept_visitor(FastgresPredicatesCollector())
+            if query.where_clause is not None else []
         )
-        context: Context = self.ctx_manager[query]
+        context = self.ctx_manager[query]
+        if context is None:
+            raise ValueError(f"No context registered for query: {query}")
         components = FastgresFeaturization.Components(context.schema.to_dict())
         for predicate in simple_predicates:
-            table_name: str = predicate.column.table.full_name
+            table = predicate.column.table
+            if table is None:
+                raise ValueError(f"Cannot featurize an unbound column: {predicate.column}")
+            table_name = table.full_name
             column_name: str = predicate.column.name
-            operation: LogicalOperator = predicate.operation
+            operation = predicate.operator
+            if operation not in self.surjective_operator_map:
+                raise ModuleError(f"Unsupported filter operator: {operation}")
 
             operator_feature: tuple[float, float, float] = FastgresFeaturization.surjective_operator_map[operation]
-            filter_feature: float = self.featurize_filter(predicate)
-            if isinstance(filter_feature, list):
-                filter_feature = filter_feature[0]
-            components.add_entry(table_name, column_name, operator_feature + (filter_feature,))
+            filter_feature = self.featurize_filter(predicate)
+            components.add_entry(
+                table_name, column_name,
+                (operator_feature[0], operator_feature[1], operator_feature[2], filter_feature),
+            )
         return np.asarray(components.arrange(), dtype=np.float64)
 
-    def transform(self, queries: list[pb.SqlQuery] | pb.SqlQuery, **kwargs) -> np.ndarray:
+    def transform(self, queries: Sequence[pb.SqlQuery] | pb.SqlQuery, **kwargs) -> np.ndarray:
         if isinstance(queries, pb.SqlQuery):
             queries = [queries]
         return np.vstack([self.transform_single(q, **kwargs) for q in queries])
 
     def featurize_filter(self, predicate: SimpleFilter) -> float:
-        table_name: str = predicate.column.table.full_name
+        table = predicate.column.table
+        if table is None:
+            raise ValueError(f"Cannot featurize an unbound column: {predicate.column}")
+        table_name = table.full_name
         column_name: str = predicate.column.name
         value = predicate.value
 
-        d_type: str = self.dbc.schema.datatype(predicate.column)
+        if predicate.operator in (UnaryOperator.IsNull, UnaryOperator.IsNotNull):
+            # NULL has no encoded literal; its operator bits distinguish the filter.
+            return 0.0
+
+        if self.db_schema is not None:
+            d_type = self.db_schema.get_datatype(table_name, column_name)
+            if d_type is None:
+                raise ValueError(f"Column {table_name}.{column_name} is missing from the stored schema")
+        else:
+            assert self.dbc is not None
+            d_type = self.dbc.schema.datatype(predicate.column)
         col_type: ColumnType = ColumnType.from_string(d_type)
-        match predicate._predicate:
+        match predicate.unwrap():
             case BinaryPredicate(_, _, _):
                 match col_type:
                     case ColumnType.CHARACTER_VARYING | ColumnType.TEXT:
-                        if predicate.operation in (LogicalOperator.Like, LogicalOperator.NotLike,
-                                                   LogicalOperator.ILike, LogicalOperator.NotILike):
+                        if predicate.operator in (BinaryOperator.Like, BinaryOperator.NotLike,
+                                                  BinaryOperator.ILike, BinaryOperator.NotILike):
                             return self.statistics.wildcard_dict.transform(table_name, column_name, value)
                         else:
                             return self.statistics.label_encoders.transform(
                                 table_name, column_name, value, self.statistics.skipped_columns
-                            )
+                            )[0]
                     case ColumnType.INTEGER | ColumnType.NUMERIC:
                         return self.statistics.min_max_dict.transform(table_name, column_name, value)
                     case ColumnType.TIMESTAMP_WITHOUT_TIMEZONE | ColumnType.DATE:
                         return self.statistics.min_max_dict.transform_time(table_name, column_name, value)
                     case ColumnType.UNHANDLED:
-                        raise ModuleError(f"Unknown column type: {self.dbc.fg_schema.schema[table_name][column_name]}")
+                        raise ModuleError(f"Unknown column type: {d_type}")
                     case _:
                         raise ModuleError(f"Unknown Column Type: {col_type}")
             case InPredicate(_, _):

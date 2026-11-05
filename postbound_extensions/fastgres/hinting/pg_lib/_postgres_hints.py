@@ -31,6 +31,13 @@ PRESORTED_AGGREGATION = Hint("PRESORT_AGG", "enable_presorted_aggregate", True)
 # pg17
 GROUP_BY_REORDER = Hint("GROUP_BY_REORDER", "enable_group_by_reordering", True)
 
+# pg18
+DISTINCT_REORDER = Hint("DISTINCT_REORDER", "enable_distinct_reordering", True)
+SELF_JOIN_ELIMINATION = Hint("SELF_JOIN_ELIMINATION", "enable_self_join_elimination", True)
+
+# pg19
+EAGER_AGGREGATION = Hint("EAGER_AGG", "enable_eager_aggregate", True)
+
 # partitions
 PARTITION_WISE_AGGREGATE = Hint("PART_AGG", "enable_partitionwise_aggregate", False)
 PARTITION_WISE_JOIN = Hint("PART_JOIN", "enable_partitionwise_join", False)
@@ -42,8 +49,10 @@ ASYNC_APPEND = Hint("ASYNC_APPEND", "enable_async_append", True)
 # GEQO
 GEQO = Hint("GEQO", "geqo", True)
 
-# JIT
+# JIT defaults to on through PG18 and off starting with PG19.
+# Keep the legacy constant for callers constructing older libraries directly.
 JIT = Hint("JIT", "jit", True)
+JIT_PG19 = Hint("JIT", "jit", False)
 
 CORE_HINTS = [
     INDEX_ONLY_SCAN,
@@ -70,8 +79,11 @@ PG14_HINTS = [*PG13_HINTS, MEMOIZE]
 PG15_HINTS = [*PG14_HINTS]
 PG16_HINTS = [*PG15_HINTS, PRESORTED_AGGREGATION]
 PG17_HINTS = [*PG16_HINTS, GROUP_BY_REORDER]
+PG18_HINTS = [*PG17_HINTS, DISTINCT_REORDER, SELF_JOIN_ELIMINATION]
+PG19_HINTS = [*PG18_HINTS, EAGER_AGGREGATION]
 
 # additional hints
 PARTITION_HINTS = [PARTITION_WISE_AGGREGATE, PARTITION_WISE_JOIN, PARTITION_PRUNING]
 BACKEND_HINTS = [ASYNC_APPEND]
 MISC_HINTS = [GEQO, JIT]
+MISC_HINTS_PG19 = [GEQO, JIT_PG19]

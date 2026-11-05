@@ -1,17 +1,19 @@
 
 from __future__ import annotations
 
-from collections.abc import Collection, Sequence
+from collections.abc import Collection
 from pathlib import Path
+from typing import Any
 
 import postbound as pb
 from postbound.qal import (
-    AbstractPredicate,
+    AndPredicate,
     BetweenPredicate,
+    BinaryOperator,
     BinaryPredicate,
-    CompoundPredicate,
     InPredicate,
-    LogicalOperator,
+    NotPredicate,
+    OrPredicate,
     SimpleFilter,
     UnaryPredicate,
 )
@@ -31,10 +33,10 @@ class WildcardCollector(pb.qal.PredicateVisitor[Collection[pb.qal.SimpleFilter]]
         if not (SimpleFilter.can_wrap(predicate) and predicate.is_filter()):
             return []
 
-        valid_operators = [LogicalOperator.Like, LogicalOperator.NotLike, LogicalOperator.ILike,
-                           LogicalOperator.NotILike]
+        valid_operators = [BinaryOperator.Like, BinaryOperator.NotLike, BinaryOperator.ILike,
+                           BinaryOperator.NotILike]
         wrapped: SimpleFilter = SimpleFilter.wrap(predicate)
-        if wrapped.operation not in valid_operators:
+        if wrapped.operator not in valid_operators:
             return []
 
         return [wrapped]
@@ -56,8 +58,7 @@ class WildcardCollector(pb.qal.PredicateVisitor[Collection[pb.qal.SimpleFilter]]
 
     def visit_or_predicate(
             self,
-            predicate: CompoundPredicate,
-            components: Sequence[AbstractPredicate],
+            predicate: OrPredicate,
             *args,
             **kwargs,
     ) -> Collection[pb.qal.SimpleFilter]:
@@ -65,8 +66,7 @@ class WildcardCollector(pb.qal.PredicateVisitor[Collection[pb.qal.SimpleFilter]]
 
     def visit_not_predicate(
             self,
-            predicate: CompoundPredicate,
-            child_predicate: AbstractPredicate,
+            predicate: NotPredicate,
             *args,
             **kwargs,
     ) -> Collection[pb.qal.SimpleFilter]:
@@ -74,24 +74,23 @@ class WildcardCollector(pb.qal.PredicateVisitor[Collection[pb.qal.SimpleFilter]]
 
     def visit_and_predicate(
             self,
-            predicate: CompoundPredicate,
-            components: Sequence[AbstractPredicate],
+            predicate: AndPredicate,
             *args,
             **kwargs,
     ) -> Collection[pb.qal.SimpleFilter]:
-        return pb.util.flatten(pred.accept_visitor(self) for pred in components)
+        return [item for child in predicate.children for item in child.accept_visitor(self)]
 
 
 class FastgresWildcardComponent(StatisticsComponent):
 
     def __init__(self):
-        self._wildcard_dict = None
+        self._wildcard_dict: dict[str, Any] | None = None
 
     def to_dict(self):
         return self._wildcard_dict
 
     def build(self, dbc: DatabaseConnection, **kwargs):
-        workload: pb.Workload = kwargs.get("workload")
+        workload = kwargs.get("workload")
         if not isinstance(workload, pb.Workload):
             raise ValueError(f"Provided workload is not a PostBound Workload: {workload}")
         if len(workload.queries()) == 0:
@@ -99,11 +98,17 @@ class FastgresWildcardComponent(StatisticsComponent):
         wildcard_dict = dict()
         for parsed in tqdm(workload.queries(), desc="Creating Wildcard Dictionary"):
             # parsed: SqlQuery = pb.parse_query(query_string)
-            wc_predicates = parsed.where_clause.predicate.accept_visitor(WildcardCollector())
+            if not isinstance(parsed, pb.qal.SelectStatement):
+                raise ValueError("FastGRES only supports SELECT statements")
+            if parsed.where_clause is None:
+                continue
+            wc_predicates = parsed.where_clause.root.accept_visitor(WildcardCollector())
 
             for wc_predicate in wc_predicates:
                 table_ref = wc_predicate.column.table
                 column_ref = wc_predicate.column
+                if table_ref is None:
+                    raise ValueError(f"Cannot collect wildcard statistics for an unbound column: {column_ref}")
 
                 table_name = table_ref.full_name
                 column_name = column_ref.name
@@ -116,11 +121,9 @@ class FastgresWildcardComponent(StatisticsComponent):
                     tqdm.write(f"Table {table_name} caused a cardinality lookup error.")
                     raise e
 
-                predicate = pb.qal.BinaryPredicate(
-                    wc_predicate.operation,
-                    first_argument=pb.qal.ColumnExpression(column_ref),
-                    second_argument=pb.qal.StaticValueExpression(value=like_value)
-                )
+                predicate = wc_predicate.unwrap()
+                if not isinstance(predicate, BinaryPredicate):
+                    raise ValueError(f"Expected a binary LIKE predicate, got {predicate}")
                 like_cardinality = dbc.like_cardinality(column_ref, predicate)
 
                 wildcard_dict.setdefault(table_name, {})['max'] = table_cardinality
@@ -140,6 +143,8 @@ class FastgresWildcardComponent(StatisticsComponent):
         return obj
 
     def transform(self, table: str, col: str, value: str):
+        if self._wildcard_dict is None:
+            raise ValueError("Wildcard statistics must be built or loaded first")
         min_v = 0
         max_v = self._wildcard_dict[table]['max']
         offset = 0.001

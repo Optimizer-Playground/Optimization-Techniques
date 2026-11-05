@@ -130,6 +130,8 @@ class ColumnContext(Context):
                 table = table_reference.full_name
                 column = column_reference.name
                 d_type = schema.get_datatype(table, column)
+                if d_type is None:
+                    raise KeyError(f"Column {table}.{column} is missing from the FastGRES schema")
                 query_schema.setdefault(table, dict())[column] = d_type
         return cls(DatabaseSchema(query_schema) / schema)
 

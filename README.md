@@ -32,9 +32,9 @@ Optimizer prototypes are implemented using the [PostBOUND framework](https://git
 - [x] SafeBound
   - [x] baseline implementation
   - [x] documentation
-- [ ] FASTgres
+- [x] FASTgres
   - [x] baseline implementation
-  - [ ] documentation
+  - [x] documentation
 - [ ] general documentation
 
 ## Installation

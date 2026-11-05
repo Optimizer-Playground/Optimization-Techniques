@@ -36,7 +36,7 @@ def get_neighbors(
 
     sorted_neighbors = sorted(
         candidates,
-        key=lambda pair: 1.0 - get_success_ratio(experience.get(pair[1]), smoothing=1.0)
+        key=lambda pair: 1.0 - get_success_ratio(experience[pair[1]], smoothing=1.0)
         if pair[1] in experience else 1.0 - default_score
     )
 

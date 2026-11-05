@@ -1,8 +1,10 @@
+from __future__ import annotations
+
 import json
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from types import MappingProxyType
 
 import numpy as np
 import onnx
@@ -15,9 +17,6 @@ from sklearn.ensemble import GradientBoostingClassifier
 from .._util import load_json, prepare_dir, save_json
 from ..context import Context, ContextFactory, ContextManager, DatabaseSchema
 from ..featurization import FastgresFeaturization
-
-# from ._base import BaseModel
-# from ._context_base import ContextModel
 from ..labeling import FastgresLabelProvider
 
 
@@ -42,13 +41,16 @@ class FastgresModel:
 
         sess = ort.InferenceSession(self._onnx_model.SerializeToString())
         input_name = sess.get_inputs()[0].name
-        return sess.run(None, {input_name: x.astype(np.float32)})[0]
+        return np.asarray(sess.run(None, {input_name: x.astype(np.float32)})[0])
 
     def save(self, path: Path):
-        if not hasattr(self._live_model, "n_features_in_"):
+        if self._onnx_model is not None:
+            onnx_model = self._onnx_model
+        elif not hasattr(self._live_model, "n_features_in_"):
             raise RuntimeError("Model must be fitted before saving to ONNX.")
-        initial_type = [('float_input', FloatTensorType([None, self._live_model.n_features_in_]))]
-        onnx_model = convert_sklearn(self._live_model, initial_types=initial_type)
+        else:
+            initial_type = [('float_input', FloatTensorType([None, self._live_model.n_features_in_]))]
+            onnx_model = convert_sklearn(self._live_model, initial_types=initial_type)
         with path.open("wb") as f:
             f.write(onnx_model.SerializeToString())
 
@@ -56,31 +58,45 @@ class FastgresModel:
         with path.open("rb") as f:
             self._onnx_model = onnx.load_model(f)
 
+    @property
+    def n_features(self) -> int:
+        if self._onnx_model is not None:
+            return self._onnx_model.graph.input[0].type.tensor_type.shape.dim[1].dim_value
+        count = getattr(self._live_model, "n_features_in_", None)
+        if count is None:
+            raise ValueError("Model must be fitted before its feature width is known")
+        return int(count)
+
 
 class FastgresContextModel:
     @dataclass
     class IntegerModel:
-        _model: int = field(init=False)
+        _model: int | None = field(default=None, init=False)
 
         def fit(self, x, y) -> None:
-            if len(set(y)) > 1:
-                raise ValueError(f"Cannot fit integer model to variate labels: {y}.")
-            self._model = y
+            labels = np.unique(y)
+            if len(labels) != 1:
+                raise ValueError(f"Integer model requires exactly one distinct label: {y}.")
+            self._model = int(labels[0])
 
-        def predict(self, x) -> Any:
+        def predict(self, x) -> list[int]:
+            if self._model is None:
+                raise ValueError("Integer model must be fitted or loaded before prediction")
             return [self._model for _ in x]
 
         def load(self, path: Path):
             model_dict = load_json(path)
-            self._model = model_dict["model"]
+            self.fit(None, np.asarray(model_dict["model"]).reshape(-1))
 
         def save(self, path: Path):
+            if self._model is None:
+                raise ValueError("Integer model must be fitted or loaded before saving")
             save_json({"model": self._model}, path)
 
     def __init__(
             self,
             featurizer: FastgresFeaturization,
-            label_provider: FastgresLabelProvider,
+            label_provider: FastgresLabelProvider | None,
             context_manager: ContextManager,
             **gb_kwargs,):
         super().__init__()
@@ -90,12 +106,22 @@ class FastgresContextModel:
         self.label_provider = label_provider
         self._models: dict[Context, FastgresModel | FastgresContextModel.IntegerModel] = {}
 
+    @property
+    def models(self) -> Mapping[Context, FastgresModel | FastgresContextModel.IntegerModel]:
+        return MappingProxyType(self._models)
+
 
     def create_model(self, context: Context) -> FastgresModel:
-        self._models[context] = FastgresModel(**self.gb_kwargs)
-        return self._models[context]
+        model = FastgresModel(**self.gb_kwargs)
+        self._models[context] = model
+        return model
 
     def fit(self, workload: pb.Workload):
+        if not workload:
+            raise ValueError("Cannot fit FastGRES on an empty workload")
+        if self.label_provider is None:
+            raise ValueError("Training requires labels; loaded models can predict without them")
+        models: dict[Context, FastgresModel | FastgresContextModel.IntegerModel] = {}
         wl_queries = workload.queries()
         ctx2q, q2ctx = self.cm.classify_queries(wl_queries)
         for context, query_set in ctx2q.items():
@@ -103,27 +129,31 @@ class FastgresContextModel:
             sorted_queries = [workload[qn] for qn in sorted_labels]
             ctx_train_x = self.featurizer.transform(sorted_queries)
             ctx_train_y = self.label_provider.get_labels(sorted_labels)
-            if len(ctx_train_y) < 2:
-                self._models[context] = self.IntegerModel()
-            model = self.create_model(context)
-            self._models[context] = model
+            model = self.IntegerModel() if len(np.unique(ctx_train_y)) == 1 else FastgresModel(**self.gb_kwargs)
             model.fit(ctx_train_x, ctx_train_y)
+            models[context] = model
+        self._models = models
 
-    def predict(self, query: pb.SqlQuery) -> Any:
+    def predict(self, query: pb.SqlQuery) -> int:
         context = self.cm[query]
+        if context is None:
+            raise ValueError(f"No context registered for query: {query}")
         model = self._models.get(context, None)
         if model is None:
             raise ValueError(f"No model found for context: {context}")
         feature = self.featurizer.transform_single(query)
-        return model.predict(feature.reshape(1, -1))[0]
+        return int(model.predict(feature.reshape(1, -1))[0])
 
     def predict_queries(
             self,
             queries: Iterable[pb.SqlQuery],
-    ) -> Any:
+    ) -> list[int]:
         return [self.predict(q) for q in queries]
 
     def save(self, path: Path):
+        if not self._models:
+            raise ValueError("Model must be fitted or loaded before saving")
+        prepare_dir(path)
         manifest = dict()
         for context, model in self._models.items():
             ctx_hash = str(hash(context))
@@ -142,6 +172,7 @@ class FastgresContextModel:
     def load(self, path: Path):
         with (path / "manifest.json").open("r") as f:
             manifest = json.load(f)
+        models: dict[Context, FastgresModel | FastgresContextModel.IntegerModel] = {}
         for ctx_hash, ctx_dict in manifest.items():
             ctx_schema: DatabaseSchema = DatabaseSchema(ctx_dict["schema"])
             ctx_type: str = ctx_dict["ctx_type"]
@@ -150,7 +181,10 @@ class FastgresContextModel:
             if model_type == "json":
                 model = self.IntegerModel()
                 model.load(path / ctx_hash / "model.json")
-            else:
-                model = self.create_model(context)
+            elif model_type == "onnx":
+                model = FastgresModel(**self.gb_kwargs)
                 model.load(path / ctx_hash / "model.onnx")
-            self._models[context] = model
+            else:
+                raise ValueError(f"Unknown saved FastGRES model type: {model_type}")
+            models[context] = model
+        self._models = models

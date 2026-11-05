@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 from datetime import date, datetime, timedelta
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
@@ -16,9 +17,11 @@ from ._statistics import StatisticsComponent
 class FastgresMinMaxComponent(StatisticsComponent):
 
     def __init__(self):
-        self.dict = None
+        self.dict: dict[str, dict[str, dict[str, Any]]] | None = None
 
     def get(self, table: str, column: str) -> tuple[Any, Any]:
+        if self.dict is None:
+            raise ValueError("Min/max statistics must be built or loaded first")
         return self.dict[table][column]["min"], self.dict[table][column]["max"]
 
     def build(self,  dbc: DatabaseConnection, **kwargs) -> dict[str, dict[str, dict]]:
@@ -57,26 +60,29 @@ class FastgresMinMaxComponent(StatisticsComponent):
         round_values = 4
         return min_max_encode(to_encode, min_value, max_value, offset, round_values)
 
-    def transform_time(self, table: str, column: str, to_encode: str) -> int | float:
+    def transform_time(self, table: str, column: str, to_encode: str | date) -> float:
         min_value, max_value = self.get(table, column)
+        if min_value is None or max_value is None:
+            return 1.0
         offset = timedelta(days=1)
         round_values = 4
-        format_string = "%Y-%m-%d"
         try:
-            filter_value = datetime.strptime(to_encode, format_string)
+            filter_value = datetime.fromisoformat(to_encode) if isinstance(to_encode, str) else to_encode
         except ValueError:
-            raise ValueError(f"Invalid format: {to_encode}, {format_string}")
+            raise ValueError(f"Invalid ISO date or timestamp: {to_encode}") from None
         return min_max_encode(filter_value, min_value, max_value, offset, round_values=round_values)
 
     class MinMaxEncoder(json.JSONEncoder):
-        def default(self, obj):
-            if isinstance(obj, (datetime, date)):
-                return obj.isoformat()
-            return super().default(obj)
+        def default(self, o):
+            if isinstance(o, (datetime, date)):
+                return o.isoformat()
+            if isinstance(o, Decimal):
+                return float(o)
+            return super().default(o)
 
     class MinMaxDecoder(json.JSONDecoder):
         def __init__(self, *args, **kwargs):
-            super().__init__(object_hook=self.object_hook, *args, **kwargs)
+            super().__init__(*args, object_hook=self.object_hook, **kwargs)
 
         @staticmethod
         def object_hook(obj: dict[str, Any]) -> Any:
