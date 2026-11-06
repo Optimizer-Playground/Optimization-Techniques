@@ -4,7 +4,6 @@ from abc import ABC, abstractmethod
 from collections.abc import Iterable, Sequence
 from datetime import date, datetime, time
 from pathlib import Path
-from typing import Self
 
 import numpy as np
 import pandas as pd
@@ -261,9 +260,6 @@ def _timestamp(value: datetime | date | None) -> float:
 
 
 class DateTimeEncoder(ColumnEncoder):
-    def __new__(cls, column: pb.BoundColumnReference, dtype: str, *, date_only: bool) -> Self:
-        return super(object).__new__(cls)
-
     def __init__(self, column: pb.BoundColumnReference, dtype: str, *, date_only: bool) -> None:
         super().__init__(column, dtype)
         self.date_only = date_only
@@ -271,7 +267,11 @@ class DateTimeEncoder(ColumnEncoder):
         self._max_val = None
 
     def fit(self, values: Sequence[datetime | date], *, prepare_values: bool = True) -> None:
-        arr = np.array([_timestamp(v) for v in values]).reshape(-1, 1)
+        if prepare_values:
+            arr = np.array([_timestamp(v) for v in values]).reshape(-1, 1)
+        else:
+            arr = np.array(values).reshape(-1, 1)
+
         self.values = arr
         self._min_val = np.nanmin(arr)
         self._max_val = np.nanmax(arr)
