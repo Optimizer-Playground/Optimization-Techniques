@@ -772,7 +772,7 @@ class PiecewiseLinearFn:
             raise ValueError("slopes, intercepts and bounds must be the same length")
 
         self._widths = np.diff(np.concat(([0], self._bounds)))
-        self._num_distinct = self._bounds[-1]
+        self._num_distinct = self._bounds[-1] if self._bounds.size > 0 else 0
 
     @property
     def n_distinct(self) -> int:

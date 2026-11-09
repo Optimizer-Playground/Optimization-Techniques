@@ -168,7 +168,7 @@ from ._catalog import (
     load_unconditioned_json,
     trigrams,
 )
-from ._compress import valid_compress
+from ._compress import generate_compressed_intervals, valid_compress
 from ._estimator import SafeBoundEstimator
 from ._fdsb import (
     AlphaStep,
@@ -223,6 +223,7 @@ __all__ = [
     "fetch_column_distribution",
     "fetch_correlated_ds",
     "fetch_raw_ds",
+    "generate_compressed_intervals",
     "histogram_for_precision",
     "load_eq_pcf_json",
     "load_eq_repo_json",
