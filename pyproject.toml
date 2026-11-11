@@ -1,6 +1,6 @@
 [project]
 name = "Optimizer-Playground"
-version = "0.1.0.dev23"
+version = "0.1.0.dev24"
 description = """
 A curated collection of interesting and novel ideas in query optimization for relational database systems, implemented using the PostBOUND framework.
 """
@@ -59,4 +59,3 @@ extend-immutable-calls = [
 ]
 
 [tool.uv.sources]
-postbound = { git = "https://github.com/Optimizer-Playground/PostBound.git", rev = "b122d612f74e577210e4787bffc47019f03332eb" }
