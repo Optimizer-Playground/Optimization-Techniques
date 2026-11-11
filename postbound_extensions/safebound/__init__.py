@@ -140,6 +140,7 @@ References
 """
 
 from ._catalog import (
+    CatalogLike,
     CatalogSpec,
     EqualityConditionedPCF,
     EqualityConditionsRepo,
@@ -191,6 +192,7 @@ from ._piecewise_fns import (
 __all__ = [
     "AlphaStep",
     "BetaStep",
+    "CatalogLike",
     "CatalogSpec",
     "DegreeSequence",
     "DimensionJoin",

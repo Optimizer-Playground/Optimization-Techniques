@@ -4,7 +4,7 @@ from collections.abc import Iterable
 
 import postbound as pb
 
-from ._catalog import SafeBoundCatalog
+from ._catalog import CatalogLike
 from ._fdsb import fdsb
 
 
@@ -23,6 +23,8 @@ class SafeBoundEstimator(pb.CardinalityEstimator):
         The catalog that stores the piecewise constant functions. The estimator relies on the
         catalog to retrieve the relevant PCFs for a given query.
 
+        You can also pass different "backends" that implement the `CatalogLike` protocol.
+
     See Also
     --------
     SafeBoundCatalog : The catalog that stores the piecewise constant functions
@@ -34,7 +36,7 @@ class SafeBoundEstimator(pb.CardinalityEstimator):
       (SIGMOD 2023) https://doi.org/10.1145/3588907
     """
 
-    def __init__(self, catalog: SafeBoundCatalog) -> None:
+    def __init__(self, catalog: CatalogLike) -> None:
         super().__init__()
         self._catalog = catalog
 

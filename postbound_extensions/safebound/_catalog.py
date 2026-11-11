@@ -2214,6 +2214,10 @@ class _Predicate2PCF(pb.qal.PredicateVisitor[PiecewiseConstantFn]):
         return pcf
 
 
+class CatalogLike(Protocol):
+    def retrieve_stats(self, query: pb.SqlQuery) -> Mapping[pb.ColumnReference, PiecewiseConstantFn]: ...
+
+
 class SafeBoundCatalog:
     """The SafeBound catalog acts as the central storage for all conditioned and unconditioned PCFs.
 
