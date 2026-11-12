@@ -139,7 +139,12 @@ class QepsIdentifier:
     def base(intermediate: Iterable[pb.TableReference]) -> QepsIdentifier:
         return QepsIdentifier(intermediate, additional=[])
 
-    def __init__(self, intermediate: Iterable[pb.TableReference], *, additional: Iterable[pb.TableReference]) -> None:
+    def __init__(
+        self,
+        intermediate: Iterable[pb.TableReference],
+        *,
+        additional: Iterable[pb.TableReference],
+    ) -> None:
         self._identifier = frozenset(intermediate)
         self._additional = frozenset(additional)
 
@@ -184,7 +189,8 @@ class FilterAwareQepsIdentifier(QepsIdentifier):
 
     @staticmethod
     def base(
-        intermediate: Iterable[pb.TableReference], filter_pred: pb.qal.AbstractPredicate | None = None
+        intermediate: Iterable[pb.TableReference],
+        filter_pred: pb.qal.AbstractPredicate | None = None,
     ) -> FilterAwareQepsIdentifier:
         return FilterAwareQepsIdentifier(intermediate, filter_pred, additional=[])
 
@@ -203,7 +209,11 @@ class FilterAwareQepsIdentifier(QepsIdentifier):
         return FilterAwareQepsIdentifier(combined, self._filter_pred, additional=self.intermediate)
 
     def __json__(self) -> pb.util.jsondict:
-        return {"identifier": self._identifier, "filter": self._filter_pred, "additional": self._additional}
+        return {
+            "identifier": self._identifier,
+            "filter": self._filter_pred,
+            "additional": self._additional,
+        }
 
     def __hash__(self) -> int:
         return hash((self._identifier, self._filter_pred))
@@ -467,7 +477,11 @@ class SubqueryQeps(QepsNode):
         self._cost_summary[operator] = cost + self._gamma * current_cost
 
     def feedback_batch(
-        self, intermediate: pb.JoinTree, *, batch: BatchedFeedback, query: pb.qal.SelectStatement | None
+        self,
+        intermediate: pb.JoinTree,
+        *,
+        batch: BatchedFeedback,
+        query: pb.qal.SelectStatement | None,
     ) -> None:
         subquery_qeps = self._subquery_root
         for node in _traverse_join_tree(intermediate):
@@ -548,6 +562,7 @@ def load_tonic_json(json_data: str | dict, *, database: pb.Database) -> TonicOpe
     retrain = json_data.get("retrain", True)
     prediction_target = json_data.get("prediction_target", "true_cost")
     exploration = json_data.get("exploration", "linear")
+    analyze_timeout_ms = json_data.get("analyze_timeout_ms", None)
 
     tonic = TonicOperators(
         database=database,
@@ -556,6 +571,7 @@ def load_tonic_json(json_data: str | dict, *, database: pb.Database) -> TonicOpe
         retrain=retrain,
         prediction_target=prediction_target,
         exploration=exploration,
+        analyze_timeout_ms=analyze_timeout_ms,
     )
 
     qeps = load_qeps_json(json_data["qeps"])
@@ -625,6 +641,7 @@ class TonicOperators(pb.OperatorSelection):
         retrain: bool = True,
         exploration: int | ExplorationMode = "linear",
         prediction_target: Literal["true_cost", "execution_time"] = "true_cost",
+        analyze_timeout_ms: float | None = None,
         log: pb.util.Logger | None = None,
     ) -> None:
         super().__init__()
@@ -642,6 +659,7 @@ class TonicOperators(pb.OperatorSelection):
             self._exploration_target = 10
         else:
             self._exploration_target = -1
+        self._analyze_timeout_ms = analyze_timeout_ms
 
         self._allowed_join_ops = [op for op in pb.JoinOperator if self._database.hinting().supports_hint(op)]
         self._log = log or pb.util.standard_logger(False)
@@ -748,7 +766,13 @@ class TonicOperators(pb.OperatorSelection):
 
         train_end = time.perf_counter_ns()
         training_time_ms = (train_end - train_start) / 1_000_000
-        return {"status": "success", "mode": "single", "training_time_ms": training_time_ms}
+        return {
+            "status": "success",
+            "mode": "single",
+            "training_time_ms": training_time_ms,
+            "n_explored": 1,
+            "n_timeout": 0,
+        }
 
     def _explore_exhaustive(self, plan: pb.QueryPlan, *, query: pb.qal.SelectStatement) -> pb.train.TrainingMetrics:
         all_joins = [join.tables() for join in plan.find_all_nodes(pb.QueryPlan.is_join)]
@@ -759,6 +783,7 @@ class TonicOperators(pb.OperatorSelection):
 
         exploration_start = time.perf_counter_ns()
 
+        n_explored, n_timeout = 0, 0
         for selection in itertools.product(*operators):
             assignment = pb.PhysicalOperatorAssignment()
             for intermediate, operator in zip(all_joins, selection):
@@ -767,26 +792,39 @@ class TonicOperators(pb.OperatorSelection):
             match self._prediction_target:
                 case "true_cost":
                     hinted_query = self._database.hinting().generate_hints(
-                        query, join_order=join_order, physical_operators=assignment, plan_parameters=plan_params
+                        query,
+                        join_order=join_order,
+                        physical_operators=assignment,
+                        plan_parameters=plan_params,
                     )
                     current_plan = self._database.optimizer().query_plan(hinted_query)
 
                 case "execution_time":
-                    hinted_query = self._database.hinting().generate_hints(
-                        query, join_order=join_order, physical_operators=assignment
-                    )
-                    current_plan = self._database.optimizer().explain_analyze(hinted_query)
-                    current_plan = current_plan.with_runtime_as_cost()
+                    current_plan = self._analyze_plan(query, join_order=join_order, operators=assignment)
+                    current_plan = current_plan.with_runtime_as_cost() if current_plan is not None else None
 
                 case _:
                     assert_never(self._prediction_target)
                     raise ValueError(f"Invalid prediction target: {self._prediction_target}. ")
 
+            if current_plan is None:
+                self._log(f"Timeout for query {query} with join {intermediate} = {operator}. Skipping.")
+                n_timeout += 1
+                continue
+            else:
+                n_explored += 1
+
             self._add_feedback(current_plan, query=query)
 
         exploration_end = time.perf_counter_ns()
         exploration_time_ms = (exploration_end - exploration_start) / 1_000_000
-        return {"status": "success", "mode": "exhaustive", "exploration_time_ms": exploration_time_ms}
+        return {
+            "status": "success",
+            "mode": "exhaustive",
+            "exploration_time_ms": exploration_time_ms,
+            "n_explored": n_explored,
+            "n_timeout": n_timeout,
+        }
 
     def _explore_random(self, plan: pb.QueryPlan, *, query: pb.qal.SelectStatement) -> pb.train.TrainingMetrics:
         all_joins = [join.tables() for join in plan.find_all_nodes(pb.QueryPlan.is_join)]
@@ -803,6 +841,7 @@ class TonicOperators(pb.OperatorSelection):
 
         exploration_start = time.perf_counter_ns()
 
+        n_explored, n_timeout = 0, 0
         for _ in range(self._exploration_target):
             assignment = pb.PhysicalOperatorAssignment()
             for intermediate in all_joins:
@@ -812,26 +851,39 @@ class TonicOperators(pb.OperatorSelection):
             match self._prediction_target:
                 case "true_cost":
                     hinted_query = self._database.hinting().generate_hints(
-                        query, join_order=join_order, physical_operators=assignment, plan_parameters=plan_params
+                        query,
+                        join_order=join_order,
+                        physical_operators=assignment,
+                        plan_parameters=plan_params,
                     )
                     current_plan = self._database.optimizer().query_plan(hinted_query)
 
                 case "execution_time":
-                    hinted_query = self._database.hinting().generate_hints(
-                        query, join_order=join_order, physical_operators=assignment
-                    )
-                    current_plan = self._database.optimizer().explain_analyze(hinted_query)
-                    current_plan = current_plan.with_runtime_as_cost()
+                    current_plan = self._analyze_plan(query, join_order=join_order, operators=assignment)
+                    current_plan = current_plan.with_runtime_as_cost() if current_plan is not None else None
 
                 case _:
                     assert_never(self._prediction_target)
                     raise ValueError(f"Invalid prediction target: {self._prediction_target}. ")
 
+            if current_plan is None:
+                self._log(f"Timeout for query {query} with join {intermediate} = {operator}. Skipping.")
+                n_timeout += 1
+                continue
+            else:
+                n_explored += 1
+
             self._add_feedback(current_plan, query=query)
 
         exploration_end = time.perf_counter_ns()
         exploration_time_ms = (exploration_end - exploration_start) / 1_000_000
-        return {"status": "success", "mode": "random", "exploration_time_ms": exploration_time_ms}
+        return {
+            "status": "success",
+            "mode": "random",
+            "exploration_time_ms": exploration_time_ms,
+            "n_explored": n_explored,
+            "n_timeout": n_timeout,
+        }
 
     def _explore_linear(self, plan: pb.QueryPlan, *, query: pb.qal.SelectStatement) -> pb.train.TrainingMetrics:
         all_joins = {
@@ -851,7 +903,10 @@ class TonicOperators(pb.OperatorSelection):
         match self._prediction_target:
             case "true_cost":
                 hinted_query = self._database.hinting().generate_hints(
-                    query, join_order=join_order, physical_operators=base_assignment, plan_parameters=plan_params
+                    query,
+                    join_order=join_order,
+                    physical_operators=base_assignment,
+                    plan_parameters=plan_params,
                 )
                 base_plan = self._database.optimizer().query_plan(hinted_query)
 
@@ -872,6 +927,7 @@ class TonicOperators(pb.OperatorSelection):
 
             cost_vector[intermediate] = {node.operator: node.estimated_cost}
 
+        n_explored, n_timeout = 1, 0  # base plan is already explored
         for join, current_op in all_joins.items():
             for operator in self._allowed_join_ops:
                 if operator == current_op:
@@ -883,20 +939,27 @@ class TonicOperators(pb.OperatorSelection):
                 match self._prediction_target:
                     case "true_cost":
                         hinted_query = self._database.hinting().generate_hints(
-                            query, join_order=join_order, physical_operators=assignment, plan_parameters=plan_params
+                            query,
+                            join_order=join_order,
+                            physical_operators=assignment,
+                            plan_parameters=plan_params,
                         )
                         current_plan = self._database.optimizer().query_plan(hinted_query)
 
                     case "execution_time":
-                        hinted_query = self._database.hinting().generate_hints(
-                            query, join_order=join_order, physical_operators=assignment
-                        )
-                        current_plan = self._database.optimizer().explain_analyze(hinted_query)
-                        current_plan = current_plan.with_runtime_as_cost()
+                        current_plan = self._analyze_plan(query, join_order=join_order, operators=assignment)
+                        current_plan = current_plan.with_runtime_as_cost() if current_plan is not None else None
 
                     case _:
                         assert_never(self._prediction_target)
                         raise ValueError(f"Invalid prediction target: {self._prediction_target}. ")
+
+                if current_plan is None:
+                    self._log(f"Timeout for query {query} with join {join} = {operator}. Skipping.")
+                    n_timeout += 1
+                    continue
+                else:
+                    n_explored += 1
 
                 join_node = current_plan.find_first_node(
                     lambda n: n.is_join() and frozenset(n.tables()) == join  # noqa: B023 - this is a false positive
@@ -914,7 +977,13 @@ class TonicOperators(pb.OperatorSelection):
 
         exploration_end = time.perf_counter_ns()
         exploration_time_ms = (exploration_end - exploration_start) / 1_000_000
-        return {"status": "success", "mode": "linear", "exploration_time_ms": exploration_time_ms}
+        return {
+            "status": "success",
+            "mode": "linear",
+            "exploration_time_ms": exploration_time_ms,
+            "n_explored": n_explored,
+            "n_timeout": n_timeout,
+        }
 
     def _add_feedback(self, plan: pb.QueryPlan, *, query: pb.qal.SelectStatement) -> pb.train.TrainingMetrics:
         current_qeps = self._qeps
@@ -937,6 +1006,36 @@ class TonicOperators(pb.OperatorSelection):
         plan = self._database.optimizer().query_plan(query)
         return pb.jointree_from_plan(plan)
 
+    def _analyze_plan(
+        self,
+        query: pb.SqlQuery,
+        *,
+        join_order: pb.JoinTree,
+        operators: pb.PhysicalOperatorAssignment,
+    ) -> pb.QueryPlan | None:
+        hinted_query = self._database.hinting().generate_hints(
+            query, join_order=join_order, physical_operators=operators
+        )
+
+        if self._analyze_timeout_ms is not None:
+            return self._analyze_with_timeout(hinted_query)
+        return self._analyze_no_timeout(hinted_query)
+
+    def _analyze_no_timeout(self, query: pb.SqlQuery) -> pb.QueryPlan:
+        return self._database.optimizer().analyze_plan(query)
+
+    def _analyze_with_timeout(self, query: pb.SqlQuery) -> pb.QueryPlan | None:
+        if not isinstance(self._database, pb.db.TimeoutSupport):
+            raise NotImplementedError("Database does not support query timeouts.")
+
+        assert self._analyze_timeout_ms is not None
+        query = pb.transform.as_explain_analyze(query)
+        result_set = self._database.execute_with_timeout(query, timeout=self._analyze_timeout_ms / 1000)
+        if result_set is None:
+            return None
+
+        return self._database.optimizer().parse_plan(result_set, query=query)
+
     def __json__(self) -> pb.util.jsondict:
         return {
             "qeps": self._qeps,
@@ -945,4 +1044,5 @@ class TonicOperators(pb.OperatorSelection):
             "retrain": self._retrain,
             "prediction_target": self._prediction_target,
             "exploration": self._exploration_target if self._exploration_mode == "random" else self._exploration_mode,
+            "analyze_timeout_ms": self._analyze_timeout_ms,
         }
