@@ -4,6 +4,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Iterable, Sequence
 from datetime import date, datetime, time
 from pathlib import Path
+from typing import assert_never
 
 import numpy as np
 import pandas as pd
@@ -88,11 +89,11 @@ class ColumnEncoder[T](ABC):
 
         datatype = database.schema().datatype(column)
         match datatype.lower():
-            case "integer" | "smallint" | "bigint":
+            case "integer" | "smallint" | "bigint" | "numeric" | "real" | "double precision" | "double" | "decimal":
                 enc = _build_numeric_encoder(column, datatype, database=database, log=log)
             case "character varying" | "varchar" | "text":
                 enc = _build_text_encoder(column, datatype, database=database, log=log)
-            case "timestamp without time zone":
+            case "timestamp without time zone" | "timestamp":  # Postgres | DuckDB
                 enc = _build_datetime_encoder(
                     column,
                     datatype,
@@ -121,11 +122,11 @@ class ColumnEncoder[T](ABC):
             raise pb.UnboundColumnError(column)
 
         match dtype.lower():
-            case "integer" | "smallint" | "bigint":
+            case "integer" | "smallint" | "bigint" | "numeric" | "real" | "double precision" | "double" | "decimal":
                 return NumericEncoder(column, dtype)
             case "character varying" | "varchar" | "text":
                 return TextEncoder(column, dtype)
-            case "timestamp without time zone":
+            case "timestamp without time zone" | "timestamp":  # Postgres | DuckDB
                 return DateTimeEncoder(column, dtype, date_only=False)
             case "date":
                 return DateTimeEncoder(column, dtype, date_only=True)
@@ -193,6 +194,10 @@ class NumericEncoder(ColumnEncoder):
     def encode_single(self, value: float) -> np.ndarray:
         if self._min_val is None or self._max_val is None:
             raise ValueError("Encoder not fitted yet")
+        if self._min_val == self._max_val:
+            # if the min and max values are the same, we can't normalize the value, so we return 0.0
+            return np.array([[0.0]])
+
         value = np.nan if value is None else value
         encoded = (value - self._min_val) / (self._max_val - self._min_val)
         return np.array([[encoded]])
@@ -200,7 +205,13 @@ class NumericEncoder(ColumnEncoder):
     def encode_batch(self, values: Iterable[int | float]) -> np.ndarray:
         if self._min_val is None or self._max_val is None:
             raise ValueError("Encoder not fitted yet")
+
         arr = np.array([np.nan if v is None else v for v in values]).reshape(-1, 1)
+
+        if self._min_val == self._max_val:
+            # if the min and max values are the same, we can't normalize the value, so we return 0.0
+            return np.zeros_like(arr)
+
         encoded = (arr - self._min_val) / (self._max_val - self._min_val)
         return encoded
 
@@ -221,7 +232,12 @@ class TextEncoder(ColumnEncoder):
         arr = np.array(values, dtype="object")
         if prepare_values:
             arr[arr == None] = "__POSTBOUND_NULL_PLACEHOLDER__"
-        self.values = arr
+
+        # Sort the values to ensure consistent encoding and decoding
+        # different database systems use different orderings of text values (dependent on collation settings), so we need
+        # to ensure that our order is consistent. The easiest way to do this is to enforce the ordering ourselves.
+        self.values = np.sort(arr)
+
         self._max_values = len(values)
 
     def encode_single(self, value: str) -> np.ndarray:
@@ -249,14 +265,21 @@ class TextEncoder(ColumnEncoder):
         return None if unwrapped == "__POSTBOUND_NULL_PLACEHOLDER__" else unwrapped
 
 
-def _timestamp(value: datetime | date | None) -> float:
+def _timestamp(value: datetime | date | str | None) -> float:
     match value:
         case datetime():
             return value.timestamp()
         case date():
             return datetime.combine(value, time()).timestamp()
+        case str():
+            # Filter values in SQL queries are usually plain literals, e.g. '2010-09-14 11:59:07' in
+            # CAST('2010-09-14 11:59:07' AS timestamp). fromisoformat() handles dates and timestamps.
+            return datetime.fromisoformat(value).timestamp()
         case None:
             return np.nan
+        case _:
+            assert_never(value)
+            raise TypeError(f"Cannot interpret {value!r} ({type(value).__name__}) as a date/timestamp")
 
 
 class DateTimeEncoder(ColumnEncoder):
@@ -279,6 +302,10 @@ class DateTimeEncoder(ColumnEncoder):
     def encode_single(self, value: datetime | date) -> np.ndarray:
         if self._min_val is None or self._max_val is None:
             raise ValueError("Encoder not fitted yet")
+        if self._min_val == self._max_val:
+            # if the min and max values are the same, we can't normalize the value, so we return 0.0
+            return np.array([[0.0]])
+
         timestamp = _timestamp(value)
         encoded = (timestamp - self._min_val) / (self._max_val - self._min_val)
         return np.array([[encoded]])
@@ -286,7 +313,14 @@ class DateTimeEncoder(ColumnEncoder):
     def encode_batch(self, values: Iterable[datetime | date]) -> np.ndarray:
         if self._min_val is None or self._max_val is None:
             raise ValueError("Encoder not fitted yet")
-        arr = np.array([_timestamp(v) for v in values]).reshape(-1, 1)
+
+        # values may be given as a flat sequence or as a column vector of shape (n, 1)
+        flat_values = np.asarray(values, dtype="object").reshape(-1)
+        arr = np.array([_timestamp(v) for v in flat_values]).reshape(-1, 1)
+        if self._min_val == self._max_val:
+            # if the min and max values are the same, we can't normalize the value, so we return 0.0
+            return np.zeros_like(arr)
+
         encoded = (arr - self._min_val) / (self._max_val - self._min_val)
         return encoded
 

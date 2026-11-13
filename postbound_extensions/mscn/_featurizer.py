@@ -236,7 +236,7 @@ class MscnFeaturizer:
             comparison_operators=list(pb.qal.BinaryOperator) + list(pb.qal.UnaryOperator),
             value_encoders=column_encoders,
             min_card=pb.Cardinality(0),
-            max_card=pb.Cardinality(outer_extent),
+            max_card=pb.Cardinality.of(min(outer_extent, np.iinfo(np.int64).max)),
             drop_table_aliases=True,
             verbose=verbose,
         )
@@ -335,7 +335,7 @@ class MscnFeaturizer:
             cards = [database.statistics().total_rows(tab) or 0 for tab in tables]
             cards.sort(reverse=True)
             outer_extent = np.prod(cards[:3])  # type: ignore
-            max_card = pb.Cardinality.of(outer_extent)
+            max_card = pb.Cardinality.of(min(outer_extent, np.iinfo(np.int64).max))
 
         return MscnFeaturizer(
             schema_name=database.database_name(),
@@ -605,6 +605,11 @@ class MscnFeaturizer:
         return len(self._operators)
 
     @property
+    def n_predicate_features(self) -> int:
+        """Width of a single predicate row: column one-hot | operator one-hot | value."""
+        return self.n_columns + len(self._operators) + 1
+
+    @property
     def min_card(self) -> pb.Cardinality:
         """Get the minimum cardinality supported by the featurization.
 
@@ -642,19 +647,22 @@ class MscnFeaturizer:
         """
         tables = query.tables()
         joins = query.joins()
-        predicates = query.filters()
         if not pb.qal.all_binary_predicates(joins):
             raise ValueError(f"Cannot featurize query {query}. Not all joins are binary predicates")
-        if not pb.qal.all_binary_predicates(predicates):
-            raise ValueError(f"Cannot featurize query {query}. Not all filter predicates are binary predicates")
+
+        predicates = [pred for pred in query.filters() if isinstance(pred, pb.qal.BinaryPredicate)]
 
         tables_enc = self.encode_tables(tables)
         joins_enc = self.encode_joins(joins)
         predicates_enc = self.encode_filter_predicates(predicates)
 
-        tables_mask = self.build_mask(len(tables), self.n_tables)
-        joins_mask = self.build_mask(len(joins), self.n_joins)
-        predicates_mask = self.build_mask(len(predicates), self.n_columns)
+        # All feature matrices contain exactly one row per encoded set element and are not padded.
+        # Their height therefore varies between queries and batches are padded by
+        # collate_featurized(). Empty sets (e.g. no joins, or no supported filter predicates) are
+        # represented by a single all-zero row that is masked out, to keep the tensors non-empty.
+        tables_enc, tables_mask = self._finalize_set(tables_enc)
+        joins_enc, joins_mask = self._finalize_set(joins_enc)
+        predicates_enc, predicates_mask = self._finalize_set(predicates_enc)
 
         return FeaturizedQuery(
             tables=torch.FloatTensor(tables_enc),
@@ -678,14 +686,14 @@ class MscnFeaturizer:
     def encode_tables(self, tables: Collection[pb.TableReference]) -> np.ndarray:
         """Computes the feature matrix for a set of tables.
 
-        The matrix is automatically padded based on the total number of tables.
+        The matrix contains exactly one row per table and is *not* padded.
         """
+        if not tables:
+            return np.zeros((0, self.n_tables))
         if self._drop_table_aliases:
             tables = [t.drop_alias() for t in tables]
         tables_arr = np.asarray([str(t) for t in tables]).reshape(-1, 1)
-        enc = self._tables_encoder.transform(tables_arr)
-        num_pad = self.n_tables - len(tables)
-        return np.pad(enc, {0: (0, num_pad)})
+        return self._tables_encoder.transform(tables_arr)
 
     def encode_tables_batch(
         self, tables_batch: Iterable[Collection[pb.TableReference]]
@@ -702,10 +710,10 @@ class MscnFeaturizer:
     def encode_joins(self, joins: Collection[pb.qal.BinaryPredicate]) -> np.ndarray:
         """Computes the feature matrix for a set of joins.
 
-        The matrix is automatically padded based on the total number of joins.
+        The matrix contains exactly one row per join and is *not* padded.
         """
         if not joins:
-            return np.zeros((self.n_joins, self.n_joins))
+            return np.zeros((0, self.n_joins))
 
         normalized_joins: list[pb.qal.BinaryPredicate] = []
         for join in joins:
@@ -720,9 +728,7 @@ class MscnFeaturizer:
             normalized_joins.append(pb.qal.as_predicate(key1, "=", key2))
 
         joins_arr = np.asarray([str(j) for j in normalized_joins]).reshape(-1, 1)
-        enc = self._joins_encoder.transform(joins_arr)
-        num_pad = self.n_joins - len(joins)
-        return np.pad(enc, {0: (0, num_pad)})
+        return self._joins_encoder.transform(joins_arr)
 
     def encode_joins_batch(
         self, joins_batch: Iterable[Collection[pb.qal.BinaryPredicate]]
@@ -750,12 +756,13 @@ class MscnFeaturizer:
     def encode_filter_predicates(self, predicates: Collection[pb.qal.BinaryPredicate]) -> np.ndarray:
         """Computes the feature matrix for a set of filter predicates.
 
-        The matrix is automatically padded based on the total number of filter columns.
+        The matrix contains exactly one row per supported predicate and is *not* padded. Multiple
+        predicates on the same column result in multiple rows. Unsupported predicates are skipped,
+        hence the matrix can have fewer rows than there are predicates (including zero rows).
         """
         if not predicates:
             # tensor structure: (column one-hot | operator one-hot | value encoding) x predicates
-            n_features = self.n_columns + len(self._operators) + 1
-            return np.zeros((self.n_columns, n_features))
+            return np.zeros((0, self.n_predicate_features))
 
         # The predicate featurization logic is quite lengthy. This is because predicate
         # featurization is a very "hot" operation during training and we need to be a bit vary about
@@ -784,7 +791,7 @@ class MscnFeaturizer:
         # To make the code easier to follow, we mark the different phases with comments.
 
         partial_enc = tuple[np.ndarray, np.ndarray, np.ndarray]
-        vectors: dict[pb.ColumnReference, partial_enc] = {}
+        vectors: list[partial_enc] = []
 
         columns: list[pb.ColumnReference] = []
         column_strings: list[str] = []
@@ -838,8 +845,7 @@ class MscnFeaturizer:
             # them (e.g. by using the average value). Should we implement something similar?
 
             # tensor structure: (column one-hot | operator one-hot | value encoding) x predicates
-            n_features = self.n_columns + len(self._operators) + 1
-            return np.zeros((self.n_columns, n_features))
+            return np.zeros((0, self.n_predicate_features))
 
         # Step 2: invoke the actual encoders
 
@@ -852,30 +858,17 @@ class MscnFeaturizer:
 
         # Step 3: stitch the different per-predicate feature vectors back together
         # This is a bit tedious because we need to make sure we keep all indexes locked.
-        # Furthermore, we need to accomodate the fact that the same column might have multiple
-        # filters. For this case we follow the MSCN strategy of computing the mean of both encodings.
 
         for i, col in enumerate(columns):
             encoded_col = encoded_columns[i]
             encoded_op = encoded_operators[i]
             value_idx = value_indexes[i]
             encoded_val = encoded_values[col][value_idx]
-
-            existing_vector = vectors.get(col)
-            if existing_vector is None:
-                vectors[col] = (encoded_col, encoded_op, encoded_val)
-                continue
-
-            _, existing_operator, existing_value = existing_vector
-            combined_op = np.maximum(existing_operator, encoded_op)
-            combined_value = np.concat([existing_value, encoded_val]).mean().reshape(1)
-            vectors[col] = (encoded_col, combined_op, combined_value)
+            vectors.append((encoded_col, encoded_op, encoded_val))
 
         # Step 4: put everything together to form the final filter matrix
 
-        enc = np.stack([np.concat(v) for v in vectors.values()])
-        num_pad = self.n_columns - len(vectors)
-        return np.pad(enc, {0: (0, num_pad)})
+        return np.stack([np.concat(v) for v in vectors])
 
     def build_mask(self, n_set: int, n_max: int) -> np.ndarray:
         """Computes the mask vector to indicate which rows of the feature matrix are set.
@@ -935,3 +928,10 @@ class MscnFeaturizer:
         self._log("Exporting catalog to", catalog_path)
         with open(catalog_path, "w") as f:
             pb.util.to_json_dump(catalog, f)
+
+    def _finalize_set(self, enc: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Computes the mask for an unpadded set matrix and replaces empty sets by a masked zero row."""
+        n_set = enc.shape[0]
+        if n_set == 0:
+            enc = np.zeros((1, enc.shape[1]))
+        return enc, self.build_mask(n_set, enc.shape[0])

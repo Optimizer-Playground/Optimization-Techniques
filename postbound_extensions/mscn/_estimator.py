@@ -29,7 +29,7 @@ import torch
 
 from ..util import PandasDataset, load_training_samples, wrap_logger
 from ._featurizer import MscnFeaturizer
-from ._misc import expand_dims, normalize_labels, qerror_loss, unnormalize_labels
+from ._misc import collate_featurized, expand_dims, normalize_labels, qerror_loss, unnormalize_labels
 from ._model import SetConv
 
 
@@ -40,12 +40,12 @@ class MscnHyperParams:
     By default, we use the same hyper parameters as the original MSCN paper. These are as follows:
 
     - training epochs: 100
-    - learning rate: 0.0001
+    - learning rate: 0.001
     - batch size: 1024
     """
 
     epochs: int = 100
-    learning_rate: float = 0.0001
+    learning_rate: float = 0.001
     batch_size: int = 1024
 
     @staticmethod
@@ -148,7 +148,11 @@ class MscnEstimator(pb.CardinalityEstimator):
         featurizer = MscnFeaturizer.pre_built(catalog_path, verbose=verbose)
 
         logger("Loading MSCN model from", catalog["mscn_model"])
-        weights = torch.load(catalog["mscn_model"])
+        # The weights are stored on the device the model was trained on (e.g. a CUDA GPU). We always
+        # load them onto the CPU first: the freshly created SetConv lives on the CPU as well, and the
+        # constructor of MscnEstimator moves the model to the GPU if one is available. This way a
+        # model trained on a GPU can also be loaded on a machine without one (and vice versa).
+        weights = torch.load(catalog["mscn_model"], map_location="cpu", weights_only=True)
         model = SetConv(
             n_tables=featurizer.n_tables,
             n_columns=featurizer.n_columns,
@@ -280,7 +284,9 @@ class MscnEstimator(pb.CardinalityEstimator):
         min_card = self.featurizer.norm_min_card
         max_card = self.featurizer.norm_max_card
         normalized_output = unnormalize_labels(output, min_card, max_card)
-        estimated_value = normalized_output.item()
+        # unnormalize_labels() already inverts the log1p() normalization via expm1(), so no further
+        # correction is needed. We only guard against tiny negative values from numerical noise.
+        estimated_value = max(0.0, normalized_output.item())
         return pb.Cardinality(estimated_value)
 
     def fit_samples(self, samples: pb.train.TrainingData) -> pb.train.TrainingMetrics:
@@ -358,6 +364,7 @@ class MscnEstimator(pb.CardinalityEstimator):
         data_loader = torch.utils.data.DataLoader(
             training_data,
             batch_size=hyper_params.batch_size,
+            collate_fn=collate_featurized,
             pin_memory=True,
         )
 
@@ -393,7 +400,7 @@ class MscnEstimator(pb.CardinalityEstimator):
 
     def store(
         self,
-        catalog: Path | str,
+        catalog_path: Path | str,
         *,
         encoder_dir: Path | str | None = None,
         model_file: Path | str | None = None,
@@ -402,7 +409,7 @@ class MscnEstimator(pb.CardinalityEstimator):
 
         Parameters
         ----------
-        catalog: Path | str
+        catalog_path: Path | str
             The path to the JSON file where the model info should be stored. If the file already
             exists, it will be overwritten. If this is a directory, it will be augmented to
             "mscn-catalog-{schema}.json", where {schema} is the name of the database schema.
@@ -420,39 +427,41 @@ class MscnEstimator(pb.CardinalityEstimator):
         MscnFeaturizer.store : Export logic for the featurizer
         """
         schema = self._database.database_name()
-        catalog = Path(catalog)
-        if catalog.is_dir():
-            catalog = catalog / f"mscn-catalog-{schema}.json"
+        catalog_path = Path(catalog_path)
+        if catalog_path.is_dir():
+            catalog_path = catalog_path / f"mscn-catalog-{schema}.json"
 
         if encoder_dir is None:
-            encoder_dir = catalog.parent
+            encoder_dir = catalog_path.parent
         else:
             encoder_dir = Path(encoder_dir)
 
         if model_file is None:
-            model_file = catalog.parent / f"mscn-{schema}.pt"
+            model_file = catalog_path.parent / f"mscn-{schema}.pt"
         else:
             model_file = Path(model_file)
 
-        catalog.parent.mkdir(parents=True, exist_ok=True)
+        catalog_path.parent.mkdir(parents=True, exist_ok=True)
         model_file.parent.mkdir(parents=True, exist_ok=True)
 
-        self.featurizer.store(catalog, encoder_dir=encoder_dir)
+        self.featurizer.store(catalog_path, encoder_dir=encoder_dir)
 
         self._log("Storing MSCN model to", model_file)
         weights = self.model.state_dict()
         torch.save(weights, model_file)
 
-        self._log("Finalizing catalog at", catalog)
-        with open(catalog, "r+") as f:
+        self._log("Finalizing catalog at", catalog_path)
+        with open(catalog_path, "r+") as f:
             catalog = json.load(f)
             catalog["mscn_model"] = str(model_file)
             catalog["hyper_parameters"] = self._training_params.__json__() if self._training_params else None
             catalog["training_metrics"] = self._training_metrics
+
+            f.truncate(0)
             f.seek(0)
             pb.util.to_json_dump(catalog, f)
 
-        return catalog
+        return catalog_path
 
     def describe(self) -> pb.util.jsondict:
         return {"name": "MSCN", "hyperparameters": self._training_params}
@@ -460,7 +469,5 @@ class MscnEstimator(pb.CardinalityEstimator):
     def _move_features(self, features: list[torch.Tensor]) -> list[torch.Tensor]:
         moved: list[torch.Tensor] = []
         for feature in features:
-            feature = feature.to(self._device, non_blocking=True)
-            feature.requires_grad_(True)
-            moved.append(feature)
+            moved.append(feature.to(self._device, non_blocking=True))
         return moved

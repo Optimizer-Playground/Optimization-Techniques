@@ -41,7 +41,7 @@ details.
 Since the training process can be quite time consuming, it is recommended to export
 the resulting model once training is completed. The `store()` method of the estimator
 is responsible for persisting the model state along with all required featurization
-info to disk. Afterwards, calling `MscnEstimator.load()` allows to re-create the
+info to disk. Afterwards, calling `MscnEstimator.pre_trained()` allows to re-create the
 estimator.
 
 The generally recommended pattern is to use `MscnEstimator.load_or_build()`. It
@@ -66,12 +66,12 @@ workload = pb.workloads.stats()
 
 #
 # Step 2: load our training samples
-# 
+#
 samples = pb.util.read_df("query-samples.parquet")
 
 #
 # Step 3: create the estimator
-# 
+#
 mscn = pbx.mscn.MscnEstimator.load_or_build(
     f"models/mscn/{workload.name}-catalog.json",
     samples=samples,
@@ -84,7 +84,7 @@ mscn = pbx.mscn.MscnEstimator.load_or_build(
 #
 # Step 4: Evaluation
 #
-# We can already use this optimizer to calculate the bound of different queries:
+# We can already use this optimizer to calculate the estimate for different queries:
 query = workload["q-10"]
 print(mscn.calculate_estimate(query, query.tables()))
 
@@ -107,9 +107,6 @@ generalize MSCN in a few ways. These affect the featurization of the SQL queries
 the MSCN model itself is left unchanged. Specifically, we perform the following
 generalizations/changes:
 
-- We do not using the few-hot encoding scheme for the filter operators. Instead,
-  we use a **pure one-hot encoding for operators**. This allows us to easily incorporate
-  additional predicate types such as _LIKE_.
 - We add support for **date and timestamp column types** to the featurization. Internally,
   these are converted to UNIX timestamps which allows to keep the normal integer
   featurization.
@@ -131,7 +128,7 @@ While this is the most realistic setting, it will typically provide the worst
 results. This is because the featurization has to consider the entire schema and
 the entire set of operators, which leads to the largest (and by consequence sparsest)
 vectors and the largest model. Nevertheless we argue that one should generally opt
-for this mode to become the most realistic impression of the model performance.
+for this mode to get the most realistic impression of the model performance.
 
 ## Authors and License
 
