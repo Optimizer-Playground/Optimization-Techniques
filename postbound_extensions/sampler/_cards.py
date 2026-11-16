@@ -121,7 +121,7 @@ class PostgresSamplerCtl:
                 "query": [query],
                 "plan": [plan],
                 "cardinality": [plan.root.true_cardinality],
-                "runtime_ms": [plan.root.execution_time],
+                "runtime_ms": [plan.root.execution_time * 1000],
             }
             df = pd.DataFrame(result_set)
             pb.util.write_df(df, self._out, mode="a", header=not self._out.exists())
