@@ -55,6 +55,7 @@ exclude = ["postbound_extensions/fastgres/**"]
 extend-immutable-calls = [
     "postbound_extensions.safebound._catalog.SafeBoundSpec.default",
     "postbound_extensions.mscn._estimator.MscnHyperParams.default",
+    "postbound_extensions.naru._hyperparams.NaruHyperParams.default",
     "postbound.Cardinality.unknown",
 ]
 

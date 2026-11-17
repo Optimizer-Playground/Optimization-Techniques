@@ -234,6 +234,10 @@ localtest*
 
 *.prof
 
+# Auditing / AI generation
+*-Paper.pdf
+reference-implementation/
+
 # FASTgres stuff
 /tests/
 # Keep the portable FastGRES compatibility tests while ignoring local experiments.
