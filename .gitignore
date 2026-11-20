@@ -221,18 +221,25 @@ __marimo__/
 # MacOS
 .DS_Store
 
-# Project-specific stuff
+# Project-specific debugging stuff
 localtest*
+
+# Databases and connection files
+.psycopg_connection*
 .pg-connect*.toml
 .query_cache*.json
 *.duckdb
 
+# Generated files, artifacts, and directories
 /generated/
 /models/
 /results/
 /workloads/
-
 *.prof
+
+# Audits
+reference-implementation/
+*-Paper.pdf
 
 # FASTgres stuff
 /tests/
