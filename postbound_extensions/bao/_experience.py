@@ -20,8 +20,8 @@ from __future__ import annotations
 
 import collections
 import json
-from collections.abc import Iterable
-from dataclasses import dataclass
+from collections.abc import Iterable, Mapping
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import pandas as pd
@@ -29,7 +29,20 @@ import postbound as pb
 import torch
 from torch.utils.data import Dataset
 
-from ._featurizer import BaoFeaturizer, DatabaseCacheState
+from ._cache import DatabaseCacheState
+from ._featurizer import BaoFeaturizer
+
+
+def read_cache_state(serialized: DatabaseCacheState | list | str) -> DatabaseCacheState:
+    """Parses a cache state, either given as a mapping or in the serialized form of `BaoSample.serialize()`."""
+    if isinstance(serialized, str):
+        serialized = json.loads(serialized)
+    if isinstance(serialized, Mapping):
+        return {
+            (pb.parser.load_table_json(rel) if not isinstance(rel, pb.TableReference) else rel): pct
+            for rel, pct in serialized.items()
+        }
+    return {pb.parser.load_table_json(entry["relation"]): entry["buffer_pct"] for entry in serialized}
 
 
 @dataclass
@@ -42,13 +55,25 @@ class BaoSample:
         The query plan that was executed
     runtime_ms : float
         The observed plan runtime in milliseconds
+    cache_state : DatabaseCacheState
+        The state of the database cache at the time of query execution.
     """
 
     plan: pb.QueryPlan
+    cache_state: DatabaseCacheState
     runtime_ms: float
 
+    # (featurizer, (features, scaled runtime)) - the encoding only depends on the sample and the featurizer, so we
+    # compute it once instead of in every training epoch. It is never persisted.
+    _encoded: tuple[BaoFeaturizer, tuple] | None = field(default=None, init=False, repr=False, compare=False)
+
     def serialize(self) -> dict:
-        return {"plan": pb.util.to_json(self.plan), "runtime": self.runtime_ms}
+        serialized_cache_state = [{"relation": rel, "buffer_pct": pct} for rel, pct in self.cache_state.items()]
+        return {
+            "plan": pb.util.to_json(self.plan),
+            "cache_state": serialized_cache_state,
+            "runtime_ms": self.runtime_ms,
+        }
 
 
 class BaoExperience(Dataset[tuple[torch.Tensor, torch.Tensor, float]]):
@@ -69,9 +94,7 @@ class BaoExperience(Dataset[tuple[torch.Tensor, torch.Tensor, float]]):
     Parameters
     -----------
     featurizer : BaoFeaturizer
-        The featurizer is required to transform the query plans into feature vectors. Since each
-        featurizer maintains a reference to the target database, we also use the featurizer to
-        obtain the current cache state, should the need arise (see Warnings below).
+        The featurizer is required to transform the query plans into feature vectors.
     sample_window : int, optional
         The maximum number of samples that are stored in the experience. If the number of samples
         exceeds this limit, the oldest samples are discarded. Default: 2000, which is the window
@@ -82,19 +105,19 @@ class BaoExperience(Dataset[tuple[torch.Tensor, torch.Tensor, float]]):
         Bao paper.
     existing_samples : Iterable[BaoSample], optional
         Samples that should be added to the experience upon creation.
+    log : pb.util.Logger, optional
+        Logger for diagnostic messages during featurization.
 
-    Warnings
-    --------
-    One current limitation of the experience store is the handling of the database cache state that
-    is used for featurization. If the target database does not automatically add caching information
-    to the query plans, the experience store tries to obtain the cache state once the samples are
-    _retrieved_. Therefore, this data will likely be out-of-sync with the actual cache state at the
-    time of query execution. It is generally best to only evaluate Bao on systems that provide full
-    caching information in the query plans, such as Postgres.
+    Notes
+    -----
+    Each sample stores the cache state of the database at the time the plan was selected. The optimizer registers
+    this state via `register_cache_state` whenever it produces a plan (`calibrate`, `optimize_query`,
+    `select_physical_operators`). Adding a plan whose cache state was never registered is an error: the cache state
+    is never inferred after the fact.
     """
 
     @staticmethod
-    def load(archive: Path | str, *, featurizer: BaoFeaturizer) -> BaoExperience:
+    def load(archive: Path | str, *, featurizer: BaoFeaturizer, log: pb.util.Logger | None = None) -> BaoExperience:
         """Loads previously stored experience."""
         with open(archive, "r") as f:
             catalog = json.load(f)
@@ -103,14 +126,16 @@ class BaoExperience(Dataset[tuple[torch.Tensor, torch.Tensor, float]]):
         samples: list[BaoSample] = []
         for row in sample_df.itertuples():
             plan = pb.opt.read_query_plan_json(row.plan)  # type: ignore
-            runtime = row.runtime  # type: ignore
-            samples.append(BaoSample(plan, runtime))
+            cache_state = read_cache_state(row.cache_state)  # type: ignore
+            runtime = row.runtime_ms  # type: ignore
+            samples.append(BaoSample(plan, cache_state, runtime))
 
         return BaoExperience(
             featurizer,
             sample_window=catalog["window_size"],
             retraining_frequency=catalog["retrain_frequency"],
             existing_samples=samples,
+            log=log,
         )
 
     @staticmethod
@@ -126,7 +151,10 @@ class BaoExperience(Dataset[tuple[torch.Tensor, torch.Tensor, float]]):
         sample_window: int = 2000,
         retraining_frequency: int = 100,
         existing_samples: Iterable[BaoSample] | None = None,
+        log: pb.util.Logger | None = None,
     ) -> None:
+        self._log = log or pb.util.standard_logger(False)
+
         self._featurizer = featurizer
         self._window = sample_window
         self._retrain_freq = retraining_frequency
@@ -136,7 +164,10 @@ class BaoExperience(Dataset[tuple[torch.Tensor, torch.Tensor, float]]):
             self._storage.extend(existing_samples)
 
         self._new_samples = 0
-        self._cache_state: DatabaseCacheState | None = None
+        # Cache states of plans that were produced by the optimizer but whose runtime is not yet known. We do not remove
+        # entries once the plan's runtime is added, because the same plan might be executed multiple times (e.g. by
+        # repeated benchmark runs). Instead, the oldest entries are evicted once the capacity is exceeded.
+        self._cache_state: collections.OrderedDict[pb.QueryPlan, DatabaseCacheState] = collections.OrderedDict()
 
     def add(self, plan: pb.QueryPlan | BaoSample, runtime_ms: float | None = None) -> None:
         """Store a new sample in the experience.
@@ -154,9 +185,28 @@ class BaoExperience(Dataset[tuple[torch.Tensor, torch.Tensor, float]]):
         elif not isinstance(plan, pb.QueryPlan):
             raise ValueError("plan must be a QueryPlan")
 
-        sample = BaoSample(plan, runtime_ms)
+        cache_state = self._cache_state.get(plan)
+        if cache_state is None:
+            raise ValueError(
+                f"No cache state registered for plan {plan}. Cannot add to experience. "
+                "BaoOptimizer should take care of this automatically. Make sure to only add samples via its `calibrate` method "
+                "or the reinforcement learning loop "
+                "(getting a plan from the optimizer and then adding its runtime back to the experience)."
+            )
+        sample = BaoSample(plan, cache_state, runtime_ms)
         self._storage.append(sample)
         self._new_samples += 1
+
+    def register_cache_state(self, plan: pb.QueryPlan, cache_state: DatabaseCacheState) -> None:
+        """Registers the cache state for a given query plan.
+
+        Plans are matched by their structure (node types, base tables and children), i.e. plans that are structurally
+        identical share the same cache state. The most recent registration wins.
+        """
+        self._cache_state[plan] = cache_state
+        self._cache_state.move_to_end(plan)
+        while len(self._cache_state) > self._window:
+            self._cache_state.popitem(last=False)
 
     def should_retrain(self) -> bool:
         """Whether enough new samples have been added to justify retraining the TCNN."""
@@ -164,7 +214,6 @@ class BaoExperience(Dataset[tuple[torch.Tensor, torch.Tensor, float]]):
 
     def samples(self) -> Dataset[tuple[torch.Tensor, torch.Tensor, float]]:
         """Provides the current experience as a PyTorch dataset of (features, runtimes) tuples."""
-        self._cache_state = DatabaseCacheState(self._featurizer._db)
         return self
 
     def mark_retrained(self) -> None:
@@ -174,11 +223,12 @@ class BaoExperience(Dataset[tuple[torch.Tensor, torch.Tensor, float]]):
         retraining is completed. There is generally no need to call this method manually.
         """
         self._new_samples = 0
-        self._cache_state = None
 
     def clear(self) -> None:
         """Removes all samples from the experience."""
         self._storage.clear()
+        self._cache_state.clear()
+        self._new_samples = 0
 
     def store(self, catalog_path: Path | str, *, experience_path: Path | str | None = None) -> None:
         """Persists the current experience to disk.
@@ -213,6 +263,10 @@ class BaoExperience(Dataset[tuple[torch.Tensor, torch.Tensor, float]]):
 
     def __getitem__(self, index):
         sample = self._storage[index]
-        featurized = self._featurizer.encode_plan(sample.plan, cache_state=self._cache_state)
+        if sample._encoded is not None and sample._encoded[0] is self._featurizer:
+            return sample._encoded[1]
+
+        featurized = self._featurizer.encode_plan(sample.plan, cache_state=sample.cache_state, log=self._log)
         scaled_runtime = self._featurizer.transform_runtime([(sample.runtime_ms,)])
+        sample._encoded = (self._featurizer, (featurized, scaled_runtime))
         return (featurized, scaled_runtime)

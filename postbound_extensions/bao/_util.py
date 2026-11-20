@@ -179,8 +179,17 @@ def prepare_trees[NodeT](
     transformer: NodeFlatten[NodeT],
     left_child: TreeTraversal[NodeT],
     right_child: TreeTraversal[NodeT],
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Flattens and pads a batch of trees for the tree convolution layers.
+
+    Returns the flattened trees (batch x channels x positions), the convolution indexes, and a padding mask
+    (batch x 1 x positions). The mask is *True* for position 0 (the zero vector) and the tree's own nodes, and *False*
+    for the padding that is added to match the largest tree in the batch. `TreeLayerNorm` and `DynamicPooling` use
+    it to make each tree's result independent of the other trees in the batch.
+    """
+    trees = list(trees)  # iterated twice below
     flat_trees = [_flatten(x, transformer, left_child, right_child) for x in trees]
+    lengths = torch.tensor([tree.shape[0] for tree in flat_trees])  # number of nodes + 1 (zero vector at position 0)
     flat_trees = _pad_and_combine(flat_trees)
     flat_trees = torch.Tensor(flat_trees) if not isinstance(flat_trees, torch.Tensor) else flat_trees
 
@@ -191,4 +200,6 @@ def prepare_trees[NodeT](
     indexes = _pad_and_combine(indexes)
     indexes = torch.Tensor(indexes).long()
 
-    return (flat_trees, indexes)
+    mask = (torch.arange(flat_trees.shape[2]).unsqueeze(0) < lengths.unsqueeze(1)).unsqueeze(1)
+
+    return (flat_trees, indexes, mask)

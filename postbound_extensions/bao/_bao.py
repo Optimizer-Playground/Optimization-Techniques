@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import functools
 import json
+import os
 from collections.abc import Callable, Iterable
 from pathlib import Path
 from typing import TypedDict
@@ -31,8 +32,9 @@ import torch
 from tqdm import tqdm
 
 from ..util import wrap_logger
-from ._experience import BaoExperience
-from ._featurizer import BaoFeaturizer, DatabaseCacheState
+from ._cache import DatabaseCacheState, infer_cache_state, infer_cache_states
+from ._experience import BaoExperience, read_cache_state
+from ._featurizer import BaoFeaturizer
 from ._model import BaoModel
 
 
@@ -481,7 +483,8 @@ class BaoOptimizer(pb.CompleteOptimizationAlgorithm, pb.OperatorSelection, pb.Co
     hint_sets: Optional[Iterable[pb.PhysicalOperatorAssignment]]
         The hint sets that Bao should use to obtain different candidate plans. It is the user's
         responsibility to make sure that the `target_db` actually supports these hint sets.
-        By default, we use the same 26 hint sets that the reference implementation uses.
+        By default, we use the first 5 of the 26 reference hint sets (see `default_hint_sets`),
+        which matches the reference implementation's default of `bao_num_arms = 5`.
     tcnn: Optional[BaoModel]
         The cost model that should be used to assess the candidate plans. If this parameter is
         omitted, a new model with random weights will be used.
@@ -537,14 +540,18 @@ class BaoOptimizer(pb.CompleteOptimizationAlgorithm, pb.OperatorSelection, pb.Co
         archive: Path | str,
         *,
         database: pb.Database,
+        retrain: bool = False,
         verbose: bool | pb.util.Logger = False,
     ) -> BaoOptimizer:
         """Loads a Bao model from disk.
 
         This is the inverse operation to `store`. Since `store` also takes care of persisting the
         featurizer and experience, it is loaded as part of this process.
+
         The `archive` must either point to a valid JSON file containing the model info, or the
         directory that contains the catalog.
+
+        If `retrain` is False, the reinforcement learning loop will be disabled.
 
         See Also
         ---------
@@ -552,13 +559,16 @@ class BaoOptimizer(pb.CompleteOptimizationAlgorithm, pb.OperatorSelection, pb.Co
         """
         archive = Path(archive)
         if archive.is_dir():
-            archive = archive / "catalog.json"
+            schema = database.database_name()
+            archive = archive / f"catalog-{schema}.json"
 
         with open(archive, "r") as f:
             catalog = json.load(f)
 
         featurizer = BaoFeaturizer.pre_built(catalog["featurizer"], database=database)
-        experience = BaoExperience.load(catalog["experience"]["catalog"], featurizer=featurizer)
+        experience = BaoExperience.load(
+            catalog["experience"]["catalog"], featurizer=featurizer, log=wrap_logger(verbose)
+        )
 
         weights = torch.load(catalog["tcnn_model"])
         model = BaoModel(featurizer.out_shape)
@@ -573,7 +583,7 @@ class BaoOptimizer(pb.CompleteOptimizationAlgorithm, pb.OperatorSelection, pb.Co
             featurizer=featurizer,
             experience=experience,
             training_epochs=catalog["training"]["epochs"],
-            retrain=False,
+            retrain=retrain,
             verbose=verbose,
         )
         return bao
@@ -611,11 +621,12 @@ class BaoOptimizer(pb.CompleteOptimizationAlgorithm, pb.OperatorSelection, pb.Co
         log = wrap_logger(verbose)
         archive = Path(archive)
         if archive.is_dir():
-            archive = archive / "catalog.json"
+            schema = database.database_name()
+            archive = archive / f"catalog-{schema}.json"
 
         if archive.is_file():
             log(f"Detected existing BAO model at {archive}. Re-loading.")
-            return BaoOptimizer.pre_trained(archive, database=database, verbose=verbose)
+            return BaoOptimizer.pre_trained(archive, database=database, retrain=retrain, verbose=verbose)
 
         log(f"No BAO model found at {archive}. Creating a new one.")
         bao = BaoOptimizer(
@@ -652,15 +663,17 @@ class BaoOptimizer(pb.CompleteOptimizationAlgorithm, pb.OperatorSelection, pb.Co
         self._db = target_db
         self._hint_sets = list(hint_sets) if hint_sets is not None else default_hint_sets()[:5]
         self._featurizer = featurizer or BaoFeaturizer.online(self._db)
+        self._log = wrap_logger(verbose)
         self._experience = experience or BaoExperience(
             self._featurizer,
             sample_window=experience_window,
             retraining_frequency=retraining_frequency,
+            log=self._log,
         )
+        self._untrained_model = tcnn is None
         self._tcnn = tcnn or BaoModel(self._featurizer.out_shape)
         self._retrain = retrain
         self._epochs = training_epochs
-        self._log = wrap_logger(verbose)
         self._verbose = bool(verbose)
 
     @property
@@ -678,12 +691,13 @@ class BaoOptimizer(pb.CompleteOptimizationAlgorithm, pb.OperatorSelection, pb.Co
         self._retrain = retrain
 
     def optimize_query(self, query: pb.SqlQuery) -> pb.QueryPlan:
-        cache_state = DatabaseCacheState(self._db)
-        plans = [self._generate_plan(query, hint_set) for hint_set in self._hint_sets]
-        featurized = [self._featurizer.encode_plan(plan, cache_state=cache_state) for plan in plans]
+        if self._untrained_model:
+            self._log("Untrained model detected, using first hint set as default")
+            plans, _ = self._candidate_plans(query, [self._hint_sets[0]])
+            return plans[0]
 
-        predictions = self._tcnn(featurized)
-        idxmin = int(torch.argmin(predictions).item())
+        plans, cache_states = self._candidate_plans(query, self._hint_sets)
+        idxmin = self._select_plan(plans, cache_states)
 
         hint_set = _stringify_hint_set(self._hint_sets[idxmin])
         self._log(f"Selected arm {idxmin} ({hint_set}) for query {query}")
@@ -692,22 +706,24 @@ class BaoOptimizer(pb.CompleteOptimizationAlgorithm, pb.OperatorSelection, pb.Co
     def select_physical_operators(
         self, query: pb.SqlQuery, join_order: pb.JoinTree | None
     ) -> pb.PhysicalOperatorAssignment:
-        cache_state = DatabaseCacheState(self._db)
-        plans = [self._generate_plan(query, hint_set, join_order=join_order) for hint_set in self._hint_sets]
+        if self._untrained_model:
+            self._log("Untrained model detected, using first hint set as default")
+            # we still need to register the cache state of the resulting plan to be able to learn from its execution
+            self._candidate_plans(query, [self._hint_sets[0]], join_order=join_order)
+            return self._hint_sets[0]
 
-        featurized = [self._featurizer.encode_plan(plan, cache_state=cache_state) for plan in plans]
-        predictions = self._tcnn(featurized)
-
-        idxmin = int(torch.argmin(predictions).item())
+        plans, cache_states = self._candidate_plans(query, self._hint_sets, join_order=join_order)
+        idxmin = self._select_plan(plans, cache_states)
         hint_set = self._hint_sets[idxmin]
         self._log(f"Selected arm {idxmin} ({_stringify_hint_set(hint_set)}) for query {query}")
         return hint_set
 
     def estimate_cost(self, query: pb.SqlQuery, plan: pb.QueryPlan) -> pb.Cost:
-        cache_state = DatabaseCacheState(self._db)
-        featurized = self._featurizer.encode_plan(plan, cache_state=cache_state)
-        prediction = self._tcnn([featurized])
-        return prediction.item()
+        cache_state = infer_cache_state(plan, self._db, log=self._log)
+        featurized = self._featurizer.encode_plan(plan, cache_state=cache_state, log=self._log)
+        with torch.no_grad():
+            prediction = self._tcnn([featurized])
+        return self._featurizer.inverse_transform_runtime(prediction.numpy()).item()
 
     def add_experience(self, plan: pb.QueryPlan, runtime_ms: float | None = None) -> None:
         """Records a new experience sample, possibly triggering retraining.
@@ -718,6 +734,9 @@ class BaoOptimizer(pb.CompleteOptimizationAlgorithm, pb.OperatorSelection, pb.Co
 
         The runtime can be omitted, in which case it will be inferred from the plan's execution
         time.
+
+        Note that before this method can be called, the cache state of the plan must have been registered via
+        `register_cache_state` on the experience.
         """
         if runtime_ms is None:
             runtime_ms = plan.execution_time * 1000
@@ -737,6 +756,7 @@ class BaoOptimizer(pb.CompleteOptimizationAlgorithm, pb.OperatorSelection, pb.Co
         self._tcnn = BaoModel(self._featurizer.out_shape)
         self._train(loader)
         self._experience.mark_retrained()
+        self._untrained_model = False
 
     def calibrate(
         self,
@@ -744,6 +764,8 @@ class BaoOptimizer(pb.CompleteOptimizationAlgorithm, pb.OperatorSelection, pb.Co
         *,
         plan_column: str = "query_plan",
         runtime_column: str = "runtime_ms",
+        cache_column: str = "cache_state",
+        archive: Path | str | None = None,
         timeout_ms: float | None = None,
         from_scratch: bool = False,
         hint_sets: Callable[[str, pb.SqlQuery], Iterable[pb.PhysicalOperatorAssignment]] | None = None,
@@ -784,6 +806,18 @@ class BaoOptimizer(pb.CompleteOptimizationAlgorithm, pb.OperatorSelection, pb.Co
             If `workload` is a DataFrame, this column is expected to contain the
             runtimes (in milliseconds) of the query plans. Defaults to
             "runtime_ms".
+        cache_column: str
+            If `workload` is a DataFrame, this column is expected to contain the
+            cache state at the time each plan was executed. Each entry is either a
+            mapping from table to buffered fraction, or its serialized form as
+            produced by `BaoSample.serialize()` (a list of relation/buffer_pct
+            entries, possibly JSON-encoded). Defaults to "cache_state".
+        archive: Optional[Path | str]
+            When calibrating online (i.e. from a workload instead of a pre-built
+            DataFrame), the resulting experience can be persisted at the given
+            path. Later calibration runs can then use the same queries.
+            As a nice side effect, this ensures that the experience has exactly
+            the format we need.
         timeout_ms: Optional[float]
             If `workload` is a set of queries, this timeout (in milliseconds)
             will be applied to each query execution. If a query exceeds this
@@ -804,7 +838,7 @@ class BaoOptimizer(pb.CompleteOptimizationAlgorithm, pb.OperatorSelection, pb.Co
             self._tcnn = BaoModel(self._featurizer.out_shape)
 
         if isinstance(workload, pd.DataFrame):
-            self._retrain_offline(workload, plan_col=plan_column, runtime_col=runtime_column)
+            self._retrain_offline(workload, plan_col=plan_column, runtime_col=runtime_column, cache_col=cache_column)
             return
 
         self._log("Gathering query plans for calibration queries")
@@ -815,7 +849,7 @@ class BaoOptimizer(pb.CompleteOptimizationAlgorithm, pb.OperatorSelection, pb.Co
 
         if timeout_ms:
             assert isinstance(self._db, pb.db.TimeoutSupport)
-            executor = functools.partial(self._db.execute_with_timeout, timeout=1000 * timeout_ms)
+            executor = functools.partial(self._db.execute_with_timeout, timeout=timeout_ms / 1000)
         else:
             executor = functools.partial(self._db.execute_query, raw=True)
 
@@ -823,20 +857,32 @@ class BaoOptimizer(pb.CompleteOptimizationAlgorithm, pb.OperatorSelection, pb.Co
             selected_hint_sets = hint_sets(label, query) if hint_sets else self._hint_sets
 
             for hint_set in selected_hint_sets:
-                query = self._db.hinting().generate_hints(query, physical_operators=hint_set)
-                query = pb.transform.as_explain_analyze(query)
+                hinted_query = self._db.hinting().generate_hints(query, physical_operators=hint_set)
+                explain_plan = self._db.optimizer().query_plan(hinted_query)
+                cache_state = infer_cache_state(explain_plan, self._db, log=self._log)
+                self._experience.register_cache_state(explain_plan, cache_state)
 
-                result_set = executor(query)
-                if result_set is None:
+                hinted_query = pb.transform.as_explain_analyze(hinted_query)
+                result_set = executor(hinted_query)
+                if result_set is not None:
+                    raw_plan = result_set
+                    plan = self._db.optimizer().parse_plan(raw_plan, query=hinted_query)
+                else:
+                    plan = None
+
+                if plan is None and timeout_ms is not None:
+                    # We ran into a timeout. This is critical because Bao needs to learn that this plan is very expensive.
+                    # We follow the reference implementation and record a runtime of 2 * timeout in the experience.
+                    plan = explain_plan
+                    runtime_s = 2 * timeout_ms / 1000
+                elif plan is None and timeout_ms is None:
+                    self._log(f"Failed to obtain query plan for {hinted_query}. Skipping this sample.")
                     continue
+                else:
+                    assert plan is not None
+                    runtime_s = plan.execution_time
 
-                raw_plan = result_set
-                plan = self._db.optimizer().parse_plan(raw_plan, query=query)
-                if plan is None:
-                    continue
-
-                runtime_s = plan.execution_time
-                self._experience.add(plan, runtime_s * 1000)
+                self._experience.add(explain_plan, 1000 * runtime_s)
 
         dataset = self._experience.samples()
         loader = torch.utils.data.DataLoader(
@@ -844,6 +890,13 @@ class BaoOptimizer(pb.CompleteOptimizationAlgorithm, pb.OperatorSelection, pb.Co
         )  # default collation messes up the data types due to namedtuple - use our own dummy
         self._train(loader)
         self._experience.mark_retrained()
+        self._untrained_model = False
+
+        if archive is not None:
+            self._log(f"Persisting experience at {archive}")
+            self._experience.store(
+                os.devnull, experience_path=archive
+            )  # we don't need the catalog, just the experience
 
     def bench_feedback(self, result: pb.bench.ExecutionResult) -> None:
         """Callback method suitable for `execute_workload` to feed the reinforcement-learning loop.
@@ -851,11 +904,19 @@ class BaoOptimizer(pb.CompleteOptimizationAlgorithm, pb.OperatorSelection, pb.Co
         If retraining is enabled, this can trigger a new training pass once the retraining
         threshold is reached.
 
+        Queries that ran into a timeout are recorded with a runtime of 2 * timeout (as in the reference
+        implementation and in `calibrate`), so that Bao learns to avoid such plans. Since no plan is available for
+        them, we use the EXPLAIN plan of the executed (hinted) query.
+
         Examples
         --------
         >>> bao = ...
-        >>> pb.bench.execute_workload(workload, on=bao, exec_callback=bao.bench_feedback)
+        >>> pb.bench.execute_workload(workload, on=bao, timeout=60, post_exec_callback=bao.bench_feedback)
         """
+        if result.status == "timeout":
+            timeout_plan = self._db.optimizer().query_plan(result.query)
+            self.add_experience(timeout_plan, 2 * 1000 * result.execution_time)
+            return
         if result.status != "ok" or result.query_result is None:
             return
         query_plan = self._db.optimizer().parse_plan(result.query_result)
@@ -863,7 +924,7 @@ class BaoOptimizer(pb.CompleteOptimizationAlgorithm, pb.OperatorSelection, pb.Co
             return
         self.add_experience(query_plan, 1000 * result.execution_time)
 
-    def store(self, archive_dir: Path | str) -> Path:
+    def store(self, archive: Path | str) -> Path:
         """Persists an optimizer and all related data to disk.
 
         This will persist the selected hint sets, the featurizer, the TCNN weights and the samples
@@ -871,10 +932,10 @@ class BaoOptimizer(pb.CompleteOptimizationAlgorithm, pb.OperatorSelection, pb.Co
 
         Parameters
         ----------
-        archive_dir: Path | str
-            The directory where the optimizer and all related data will be stored. This directory
-            should be exclusive to the current optimizer. If two optimizers share the same
-            directory, they will overwrite each others data.
+        archive: Path | str
+            The path to the catalog file that should be created. If this path points to a directory,
+            the catalog will be stored in a file named `catalog-<schema>.json` where `<schema>` is
+            the name of the target database system.
 
         Returns
         -------
@@ -882,11 +943,19 @@ class BaoOptimizer(pb.CompleteOptimizationAlgorithm, pb.OperatorSelection, pb.Co
             The path to the catalog file that should be passed to subsequent `pre_trained` calls to
             load this optimizer.
         """
-
-        archive_dir = Path(archive_dir)
-        archive_dir.mkdir(parents=True, exist_ok=True)
+        archive = Path(archive)
         schema = self._db.database_name()
-        catalog_path = archive_dir / f"catalog-{schema}.json"
+        if archive.is_dir():
+            archive_dir = archive
+            catalog_path = archive / f"catalog-{schema}.json"
+        elif not archive.exists():
+            archive_dir = archive.parent
+            catalog_path = archive
+        else:
+            archive_dir = archive.parent
+            catalog_path = archive
+
+        archive_dir.mkdir(parents=True, exist_ok=True)
 
         featurizer_catalog = archive_dir / f"featurizer-{schema}.json"
         self._log("Exporting featurizer to", featurizer_catalog)
@@ -938,7 +1007,31 @@ class BaoOptimizer(pb.CompleteOptimizationAlgorithm, pb.OperatorSelection, pb.Co
         hinted_query = self._db.hinting().generate_hints(query, join_order=join_order, physical_operators=hint_set)
         return self._db.optimizer().query_plan(hinted_query)
 
-    def _retrain_offline(self, samples: pd.DataFrame, *, plan_col: str, runtime_col: str) -> None:
+    def _candidate_plans(
+        self,
+        query: pb.SqlQuery,
+        hint_sets: list[pb.PhysicalOperatorAssignment],
+        *,
+        join_order: pb.JoinTree | None = None,
+    ) -> tuple[list[pb.QueryPlan], list[DatabaseCacheState]]:
+        """Generates the plans for all hint sets and registers their cache state (one buffer snapshot per decision)."""
+        plans = [self._generate_plan(query, hint_set, join_order=join_order) for hint_set in hint_sets]
+        cache_states = infer_cache_states(plans, self._db, log=self._log)
+        for plan, cache_state in zip(plans, cache_states):
+            self._experience.register_cache_state(plan, cache_state)
+        return plans, cache_states
+
+    def _select_plan(self, plans: list[pb.QueryPlan], cache_states: list[DatabaseCacheState]) -> int:
+        """Determines the index of the plan with the lowest predicted runtime."""
+        featurized = [
+            self._featurizer.encode_plan(plan, cache_state=cache_state, log=self._log)
+            for plan, cache_state in zip(plans, cache_states)
+        ]
+        with torch.no_grad():
+            predictions = self._tcnn(featurized)
+        return int(torch.argmin(predictions).item())
+
+    def _retrain_offline(self, samples: pd.DataFrame, *, plan_col: str, runtime_col: str, cache_col: str) -> None:
         """Utility to prepare and invoke training based on offline samples."""
         if isinstance(samples[plan_col].iloc[0], pb.QueryPlan):
             plans = samples[plan_col]
@@ -946,8 +1039,16 @@ class BaoOptimizer(pb.CompleteOptimizationAlgorithm, pb.OperatorSelection, pb.Co
             plans = samples[plan_col].map(self._db.optimizer().parse_plan)
         runtimes = samples[runtime_col]
 
-        for i in range(len(samples)):
-            self._experience.add(plans[i], runtimes[i])
+        if cache_col not in samples.columns:
+            raise ValueError(
+                f"Offline samples require the cache state at execution time (column '{cache_col}'). "
+                "Bao never infers it after the fact. See BaoSample.serialize() for the expected format."
+            )
+        cache_states = samples[cache_col].map(read_cache_state)
+
+        for plan, runtime, cache_state in zip(plans, runtimes, cache_states):
+            self._experience.register_cache_state(plan, cache_state)
+            self._experience.add(plan, runtime)
 
         dataset = self._experience.samples()
         loader = torch.utils.data.DataLoader(
@@ -955,6 +1056,7 @@ class BaoOptimizer(pb.CompleteOptimizationAlgorithm, pb.OperatorSelection, pb.Co
         )  # default collation messes up the data types due to namedtuple - use our own dummy
         self._train(loader)
         self._experience.mark_retrained()
+        self._untrained_model = False
 
     def _train(self, samples: torch.utils.data.DataLoader) -> None:
         self._tcnn.train()

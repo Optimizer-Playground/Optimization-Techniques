@@ -46,10 +46,15 @@ have been executed. The retraining parameters must be configured when creating
 the optimizer. Afterwards, `add_experience()` is used to store feedback and to
 trigger retraining when necessary.
 
-When also add an "offline mode" to learn an initial TCNN configuration with
+While `add_experience()` in principle accepts arbitrary query plans as input,
+it is crucial to only pass plans that already went through BAOs prediction
+loop. The reason is that this loop generates statistics about the buffer cache
+that are required during training. Plans from external generators do not have
+this information and raise an error during training.
+
+We also add an "offline mode" to learn an initial TCNN configuration with
 the `calibrate()` method. This is particularly useful for the learned cost model
-approach. Suitable training samples can be generated using the _query-sampler.py_
-tool.
+approach and allows to store static training data for offline retraining.
 
 In addition to the actual optimizer, the following classes capture important
 concepts of the original Bao paper:
@@ -143,13 +148,13 @@ the description in the paper. In this case, we typically favor the
 description in the paper. Specifically, this includes the following
 aspects of Bao:
 
-The plan featurization uses the full query plan and binarizes nodes with a single
+The **plan featurization** uses the full query plan and binarizes nodes with a single
 child element. The reference implementation seems to simply drop these nodes and
 strip the query plan down to joins and scans. As part of this change, we also
 extend the encoding of the physical operators. By default, we use the full set of
 operators supported by Postgres. This can be adjusted by customizing the `BaoFeaturizer`.
 
-For the buffer usage statistics, we calculate the cache percentage at the beginning
+For the **buffer usage statistics**, we calculate the cache percentage at the beginning
 of the optimization process. Currently, this functionality is limited to and specialized
 for Postgres. The cache percentage for sequential scans is inferred directly from
 the buffer pool (as in the Bao paper). For index scans and bitmap scans, we try
@@ -157,6 +162,12 @@ to accomodate for the fact that Postgres needs to access two kinds of relations:
 the actual data pages and the index pages. To include both of the relation types,
 we calcualte the cache percentage as the average cache percentage of the index pages
 and all data pages.
+
+The paper describes using **Thompson sampling** for training from experience. However,
+the reference just uses every sample exactly once. Many related papers compare against
+Bao and use the reference implementation to do so. Therefore, they also do not use
+Thompson sampling. To not in-validate their results,
+**we follow the reference implementation rather than the paper.**
 
 In addition to these deviations, we changed the following aspects of the Bao system:
 We added calibration support to train a TCNN in an offline fashion. Afterwards,

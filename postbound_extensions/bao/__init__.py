@@ -81,11 +81,13 @@ Example
 
 
     #
-    # Step 2: load some calibration queries
-    # These are used to pre-train the TCNN cost model
+    # Step 2: select some calibration queries
+    # These are executed under all hint sets to pre-train the TCNN cost model.
+    # (Pre-computed samples can also be passed as a DataFrame, but they must
+    # contain the cache state at execution time, see BaoOptimizer.calibrate)
     #
 
-    training_samples = pb.util.read_df("query-samples.parquet")
+    training_queries = stats.pick_random(20)
 
     #
     # Step 3: build our optimizer
@@ -94,7 +96,7 @@ Example
     bao = pbx.bao.BaoOptimizer.load_or_build(
         "models/bao/catalog.json",
         database=pg_instance,
-        calibration_queries=training_samples,
+        calibration_queries=training_queries,
         retrain=True,
         training_epochs=100,
         experience_window=2000,
@@ -111,7 +113,7 @@ Example
     print(bao.select_physical_operators(query, join_order=None))
 
     # Or we can run the PostBOUND benchmarking utilities
-    # By passing bench_feedback as an exec_callback, we can automatically
+    # By passing bench_feedback as a post_exec_callback, we can automatically
     # tap into the retraining facilities.
     pb.bench.execute_workload(
         stats,
@@ -119,7 +121,8 @@ Example
         query_preparation={"analyze": True, "prewarm": True},
         name="bao-test",
         progressive_output="bao-benchmark.parquet",
-        exec_callback=bao.bench_feedback,
+        timeout=60,
+        post_exec_callback=bao.bench_feedback,
         logger="tqdm"
     )
 
@@ -163,7 +166,7 @@ One key architectural change was necessary because PostBOUND currently does not
 support a tight feedback loop between an optimized plan and its performance. This
 is a key component of Bao's reinforcement learning architecure.
 Instead, feedback  needs to be handled either explicitly by the user, or as an
-`exec_callback` in the benchmarking utilities.
+`post_exec_callback` in the benchmarking utilities.
 To support this use-case, our Bao implementation offers a `bench_feedback` method
 (see example above).
 

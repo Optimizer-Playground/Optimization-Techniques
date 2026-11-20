@@ -29,9 +29,10 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import postbound as pb
-import torch
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import FunctionTransformer, MinMaxScaler, OneHotEncoder
+
+from ._cache import DatabaseCacheState, determine_cache_pct
 
 
 @dataclass
@@ -76,10 +77,11 @@ class BinarizedQep:
         plan: pb.QueryPlan,
         *,
         cache_state: DatabaseCacheState,
+        log: pb.util.Logger,
     ) -> BinarizedQep:
         """Recursively transforms the plan node and all of its children into a binarized QEP."""
         if plan.is_scan():
-            cache_pct = cache_state.determine_cache_pct(plan)
+            cache_pct = determine_cache_pct(plan, cache_state, log=log)
             return BinarizedQep.scan(
                 plan.node_type,
                 cardinality=int(plan.estimated_cardinality),
@@ -89,8 +91,8 @@ class BinarizedQep:
 
         elif plan.is_join():
             assert plan.outer_child and plan.inner_child
-            binarized_outer = BinarizedQep.create_for(plan.outer_child, cache_state=cache_state)
-            binarized_inner = BinarizedQep.create_for(plan.inner_child, cache_state=cache_state)
+            binarized_outer = BinarizedQep.create_for(plan.outer_child, cache_state=cache_state, log=log)
+            binarized_inner = BinarizedQep.create_for(plan.inner_child, cache_state=cache_state, log=log)
             return BinarizedQep.pseudo_join(
                 plan.node_type,
                 binarized_outer,
@@ -103,7 +105,7 @@ class BinarizedQep:
         assert plan.input_node
 
         dummy_child = BinarizedQep.dummy()
-        binarized_input = BinarizedQep.create_for(plan.input_node, cache_state=cache_state)
+        binarized_input = BinarizedQep.create_for(plan.input_node, cache_state=cache_state, log=log)
         return BinarizedQep.pseudo_join(
             plan.node_type,
             binarized_input,
@@ -180,58 +182,6 @@ def inner_child(node: FeaturizedNode) -> FeaturizedNode | None:
     if node.node_type == NodeType.Dummy or node.node_type == NodeType.Scan:
         return None
     return node.inner_child
-
-
-class DatabaseCacheState:
-    def __init__(self, database: pb.Database) -> None:
-        self._db = database
-        self._stats = self._db.statistics()
-
-        if isinstance(self._stats, pb.postgres.PostgresStatistics):
-            self._cache_state = self._stats.buffer_state()
-        else:
-            self._cache_state = {}
-
-    def determine_cache_pct(self, node: pb.QueryPlan) -> float:
-        measures = node.measures
-
-        if measures.cache_hits is not None and measures.cache_misses is not None:
-            total_cache_accesses = measures.cache_hits + measures.cache_misses
-            if total_cache_accesses == 0:
-                return 1
-
-            return measures.cache_hits / total_cache_accesses
-
-        if not isinstance(self._db, pb.postgres.PostgresDatabase):
-            return 0
-
-        assert node.base_table
-        match node.operator:
-            case pb.ScanOperator.SequentialScan:
-                rels = [node.base_table.full_name]
-            case pb.ScanOperator.IndexScan | pb.ScanOperator.IndexOnlyScan:
-                rels = [node.params.index, node.base_table.full_name]
-            case pb.ScanOperator.BitmapScan:
-                rel_set = set()
-                for child in node:
-                    if child.base_table is not None:
-                        rel_set.add(child.base_table.full_name)
-                    if child.params.index:
-                        rel_set.add(child.params.index)
-                rels = list(rel_set)
-            case _:
-                raise ValueError(f"Unsupported scan operator: {node.operator}")
-
-        pct_sum = 0
-        for rel in rels:
-            total_pages = self._stats.n_pages(rel)  # type: ignore - guarded by isinstance(PostgresInterface) above
-            buffered_pages = self._cache_state.get(rel, -1)
-            if buffered_pages == -1:
-                buffered_pages = self._stats.n_buffered(rel)  # type: ignore - guarded by isinstance(PostgresInterface) above
-                self._cache_state[rel] = buffered_pages
-            pct_sum += buffered_pages / total_pages
-
-        return pct_sum / len(rels)
 
 
 _PGNodeMap = {
@@ -372,17 +322,29 @@ class BaoFeaturizer:
         allowed_ops: set[str] = set()
         min_card, max_card = np.inf, 0
         min_cost, max_cost = np.inf, 0
-        min_runtime, max_runtime = np.inf, 0
+        min_runtime_s, max_runtime_s = np.inf, 0
+
+        def _known(value) -> bool:
+            # missing measurements are None or NaN (e.g. plain EXPLAIN plans have no execution time)
+            return value is not None and np.isfinite(float(value))
 
         for plan in plans:
             for node in plan:
                 allowed_ops.add(node.node_type)
-                min_card = min(min_card, node.estimated_cardinality)
-                max_card = max(max_card, node.estimated_cardinality)
-                min_cost = min(min_cost, node.estimated_cost)
-                max_cost = max(max_cost, node.estimated_cost)
-                min_runtime = min(min_runtime, node.execution_time)
-                max_runtime = max(max_runtime, node.execution_time)
+                if _known(node.estimated_cardinality):
+                    min_card = min(min_card, float(node.estimated_cardinality))
+                    max_card = max(max_card, float(node.estimated_cardinality))
+                if _known(node.estimated_cost):
+                    min_cost = min(min_cost, node.estimated_cost)
+                    max_cost = max(max_cost, node.estimated_cost)
+                if _known(node.execution_time):
+                    min_runtime_s = min(min_runtime_s, node.execution_time)
+                    max_runtime_s = max(max_runtime_s, node.execution_time)
+
+        if not np.isfinite(min_runtime_s):
+            raise ValueError("The sample does not contain any executed plans (EXPLAIN ANALYZE). Cannot infer runtimes.")
+        if not np.isfinite(min_card) or not np.isfinite(min_cost):
+            raise ValueError("The sample does not contain any cardinality or cost estimates.")
 
         min_card = int(min_card)
         max_card = int(max_card)
@@ -392,8 +354,8 @@ class BaoFeaturizer:
             max_card=max_card,
             min_cost=min_cost,
             max_cost=max_cost,
-            min_runtime_ms=min_runtime,
-            max_runtime_ms=max_runtime,
+            min_runtime_ms=1000 * min_runtime_s,
+            max_runtime_ms=1000 * max_runtime_s,
             database=database,
         )
 
@@ -452,26 +414,39 @@ class BaoFeaturizer:
         self._op_enc = OneHotEncoder(sparse_output=False)
         self._op_enc.fit([(op,) for op in self._allowed_ops])
 
-        self._min_card = min_card
-        self._max_card = max_card
-        self._min_cost = min_cost
-        self._max_cost = max_cost
-        self._min_runtime = min_runtime_ms
-        self._max_runtime = max_runtime_ms
+        self._min_card = np.float64(min_card)
+        self._max_card = np.float64(max_card)
+        self._min_cost = np.float64(min_cost)
+        self._max_cost = np.float64(max_cost)
+        self._min_runtime = np.float64(min_runtime_ms)
+        self._max_runtime = np.float64(max_runtime_ms)
 
-        self._min_card_log = np.log(self._min_card)
-        self._max_card_log = np.log(self._max_card)
-        self._min_cost_log = np.log(self._min_cost)
-        self._max_cost_log = np.log(self._max_cost)
-        self._min_runtime_log = np.log(self._min_runtime)
-        self._max_runtime_log = np.log(self._max_runtime)
-
-        # beware of where to pass the log-scaled values and where we need the original ones!
-        self._runtime_pipeline = make_pipeline(
+        self._card_scaler = make_pipeline(
             FunctionTransformer(func=np.log1p, inverse_func=np.expm1),
-            MinMaxScaler((self._min_runtime_log, self._max_runtime_log)),
+            MinMaxScaler(),
         )
-        self._runtime_pipeline.fit(np.asarray([self._min_runtime, self._max_runtime]).reshape(-1, 1))
+        self._card_scaler.fit(np.asarray([self._min_card, self._max_card]).reshape(-1, 1))
+
+        self._cost_scaler = make_pipeline(
+            FunctionTransformer(func=np.log1p, inverse_func=np.expm1),
+            MinMaxScaler(),
+        )
+        self._cost_scaler.fit(np.asarray([self._min_cost, self._max_cost]).reshape(-1, 1))
+
+        self._runtime_scaler = make_pipeline(
+            FunctionTransformer(func=np.log1p, inverse_func=np.expm1),
+            MinMaxScaler(),
+        )
+        self._runtime_scaler.fit(np.asarray([self._min_runtime, self._max_runtime]).reshape(-1, 1))
+
+        # Calling the sklearn transformers for every single node is very slow (~200 us per call), and featurization
+        # dominated the training time. Therefore, we extract the parameters of the fitted transformers and apply the
+        # same arithmetic directly. The sklearn objects are still the source of truth (fitting, inverse transforms).
+        self._op_index = {op: idx for idx, op in enumerate(self._op_enc.categories_[0])}
+        card_mm: MinMaxScaler = self._card_scaler[-1]
+        self._card_scale, self._card_offset = float(card_mm.scale_[0]), float(card_mm.min_[0])
+        cost_mm: MinMaxScaler = self._cost_scaler[-1]
+        self._cost_scale, self._cost_offset = float(cost_mm.scale_[0]), float(cost_mm.min_[0])
 
         self._db = database
 
@@ -491,58 +466,49 @@ class BaoFeaturizer:
         )
 
     def encode(self, node: BinarizedQep) -> np.ndarray:
-        """Transforms a specific pre-processed node into its feature representation."""
-        op_enc = self.encode_operator(node)
-        card_enc = self.encode_cardinality(node)
-        cost_enc = self.encode_cost(node)
-        cache_pct_enc = self.encode_cache_pct(node)
-        return np.concat(
-            [
-                op_enc,
-                card_enc,
-                cost_enc,
-                cache_pct_enc,
-            ],
-        )
+        """Transforms a specific pre-processed node into its feature representation.
+
+        The layout is [operator one-hot | cardinality | cost | cache pct]. This is equivalent to concatenating the
+        results of `encode_operator`, `encode_cardinality`, `encode_cost` and `encode_cache_pct`, but avoids the
+        intermediate arrays.
+        """
+        n_ops = len(self._op_index)
+        encoding = np.zeros(n_ops + 3)
+        encoding[self._operator_index(node)] = 1.0
+        if not node.is_dummy:
+            encoding[n_ops] = self._scale_cardinality(node.cardinality)
+            encoding[n_ops + 1] = self._scale_cost(node.cost)
+            encoding[n_ops + 2] = node.cache_pct
+        return encoding
 
     def encode_plan(
         self,
         plan: pb.QueryPlan,
         *,
-        cache_state: DatabaseCacheState | None = None,
+        cache_state: DatabaseCacheState,
+        log: pb.util.Logger,
     ) -> FeaturizedNode | tuple:
-        """Transforms a raw PostBOUND query plan into its feature representation.
-
-        If the cache state is not explicitly given, it will be inferred from the target database.
-        """
-        if cache_state is None:
-            cache_state = DatabaseCacheState(self._db)
-
-        binarized = BinarizedQep.create_for(plan, cache_state=cache_state)
+        """Transforms a raw PostBOUND query plan into its feature representation."""
+        binarized = BinarizedQep.create_for(plan, cache_state=cache_state, log=log)
         return self._featurize_qep(binarized)
 
     def encode_operator(self, node: BinarizedQep) -> np.ndarray:
         """Applies the operator one-hot encoding to the node."""
-        operator = "__bao_null__" if node.is_dummy else node.node
-        operator = _PGNodeMap.get(operator, operator)
-        enc = self._op_enc.transform([(operator,)])
-        return enc[0]
+        enc = np.zeros(len(self._op_index))
+        enc[self._operator_index(node)] = 1.0
+        return enc
 
     def encode_cardinality(self, node: BinarizedQep) -> np.ndarray:
         """Min-max scales the cardinality estimate of the node."""
         if node.is_dummy:
             return np.zeros(1)
-        scaled = np.log(node.cardinality + 1) - self._min_card_log
-        scaled /= self._max_card_log - self._min_card_log
-        return np.asarray([scaled])
+        return np.asarray([self._scale_cardinality(node.cardinality)])
 
     def encode_cost(self, node: BinarizedQep) -> np.ndarray:
         """Min-max scales the cost estimate of the node."""
         if node.is_dummy:
             return np.zeros(1)
-        scaled = np.log(node.cost + 1) - self._min_cost_log
-        scaled /= self._max_cost_log - self._min_cost_log
-        return np.asarray([scaled])
+        return np.asarray([self._scale_cost(node.cost)])
 
     def encode_cache_pct(self, node: BinarizedQep) -> np.ndarray:
         """Transforms the cache percentage of the node.
@@ -556,13 +522,30 @@ class BaoFeaturizer:
             return np.zeros(1)
         return np.asarray([node.cache_pct])
 
+    def _operator_index(self, node: BinarizedQep) -> int:
+        """Determines the position of the node's operator in the one-hot encoding."""
+        operator = "__bao_null__" if node.is_dummy else node.node
+        operator = _PGNodeMap.get(operator, operator)
+        idx = self._op_index.get(operator)
+        if idx is None:
+            raise ValueError(f"Unknown operator '{operator}'. Allowed operators are {list(self._op_index)}")
+        return idx
+
+    def _scale_cardinality(self, cardinality: float) -> float:
+        """log1p + min-max scaling, identical to `self._card_scaler.transform`."""
+        return np.log1p(cardinality) * self._card_scale + self._card_offset
+
+    def _scale_cost(self, cost: float) -> float:
+        """log1p + min-max scaling, identical to `self._cost_scaler.transform`."""
+        return np.log1p(cost) * self._cost_scale + self._cost_offset
+
     def transform_runtime(self, runtime) -> np.ndarray:
         """Scales a raw runtime measurement."""
-        return self._runtime_pipeline.transform(runtime)
+        return self._runtime_scaler.transform(runtime)
 
-    def inverse_transform_runtime(self, scaled):
+    def inverse_transform_runtime(self, scaled: np.ndarray) -> np.ndarray:
         """Undos the runtime scaling."""
-        return self._runtime_pipeline.inverse_transform(scaled)
+        return self._runtime_scaler.inverse_transform(scaled)
 
     def store(self, archive: Path | str) -> None:
         """Persists the featurization info at the specified location.
@@ -586,7 +569,7 @@ class BaoFeaturizer:
 
     def _featurize_qep(self, node: BinarizedQep | None) -> FeaturizedNode:
         if node is None or node.is_dummy:
-            encoding = torch.zeros(self.out_shape)
+            encoding = self.encode(BinarizedQep.dummy())
             return FeaturizedNode(NodeType.Dummy, encoding, [], [])
 
         encoding = self.encode(node)
