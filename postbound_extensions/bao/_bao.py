@@ -500,8 +500,10 @@ class BaoOptimizer(pb.CompleteOptimizationAlgorithm, pb.OperatorSelection, pb.Co
         allows for new experience to be added. This experience will simply not be used until
         retraining is enabled again.
     training_epochs: int
-        The number of epochs that should be used for each retraining phase. By default, we use
-        100 epochs, which is the same as the reference implementation.
+        The maximum number of epochs that should be used for each retraining phase. By default, we
+        use 100 epochs, which is the same as the paper and the reference implementation. Training
+        stops early once it converged, i.e. if the training loss decreased by less than 1% over
+        the last 10 epochs (as described in the paper).
     experience_window: int
         The maximum number of past query executions that should be considered for retraining. If
         more queries arrive, the oldest ones will be dropped. Even if retraining is currently
@@ -1063,9 +1065,18 @@ class BaoOptimizer(pb.CompleteOptimizationAlgorithm, pb.OperatorSelection, pb.Co
         optimizer = torch.optim.Adam(self._tcnn.parameters())
         mse_loss = torch.nn.MSELoss()
 
+        # Early stopping follows the paper (Sec. 6.1): train until either the maximum number of
+        # epochs elapsed, or convergence is reached, i.e. the training loss decreased by less than
+        # 1% over the last 10 epochs. The reference implementation uses a different, absolute
+        # criterion (see model.py) which depends on the scale of the transformed runtimes.
+        convergence_window = 10
+        convergence_threshold = 0.01
+        epoch_losses: list[float] = []
+
         self._log("Starting training")
         for epoch in range(self._epochs):
             loss_total = 0.0
+            n_batches = 0
 
             for batch in samples:
                 xs, y = list(zip(*batch))
@@ -1074,10 +1085,23 @@ class BaoOptimizer(pb.CompleteOptimizationAlgorithm, pb.OperatorSelection, pb.Co
                 prediction = self._tcnn.forward(xs)
                 loss = mse_loss(prediction, y)
                 loss_total += loss.item()
+                n_batches += 1
                 loss.backward()
                 optimizer.step()
 
+            epoch_loss = loss_total / max(n_batches, 1)
+            epoch_losses.append(epoch_loss)
             epoch_str = str(epoch + 1).rjust(len(str(self._epochs)))
-            self._log(f"Epoch: {epoch_str} / {self._epochs} :: loss = {loss_total}")
+            self._log(f"Epoch: {epoch_str} / {self._epochs} :: loss = {epoch_loss}")
+
+            if len(epoch_losses) > convergence_window:
+                reference_loss = epoch_losses[-1 - convergence_window]
+                improvement = reference_loss - epoch_loss
+                if improvement < convergence_threshold * reference_loss:
+                    self._log(
+                        f"Stopping training after epoch {epoch + 1}: loss decreased by less than "
+                        f"{convergence_threshold:.0%} over the last {convergence_window} epochs"
+                    )
+                    break
 
         self._tcnn.eval()

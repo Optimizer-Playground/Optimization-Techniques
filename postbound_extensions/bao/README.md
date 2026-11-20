@@ -169,6 +169,13 @@ Bao and use the reference implementation to do so. Therefore, they also do not u
 Thompson sampling. To not in-validate their results,
 **we follow the reference implementation rather than the paper.**
 
+For training, the paper describes an **early stopping** mechanism as follows:
+training runs for at most 100 epochs and stops early if the training loss decreased
+by less than 1% over the last 10 epochs. However, the reference implementation only
+stops once the absolute loss falls below 0.1. Then, it stops if the loss increases
+again or decreases by less than 0.0001 over 10 epochs. These absolute thresholds
+depend on the scale of the transformed runtimes.
+
 In addition to these deviations, we changed the following aspects of the Bao system:
 We added calibration support to train a TCNN in an offline fashion. Afterwards,
 Bao can be used without any feedback as a pure offline model.
