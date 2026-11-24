@@ -7,7 +7,7 @@ from collections.abc import Callable, Generator, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Protocol, overload
+from typing import Any, Protocol, overload, override
 
 import numpy as np
 import postbound as pb
@@ -165,6 +165,7 @@ class _CatalogVisitor(pb.qal.PredicateVisitor[None]):
         self.spec = spec
         self._log = log
 
+    @override
     def visit_binary_predicate(self, predicate: pb.qal.BinaryPredicate, *args, **kwargs) -> None:
         simplified = pb.qal.SimpleFilter.attempt_wrap(predicate)
         if simplified is None:
@@ -198,6 +199,7 @@ class _CatalogVisitor(pb.qal.PredicateVisitor[None]):
                 # Operator is not supported
                 pass
 
+    @override
     def visit_between_predicate(self, predicate: pb.qal.BetweenPredicate, *args, **kwargs) -> None:
         # even for BETWEEN predicates we perform the simplification check.
         # This makes sure that the predicate contains a simple range, i.e. BETWEEN 24 AND 42
@@ -213,6 +215,7 @@ class _CatalogVisitor(pb.qal.PredicateVisitor[None]):
             self._log(f"Detected range-conditioned PCF on {join_col} for {simplified}")
             self.spec.range_cols[join_col].add(filter_col)
 
+    @override
     def visit_in_predicate(self, predicate: pb.qal.InPredicate, *args, **kwargs) -> None:
         # even for IN predicates we perform the simplification check.
         # This makes sure that the predicate contains a simple range, i.e. IN (1, 2, 3)
@@ -228,18 +231,22 @@ class _CatalogVisitor(pb.qal.PredicateVisitor[None]):
             self._log(f"Detected equality-conditioned PCF on {join_col} for {simplified}")
             self.spec.equality_cols[join_col].add(filter_col)
 
+    @override
     def visit_unary_predicate(self, predicate: pb.qal.UnaryPredicate, *args, **kwargs) -> None:
         # SafeBound does not handle unary predicates
         pass
 
+    @override
     def visit_not_predicate(self, predicate: pb.qal.NotPredicate, *args, **kwargs) -> None:
         # SafeBound does not handle NOT predicates
         pass
 
+    @override
     def visit_or_predicate(self, predicate: pb.qal.OrPredicate, *args, **kwargs) -> None:
         for child in predicate.children:
             child.accept_visitor(self, *args, **kwargs)
 
+    @override
     def visit_and_predicate(self, predicate: pb.qal.AndPredicate, *args, **kwargs) -> None:
         for child in predicate.children:
             child.accept_visitor(self, *args, **kwargs)
@@ -395,8 +402,7 @@ def fetch_correlated_ds(
     *,
     on: pb.BoundColumnReference,
     database: pb.Database,
-    accuracy: float = 0.01,
-) -> PiecewiseConstantFn:
+) -> DegreeSequence:
     """Loads a compressed degree sequence for a specific column that is conditioned on a predicate.
 
     Parameters
@@ -408,18 +414,6 @@ def fetch_correlated_ds(
         The column to load the degree sequence for.
     database : pb.Database
         The database to load the degree sequence from.
-    accuracy : float, optional
-        The accuracy parameter to use for compressing the degree sequence. This corresponds to the
-        *c* parameter in the original SafeBound paper. Defaults to 0.01, which is the value used in
-        the paper as well.
-
-    Returns
-    -------
-    The compressed conditioned degree sequence.
-
-    See Also
-    --------
-    valid_compress : The compression algorithm used to compress the degree sequence.
     """
     on_filter = pb.qal.as_predicate(on, "IS NOT NULL")
 
@@ -432,11 +426,10 @@ def fetch_correlated_ds(
     result_set = database.execute_query(sql, raw=True)
     if not result_set:
         # all matching rows have a NULL join key
-        return PiecewiseConstantFn.zero(column=on)
+        return DegreeSequence.zero(on)
 
     ds = DegreeSequence([row[0] for row in result_set], column=on)
-    piecewiese_linear = valid_compress(ds, accuracy=accuracy)
-    return piecewiese_linear.deriv()
+    return ds
 
 
 def fetch_column_distribution(
@@ -471,7 +464,7 @@ def fetch_mcv_ds(
     database: pb.Database,
     num_mcv: int,
     accuracy: float = 0.01,
-) -> Mapping[Any, PiecewiseConstantFn]:
+) -> Mapping[Any, DegreeSequence]:
     filter_col = column.name
     join_col = on.name
     table = column.table.full_name
@@ -522,11 +515,7 @@ def fetch_mcv_ds(
     for filter_val, freq in result_set:
         collector[filter_val].append(freq)
 
-    mcv_ds = {
-        filter_val: valid_compress(DegreeSequence(frequencies, column=on), accuracy=accuracy).deriv()
-        for filter_val, frequencies in collector.items()
-    }
-
+    mcv_ds = {filter_val: DegreeSequence(frequencies, column=on) for filter_val, frequencies in collector.items()}
     return mcv_ds
 
 
@@ -537,7 +526,7 @@ def fetch_non_mcv_ds(
     database: pb.Database,
     num_mcv: int,
     accuracy: float = 0.01,
-) -> PiecewiseConstantFn:
+) -> DegreeSequence:
     filter_col = column.name
     join_col = on.name
     table = column.table.full_name
@@ -588,11 +577,10 @@ def fetch_non_mcv_ds(
 
     result_set = database.execute_query(sql_template, raw=True)
     if not result_set:
-        return PiecewiseConstantFn.zero(column=on)
+        return DegreeSequence.zero(column=on)
 
     ds = DegreeSequence([row[0] for row in result_set], column=on)
-    piecewiese_linear = valid_compress(ds, accuracy=accuracy)
-    return piecewiese_linear.deriv()
+    return ds
 
 
 class EqualityConditionedPCF[T]:
@@ -641,6 +629,7 @@ class EqualityConditionedPCF[T]:
             "unconditioned": self._unconditioned,
         }
 
+    @override
     def __repr__(self) -> str:
         return f"Equality-conditioned PCF on {self.equality_col}"
 
@@ -773,18 +762,20 @@ def build_equality_mcvs(
     for join_col, filter_cols in spec.equality_cols.items():
         for filter_col in filter_cols:
             log(f"Building MCV PCFs for {join_col} on {filter_col}")
-            correlated_pcfs = fetch_mcv_ds(
+            correlated_ds = fetch_mcv_ds(
                 filter_col, on=join_col, database=database, num_mcv=mcv_size, accuracy=accuracy
             )
+            correlated_pcfs = {val: valid_compress(ds, accuracy=accuracy).deriv() for val, ds in correlated_ds.items()}
 
             log(f"Building non-mcv PCF for {join_col} on {filter_col}")
-            non_mcv_pcf = fetch_non_mcv_ds(
+            non_mcv_ds = fetch_non_mcv_ds(
                 filter_col,
                 on=join_col,
                 database=database,
                 num_mcv=mcv_size,
                 accuracy=accuracy,
             )
+            non_mcv_pcf = valid_compress(non_mcv_ds, accuracy=accuracy).deriv()
 
             repo = EqualityConditionedPCF(filter_col, correlated_pcfs, non_mcv_pcf)
             pcfs[join_col].append(repo)
@@ -1095,6 +1086,7 @@ class RangeConditionedPCF[T: _HistogramKey]:
             "cutoff_point": self._cutoff_point,
         }
 
+    @override
     def __repr__(self) -> str:
         bucket_type = "leaf" if self._is_leaf else "intermediate"
         if self._cutoff_point is not None:
@@ -1417,7 +1409,8 @@ def build_histogram_hierarchy[T: _HistogramKey](
         range_pred = pb.qal.CompoundPredicate.create_and([lo_pred, hi_pred])
 
     log(f"Loading range-conditioned PCF for {join_col} on bucket {range_pred}")
-    pcf = fetch_correlated_ds(range_pred, on=join_col, database=database, accuracy=accuracy)
+    ds = fetch_correlated_ds(range_pred, on=join_col, database=database)
+    pcf = valid_compress(ds, accuracy=accuracy).deriv()
     if len(values) == 1 or current_level >= max_level:
         return RangeConditionedPCF(
             pcf,
@@ -1621,6 +1614,7 @@ class LikeConditionedPCF:
             "like_col": self._like_col,
         }
 
+    @override
     def __repr__(self) -> str:
         return f"Like-conditioned PCF on {self.like_col}"
 
@@ -2048,6 +2042,7 @@ class _Predicate2PCF(pb.qal.PredicateVisitor[PiecewiseConstantFn]):
         self._callback = callback or (lambda predicate, pcf: None)
         self._log = log
 
+    @override
     def visit_binary_predicate(self, predicate: pb.qal.BinaryPredicate, *args, **kwargs) -> PiecewiseConstantFn:
         join_col = kwargs["join_col"]
         simplified = pb.qal.SimpleFilter.attempt_wrap(predicate)
@@ -2126,6 +2121,7 @@ class _Predicate2PCF(pb.qal.PredicateVisitor[PiecewiseConstantFn]):
         self._callback(predicate, pcf)
         return pcf
 
+    @override
     def visit_between_predicate(self, predicate: pb.qal.BetweenPredicate, *args, **kwargs) -> PiecewiseConstantFn:
         join_col = kwargs["join_col"]
         simplified = pb.qal.SimpleFilter.attempt_wrap(predicate)
@@ -2144,6 +2140,7 @@ class _Predicate2PCF(pb.qal.PredicateVisitor[PiecewiseConstantFn]):
         self._callback(predicate, pcf)
         return pcf
 
+    @override
     def visit_in_predicate(self, predicate: pb.qal.InPredicate, *args, **kwargs) -> PiecewiseConstantFn:
         join_col = kwargs["join_col"]
         simplified = pb.qal.SimpleFilter.attempt_wrap(predicate)
@@ -2161,6 +2158,7 @@ class _Predicate2PCF(pb.qal.PredicateVisitor[PiecewiseConstantFn]):
         self._callback(predicate, pcf)
         return pcf
 
+    @override
     def visit_unary_predicate(self, predicate: pb.qal.UnaryPredicate, *args, **kwargs) -> PiecewiseConstantFn:
         join_col = kwargs["join_col"]
         self._log(f"Falling back to unconditioned PCF for unary predicate {predicate} on join column {join_col}")
@@ -2168,6 +2166,7 @@ class _Predicate2PCF(pb.qal.PredicateVisitor[PiecewiseConstantFn]):
         self._callback(predicate, pcf)
         return pcf
 
+    @override
     def visit_not_predicate(
         self,
         predicate: pb.qal.NotPredicate,
@@ -2182,6 +2181,7 @@ class _Predicate2PCF(pb.qal.PredicateVisitor[PiecewiseConstantFn]):
         self._callback(predicate, pcf)
         return pcf
 
+    @override
     def visit_or_predicate(
         self,
         predicate: pb.qal.OrPredicate,
@@ -2197,6 +2197,7 @@ class _Predicate2PCF(pb.qal.PredicateVisitor[PiecewiseConstantFn]):
         self._callback(predicate, pcf)
         return pcf
 
+    @override
     def visit_and_predicate(
         self,
         predicate: pb.qal.AndPredicate,
@@ -2413,16 +2414,15 @@ class SafeBoundCatalog:
         if not archive.exists():
             raise FileNotFoundError(archive)
 
-        match archive.suffixes:
-            case [".json", ".xz"]:
-                with open(archive, "rb") as f:
-                    decompressed = lzma.decompress(f.read()).decode("utf-8")
-                    catalog = json.loads(decompressed)
-            case [".json"]:
-                with open(archive, "r") as f:
-                    catalog = json.load(f)
-            case _:
-                raise RuntimeError(f"No suitable parser for catalog {archive}")
+        if archive.name.endswith(".json.xz"):
+            with open(archive, "rb") as f:
+                decompressed = lzma.decompress(f.read()).decode("utf-8")
+                catalog = json.loads(decompressed)
+        elif archive.name.endswith(".json"):
+            with open(archive, "r", encoding="utf-8") as f:
+                catalog = json.load(f)
+        else:
+            raise ValueError(f"No suitable parser for catalog {archive}")
 
         eq_pcfs = load_eq_repo_json(catalog["equality_pcfs"], database=database)
         range_pcfs = load_range_repo_json(catalog["range_pcfs"], database=database)
@@ -2704,7 +2704,7 @@ class SafeBoundCatalog:
         *safebound-catalog.json*.
         """
         archive = Path(archive)
-        if not archive.suffix:
+        if not archive.suffix and not archive.is_dir():
             extension = "json.xz" if compressed else "json"
             archive = archive / f"safebound-catalog.{extension}"
         archive.parent.mkdir(parents=True, exist_ok=True)

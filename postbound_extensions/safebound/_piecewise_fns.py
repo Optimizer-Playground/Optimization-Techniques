@@ -129,6 +129,14 @@ class DegreeSequence:
         """
         return DegreeSequence(np.ones(n_values), column=column)
 
+    @staticmethod
+    def zero(column: pb.ColumnReference | None = None) -> DegreeSequence:
+        """Creates a new degree sequence that contains no values.
+
+        This is useful for testing and debugging purposes.
+        """
+        return DegreeSequence([], column=column)
+
     def __init__(
         self,
         degrees: Iterable[int | pb.Cardinality] | NDArray[np.int_],
@@ -177,6 +185,14 @@ class DegreeSequence:
         return self._degrees.tolist()
 
     @property
+    def deg_array(self) -> NDArray[np.int_]:
+        """Get all frequencies/degrees stored in this sequence as a numpy array.
+
+        The frequencies are ordered with the highest values appearing first.
+        """
+        return self._degrees
+
+    @property
     def distinct_values(self) -> int:
         """Get the number of elements in this sequence (i.e. its length)."""
         return len(self)
@@ -204,7 +220,7 @@ class DegreeSequence:
         kept. Otherwise, elements with 0 frequency are inserted up to `n_elems`.
         """
         current_len = len(self)
-        if current_len < n_elems:
+        if current_len > n_elems:
             return DegreeSequence(self._degrees[:n_elems], column=self._column)
 
         padding = np.zeros(n_elems - current_len)
@@ -796,6 +812,8 @@ class PiecewiseLinearFn:
 
     def deriv(self) -> PiecewiseConstantFn:
         """Computes the derivative of the PLF, which yields a piecewise constant function."""
+        if len(self._slopes) == 0:
+            return PiecewiseConstantFn.zero(column=self.column)
         return PiecewiseConstantFn(self._slopes, self._bounds, column=self.column)
 
     def __len__(self) -> int:
