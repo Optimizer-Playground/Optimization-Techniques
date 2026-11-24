@@ -4,8 +4,9 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from datetime import date, datetime
+from decimal import Decimal
 from pathlib import Path
-from typing import Any
+from typing import Any, override
 
 import pandas as pd
 import postbound as pb
@@ -92,6 +93,7 @@ class PandasDataset(Dataset):
     def __len__(self) -> int:
         return len(self.df)
 
+    @override
     def __getitem__(self, index: int):
         return list(self.df.iloc[index])
 
@@ -102,7 +104,7 @@ def _noop_parser[T](value: T) -> T:
 
 def _int_parser(value: int | str) -> int | None:
     match value:
-        case "null":
+        case "null" | None:
             return None
         case int():
             return value
@@ -112,7 +114,7 @@ def _int_parser(value: int | str) -> int | None:
 
 def _float_parser(value: float | str) -> float | None:
     match value:
-        case "null":
+        case "null" | None:
             return None
         case float():
             return value
@@ -121,15 +123,27 @@ def _float_parser(value: float | str) -> float | None:
 
 
 def _timestamp_parser(ts: str) -> datetime | None:
-    if ts == "null":
+    if ts == "null" or ts is None:
         return None
     return datetime.fromisoformat(ts)
 
 
 def _date_parser(d: str) -> date | None:
-    if d == "null":
+    if d == "null" or d is None:
         return None
     return datetime.fromisoformat(d).date()
+
+
+def _decimal_parser(d: str) -> Decimal | None:
+    if d == "null" or d is None:
+        return None
+    return Decimal(d)
+
+
+def _bool_parser(b: str) -> bool | None:
+    if b == "null" or b is None:
+        return None
+    return b.lower() == "true" if isinstance(b, str) else bool(b)
 
 
 def make_json_parser(column_dtype: str) -> Callable[[Any], Any]:
@@ -146,9 +160,18 @@ def make_json_parser(column_dtype: str) -> Callable[[Any], Any]:
             return _date_parser
         case "integer" | "bigint" | "smallint":
             return _int_parser
-        case "float" | "double precision" | "real":
+        case "float" | "double precision" | "real" | "double":
             return _float_parser
         case "varchar" | "character varying" | "text":
             return _noop_parser
+        case "boolean":
+            return _bool_parser
+
+        # same weird logic as in cast_value(). See its comments for details
+        case _ if column_dtype.startswith("decimal"):
+            return _decimal_parser
+        case _ if column_dtype.startswith("numeric"):
+            return _decimal_parser
+
         case _:
             raise ValueError(f"Missing JSON parser for column type {column_dtype}")
