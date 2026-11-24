@@ -1,6 +1,7 @@
 from . import (
     bao,
     fastgres,
+    lpbound,
     meta,
     mscn,
     preprocessing,
@@ -14,6 +15,7 @@ from . import (
 __all__ = [
     "bao",
     "fastgres",
+    "lpbound",
     "meta",
     "mscn",
     "preprocessing",

@@ -13,7 +13,7 @@ dependencies = [
     "onnx>=1.23.2",
     "onnxruntime>=1.31.1",
     "pandas>=2.3.3",
-    "postbound>=0.23.5",
+    "postbound>=0.23.6",
     "pyarrow>=23.0.1",
     "scikit-learn>=1.8.0",
     "scipy>=1.17.0",
@@ -53,9 +53,13 @@ exclude = ["postbound_extensions/fastgres/**"]
 # These factories all return immutable value objects, so sharing one instance across all calls
 # (which is what a default argument does) is safe and intentional.
 extend-immutable-calls = [
-    "postbound_extensions.safebound._catalog.SafeBoundSpec.default",
+    "postbound_extensions.lpbound._core.LpBoundSpec.default",
     "postbound_extensions.mscn._estimator.MscnHyperParams.default",
+    "postbound_extensions.safebound._catalog.SafeBoundSpec.default",
     "postbound.Cardinality.unknown",
 ]
 
 [tool.uv.sources]
+
+[tool.ty.rules]
+missing-override-decorator = "error"
