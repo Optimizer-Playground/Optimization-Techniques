@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
+from typing import override
 
 import postbound as pb
 
@@ -40,6 +41,7 @@ class SafeBoundEstimator(pb.CardinalityEstimator):
         super().__init__()
         self._catalog = catalog
 
+    @override
     def calculate_estimate(
         self,
         query: pb.SqlQuery,
@@ -55,6 +57,3 @@ class SafeBoundEstimator(pb.CardinalityEstimator):
 
         stats = self._catalog.retrieve_stats(subquery)
         return fdsb(subquery, statistics=stats)
-
-    def describe(self) -> pb.util.jsondict:
-        return {"name": "SafeBound", "catalog": self._catalog}

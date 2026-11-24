@@ -2228,7 +2228,7 @@ class SafeBoundCatalog:
     usage scenario (see below).
 
     In addition, the catalog provides functionality to retrieve the appropriate PCFs for a specific
-    query. This behavior is encoded in the different ``lookup_XYZ()`` methods and the
+    query. This behavior is encoded in the different ``lookup_XYZ()`` methods.
 
     Creating a Catalog
     ------------------

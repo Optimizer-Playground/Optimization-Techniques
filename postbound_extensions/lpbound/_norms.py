@@ -6,6 +6,7 @@ import itertools
 import json
 import lzma
 from collections.abc import Iterable, Iterator, Mapping, Sequence
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Protocol, override
 
@@ -17,6 +18,8 @@ from postbound_extensions.preprocessing import cast_value
 from ..safebound import (
     CatalogSpec,
     DegreeSequence,
+    catalog_from_schema,
+    catalog_from_workload,
     fetch_column_distribution,
     fetch_correlated_ds,
     fetch_mcv_ds,
@@ -24,13 +27,25 @@ from ..safebound import (
     fetch_raw_ds,
 )
 from ..util import make_json_parser, wrap_logger
-from ._core import NormSet
+from ._core import LpBoundSpec, NormSet
 
 
-class LpCollection:
+class LpNorms:
+    """Collects all Lp norms that are computed for a specific join key.
+
+    The norms are stored as a mapping from the p-value (0, 1, ..., inf) to the actual norm. The p-values can be iterated
+    over and individual norms can be accessed with *__getitem__* semantics. In addition, `norms` provides quick access
+    to all norms of p-values with p > 0. Those are the norms that actually feed into the linear programs.
+
+    Different sets of Lp norms can be combined using `max_with`, `min_with`, and `sum_with`. Note that these operations
+    are only defined for collections of Lp norms with the same p-values and raise otherwise. An empty collection is
+    the only exception and can be combined with any other instance.
+    """
+
     @staticmethod
-    def zeros() -> LpCollection:
-        return LpCollection({})
+    def zeros() -> LpNorms:
+        """Constructs a collection of all-zero Lp norms."""
+        return LpNorms({})
 
     def __init__(self, norms: Mapping[float, float]) -> None:
         self._entries = dict(norms)
@@ -38,12 +53,18 @@ class LpCollection:
 
     @property
     def norms(self) -> Mapping[float, float]:
+        """Get all Lp norms with p > 0, mapping p -> norm value."""
         return {norm: val for norm, val in self._entries.items() if norm > 0}
 
     def is_zero(self) -> bool:
+        """Checks, whether all norms are zero."""
         return all(val == 0 for val in self._entries.values())
 
-    def max_with(self, other: LpCollection) -> LpCollection:
+    def max_with(self, other: LpNorms) -> LpNorms:
+        """Computes the element-wise maximum of two collections of Lp norms.
+
+        If the collections contain different p-values, an error is raised.
+        """
         if self.is_zero():
             return other
         if other.is_zero():
@@ -52,18 +73,26 @@ class LpCollection:
         diff = self._norms.symmetric_difference(other._norms)
         if diff:
             raise ValueError(f"Cannot compute max_with for collections with different norms: {diff}")
-        return LpCollection({norm: max(self[norm], other[norm]) for norm in self._norms})
+        return LpNorms({norm: max(self[norm], other[norm]) for norm in self._norms})
 
-    def min_with(self, other: LpCollection) -> LpCollection:
+    def min_with(self, other: LpNorms) -> LpNorms:
+        """Computes the element-wise minimum of two collections of Lp norms.
+
+        If the collections contain different p-values, an error is raised.
+        """
         if self.is_zero() or other.is_zero():
-            return LpCollection.zeros()
+            return LpNorms.zeros()
 
         diff = self._norms.symmetric_difference(other._norms)
         if diff:
             raise ValueError(f"Cannot compute min_with for collections with different norms: {diff}")
-        return LpCollection({norm: min(self[norm], other[norm]) for norm in self._norms})
+        return LpNorms({norm: min(self[norm], other[norm]) for norm in self._norms})
 
-    def sum_with(self, other: LpCollection) -> LpCollection:
+    def sum_with(self, other: LpNorms) -> LpNorms:
+        """Computes the element-wise sum of two collections of Lp norms.
+
+        If the collections contain different p-values, an error is raised.
+        """
         if self.is_zero():
             return other
         if other.is_zero():
@@ -72,9 +101,10 @@ class LpCollection:
         diff = self._norms.symmetric_difference(other._norms)
         if diff:
             raise ValueError(f"Cannot compute sum_with for collections with different norms: {diff}")
-        return LpCollection({norm: self[norm] + other[norm] for norm in self._norms})
+        return LpNorms({norm: self[norm] + other[norm] for norm in self._norms})
 
     def get(self, norm: float, default: float | None) -> float | None:
+        """Provides the norm for a specific p-value, or a default if it does not exist."""
         return self._entries.get(norm, default)
 
     def __json__(self) -> pb.util.jsondict:
@@ -91,27 +121,41 @@ class LpCollection:
         return self._entries[norm]
 
 
-def load_norm_json(json_data: dict | str) -> LpCollection:
-    if isinstance(json_data, str):
-        json_data = json.loads(json_data)
-    return LpCollection({float(norm): float(val) for norm, val in json_data})
-
-
-def compute_norms(ds: DegreeSequence, *, norms: NormSet) -> LpCollection:
+def compute_norms(ds: DegreeSequence, *, norms: NormSet) -> LpNorms:
+    """Computes the Lp norms for a given degree sequence."""
     degrees = ds.deg_array
     lpcoll: dict[float, float] = {}
     for norm in norms:
         lpcoll[norm] = np.linalg.norm(degrees, ord=norm)
-    return LpCollection(lpcoll)
+    return LpNorms(lpcoll)
+
+
+def load_norm_json(json_data: dict | str) -> LpNorms:
+    """Restores a Lp norms collection from its JSON representation."""
+    if isinstance(json_data, str):
+        json_data = json.loads(json_data)
+    return LpNorms({float(norm): float(val) for norm, val in json_data})
 
 
 class EqualityConditionedNorms[T]:
+    """Represents the Lp norms for equality predicates over an MCV list.
+
+    The norms for each MCV value are stored separately, and there is an additional "unconditioned" norm
+    that represents the frequencies of all non-MCV values combined.
+
+    The column that the norms are conditioned on (i.e. the column containing the MCV values) is stored
+    in `filter_col`. It is the client's responsibility to keep track of the join column that the norms
+    are associated with.
+
+    Use the `get` method to obtain the norms for a specific value.
+    """
+
     def __init__(
         self,
-        norms: Mapping[T | None, LpCollection],
+        norms: Mapping[T | None, LpNorms],
         *,
         filter_col: pb.BoundColumnReference,
-        fallback: LpCollection,
+        fallback: LpNorms,
     ) -> None:
         self._norms = dict(norms)
         self._fallback = fallback
@@ -121,7 +165,8 @@ class EqualityConditionedNorms[T]:
     def filter_col(self) -> pb.BoundColumnReference:
         return self._col
 
-    def get(self, key: T | None) -> LpCollection:
+    def get(self, key: T | None) -> LpNorms:
+        """Returns the norms for the given filter key if it exists, otherwise returns the unconditioned norms."""
         norm = self._norms.get(key)
         if norm is None:
             return self._fallback
@@ -133,6 +178,10 @@ class EqualityConditionedNorms[T]:
 
 
 def load_eq_norm_json(json_data: dict | str, *, database: pb.Database) -> EqualityConditionedNorms:
+    """Reconstructs equality-conditioned norms from their JSON representation.
+
+    Access to the database is required to parse the column values based on their data type.
+    """
     if isinstance(json_data, str):
         json_data = json.loads(json_data)
 
@@ -147,12 +196,30 @@ def load_eq_norm_json(json_data: dict | str, *, database: pb.Database) -> Equali
 
 
 class EqualityConditionedRepo:
+    """Maintains the equality-conditioned norms for a set of join columns.
+
+    Use the `lookup` method to obtain the norms for a specific join column and filter value.
+
+    Parameters
+    ----------
+    join_norms : dict[pb.ColumnReference, Sequence[EqualityConditionedNorms]]
+        A mapping from join column to the equality-conditioned norms for that column. Each set of norms should
+        be conditioned on a different filter column.
+    """
+
     def __init__(self, join_norms: Mapping[pb.ColumnReference, Sequence[EqualityConditionedNorms]]) -> None:
         self._norms = dict(join_norms)
 
     def lookup(
         self, join_col: pb.ColumnReference, *, filter_col: pb.ColumnReference, filter_val: object
-    ) -> LpCollection | None:
+    ) -> LpNorms | None:
+        """Retrieves the Lp norms set for a join column based on the condition *filter_col = filter_val*.
+
+        If the repository does not contain norms conditioned on the filter column, *None* is
+        returned. However, if there is a matching conditioned Lp norm, but it does not contain the
+        filter value (e.g. because the value is not in the MCV list), its unconditioned Lp norm is
+        returned.
+        """
         join_col = join_col.drop_table_alias()
         filter_col = filter_col.drop_table_alias()
 
@@ -174,6 +241,29 @@ class EqualityConditionedRepo:
 def build_equality_norms(
     spec: CatalogSpec, *, mcv_size: int, norms: NormSet, database: pb.Database, verbose: bool | pb.util.Logger = False
 ) -> EqualityConditionedRepo:
+    """Fetches all equality-conditioned Lp norms for the given catalog.
+
+    Parameters
+    ----------
+    spec : CatalogSpec
+        Specification that contains the join column/equality column pairs to build.
+    mcv_size : int
+        The number of entries for each MCV list. All entries in the MCV list are used to build
+        separate conditioned norms, as well as one additional "unconditioned" Lp norm that combines all
+        non-MCV values.
+    norms : NormSet
+        The Lp norms that should be computed for each join key.
+    database : pb.Database
+        The database to fetch the degree sequences from.
+    verbose : bool | pb.util.Logger, optional
+        Either a pre-defined logger, or a boolean that indicates whether to log the progress using a
+        default logger.
+
+    Returns
+    -------
+    EqualityConditionedRepo
+        A repository that contains all specified Lp norms.
+    """
     log = wrap_logger(verbose)
     repo = collections.defaultdict(list)
 
@@ -195,6 +285,10 @@ def build_equality_norms(
 
 
 def load_eq_repo_json(json_data: dict | str, *, database: pb.Database) -> EqualityConditionedRepo:
+    """Reconstructs an equality-conditioned Lp norms repository from its JSON representation.
+
+    Access to the database is required to parse the column values based on their data type.
+    """
     if isinstance(json_data, str):
         json_data = json.loads(json_data)
 
@@ -215,9 +309,29 @@ class _HistogramKey(Protocol):
 
 
 class RangeConditionedNorms[T: _HistogramKey]:
+    """Represents the Lp norms for range predicates over a (hierarchy of) histogram(s).
+
+    Each bucket in the histogram contains its own set of Lp norms. These norms model the
+    join column conditioned on the filter column taking values in the bucket's range.
+
+    Optionally, each histogram can have a "lower resolution" child histogram that models the same
+    join column conditioned on the same filter column, but with a coarser granularity (i.e. less
+    buckets). This results in additional bucket boundaries that might over-estimate the true
+    frequencies by a smaller margin.
+
+    Use the `get_range`, `get_less` and `get_greater` methods to obtain the norms for specific
+    predicates.
+
+    Notes
+    -----
+    The original LpBound paper does not specify how to handle half-open ranges (e.g. ``R.a < 42``),
+    but only closed ranges (e.g. ``R.a BETWEEN 24 AND 42``). Our implementation supports both. See
+    the documentation of `get_less` for details.
+    """
+
     def __init__(
         self,
-        norms: Sequence[LpCollection],
+        norms: Sequence[LpNorms],
         bounds: Sequence[T],
         *,
         range_col: pb.ColumnReference,
@@ -239,12 +353,21 @@ class RangeConditionedNorms[T: _HistogramKey]:
     def range_col(self) -> pb.ColumnReference:
         return self._col
 
-    def get_range(self, lower: T, upper: T) -> LpCollection:
+    def get_range(self, lower: T, upper: T) -> LpNorms:
+        """Retrieves the Lp norms for a specific range of values.
+
+        Matching norms must be enclosed by a single bucket of the histogram. If there exists no such
+        bucket, a coarser histogram is queried..
+
+        This function automatically traverses the histogram hierarchy to find the smallest bucket
+        that encompasses the entire range (and thus the norms that over-estimates the true frequencies
+        by the smallest margin).
+        """
         if lower > upper:
             # SQL allows BETWEEN 42 AND 24 which produces an empty result set.
-            return LpCollection.zeros()
+            return LpNorms.zeros()
         if upper < self._min_val or lower > self._bounds[-1]:
-            return LpCollection.zeros()
+            return LpNorms.zeros()
 
         idx = bisect.bisect_left(self._bounds, upper)
 
@@ -269,10 +392,42 @@ class RangeConditionedNorms[T: _HistogramKey]:
             raise AssertionError(f"Cannot find a histogram bucket for range [{lower}, {upper}]")
         return self._coarser.get_range(lower, upper)
 
-    def get_less(self, value: T, *, inclusive: bool) -> LpCollection:
+    def get_less(self, value: T, *, inclusive: bool) -> LpNorms:
+        """Obtains the Lp norms for all values less than (or equal to) a given value.
+
+        Use the `inclusive` flag to distinguish between open and closed ranges (i.e. strict less-than
+        vs. less-or-equal). But see the detailed notes below!
+
+        Notes
+        -----
+        The original LpBound paper did not specify how to obtain conditioned Lp norms for half-open
+        ranges. Our algorithm simply maps a filter *col < v* to the range *col between MIN and v*.
+
+        Our implementation currently does not distinguish between open and closed intervals. This is
+        due to limitations of the histogram-based approach. If the value falls somewhere in the
+        middle of a bucket, we can only default to the entire bucket. Likewise, if the value falls
+        exactly on a bucket boundary, we do not know what the first smaller value is and thus have to
+        default once again to the entire bucket (in case of an open interval). Lastly, for closed
+        intervals, we have to include the boundary value anyway and thus use the entire bucket. To
+        representation for range predicates. We argue that this would no longer be a faithful
+        adaptation of SafeBound. In case we come up with a better solution in the future, we already
+        include the `inclusive` flag in the method signature. This avoids breaking changes - even if
+        this flag has no effect for now.
+        """
         return self.get_range(self._min_val, value)
 
-    def get_greater(self, value: T, *, inclusive: bool) -> LpCollection:
+    def get_greater(self, value: T, *, inclusive: bool) -> LpNorms:
+        """Obtains the Lp norms for all values greater than (or equal to) a given value.
+
+        Use the `inclusive` flag to distinguish between open and closed ranges (i.e. strict
+        greater-than vs. greater-or-equal).
+        But see the notes below!
+
+        See Also
+        --------
+        get_less : for details on the underyling algorithm and the handling of open vs. closed
+                   intervals.
+        """
         global_max = self._bounds[-1]
         return self.get_range(value, global_max)
 
@@ -287,6 +442,10 @@ class RangeConditionedNorms[T: _HistogramKey]:
 
 
 def load_range_norms_json(json_data: dict | str, *, database: pb.Database) -> RangeConditionedNorms:
+    """Reconstructs range-conditioned norms from their JSON representation.
+
+    Access to the database is required to parse the column values based on their data type.
+    """
     if isinstance(json_data, str):
         json_data = json.loads(json_data)
 
@@ -305,12 +464,41 @@ def load_range_norms_json(json_data: dict | str, *, database: pb.Database) -> Ra
 
 
 class RangeConditionedRepo:
+    """Maintains the range-conditioned Lp norms for a set of join columns.
+
+    Depending on the current filter predicate, different lookup methods exist. Each method requires
+    the join column as well as the column being filtered. In addition, the filter value must be
+    supplied in a predicate-specific form. Lp norms can be looked up using the following methods:
+
+    - `lookup_range`: for predicates of the form *filter_col BETWEEN lower AND upper*
+    - `lookup_less_equal`: for predicates of the form *filter_col <= bound*
+    - `lookup_strict_less`: for predicates of the form *filter_col < bound*
+    - `lookup_greater_equal`: for predicates of the form *filter_col >= bound*
+    - `lookup_strict_greater`: for predicates of the form *filter_col > bound*
+
+    While there exist different lookup methods for open and closed intervals, see the documentation
+    on `RangeConditionedNorms.get_less` for details on how we currently handle this distinction.
+
+    Parameters
+    ----------
+    join_pcfs : dict[pb.ColumnReference, Sequence[RangeConditionedNorms]]
+        A mapping from join column to the range-conditioned norms for that column. Each set of Lp norms
+        should be conditioned on a different filter column.
+    """
+
     def __init__(self, join_norms: Mapping[pb.ColumnReference, Sequence[RangeConditionedNorms]]) -> None:
         self._norms = dict(join_norms)
 
     def lookup_range[T](
         self, join_col: pb.ColumnReference, *, range_col: pb.ColumnReference, between: tuple[T, T]
-    ) -> LpCollection | None:
+    ) -> LpNorms | None:
+        """Retrieves the Lp norms for a join column based on the condition *range_col BETWEEN lo AND hi*.
+
+        The range must be given as a tuple of the form *(lo, hi)*.
+
+        If the repository does not contain Lp norms conditioned on the filter column, *None* is
+        returned.
+        """
         join_col = join_col.drop_table_alias()
         range_col = range_col.drop_table_alias()
 
@@ -327,7 +515,15 @@ class RangeConditionedRepo:
 
     def lookup_less_equal[T](
         self, join_col: pb.ColumnReference, *, range_col: pb.ColumnReference, bound: T
-    ) -> LpCollection | None:
+    ) -> LpNorms | None:
+        """Retrieves the Lp norms for a join column based on the condition *range_col <= bound*.
+
+        If the repository does not contain Lp norms conditioned on the filter column, *None* is
+        returned.
+
+        See the documentation on `RangeConditionedNorms.get_less` for details on how we currently
+        handle the distinction between open and closed intervals.
+        """
         join_col = join_col.drop_table_alias()
         range_col = range_col.drop_table_alias()
 
@@ -343,7 +539,15 @@ class RangeConditionedRepo:
 
     def lookup_strict_less[T](
         self, join_col: pb.ColumnReference, *, range_col: pb.ColumnReference, bound: T
-    ) -> LpCollection | None:
+    ) -> LpNorms | None:
+        """Retrieves the Lp norms for a join column based on the condition *range_col < bound*.
+
+        If the repository does not contain Lp norms conditioned on the filter column, *None* is
+        returned.
+
+        See the documentation on `RangeConditionedNorms.get_less` for details on how we currently
+        handle the distinction between open and closed intervals.
+        """
         join_col = join_col.drop_table_alias()
         range_col = range_col.drop_table_alias()
 
@@ -359,7 +563,15 @@ class RangeConditionedRepo:
 
     def lookup_greater_equal[T](
         self, join_col: pb.ColumnReference, *, range_col: pb.ColumnReference, bound: T
-    ) -> LpCollection | None:
+    ) -> LpNorms | None:
+        """Retrieves the Lp norms for a join column based on the condition *range_col >= bound*.
+
+        If the repository does not contain Lp norms conditioned on the filter column, *None* is
+        returned.
+
+        See the documentation on `RangeConditionedNorms.get_less` (sic!) for details on how we
+        currently handle the distinction between open and closed intervals.
+        """
         join_col = join_col.drop_table_alias()
         range_col = range_col.drop_table_alias()
 
@@ -375,7 +587,15 @@ class RangeConditionedRepo:
 
     def lookup_strict_greater[T](
         self, join_col: pb.ColumnReference, *, range_col: pb.ColumnReference, bound: T
-    ) -> LpCollection | None:
+    ) -> LpNorms | None:
+        """Retrieves the Lp norms for a join column based on the condition *range_col > bound*.
+
+        If the repository does not contain Lp norms conditioned on the filter column, *None* is
+        returned.
+
+        See the documentation on `RangeConditionedNorms.get_less` (sic!) for details on how we
+        currently handle the distinction between open and closed intervals.
+        """
         join_col = join_col.drop_table_alias()
         range_col = range_col.drop_table_alias()
 
@@ -405,6 +625,33 @@ def build_histogram_hierarchy[T: _HistogramKey](
     database: pb.Database,
     log: pb.util.Logger,
 ) -> RangeConditionedNorms:
+    """Recursively builds a histogram hierarchy starting at a specific number of buckets.
+
+    Each lower level histogram is coarser than the current one: it contains exactly 1/2 the number of buckets.
+    Recursion stops as soon as only a single bucket is left. This ensures that the each range predicate can be supported.
+
+    Parameters
+    ----------
+    frequencies : np.ndarray
+        The frequencies of the values in the range column. The i-th entry corresponds to the i-th entry in `values`.
+    values : Sequence[T]
+        The distinct values in the range column, sorted in ascending order. The i-th entry corresponds to the i-th
+        entry in `frequencies`.
+    join_col : pb.BoundColumnReference
+        The join column that the resulting Lp norms should be defined on. This is required to fetch the
+        correlated degree sequences from the database and to construct the resulting norms.
+    range_col : pb.BoundColumnReference
+        The filter column that the resulting Lp norms should be conditioned on. This is required to
+        fetch the correlated degree sequences from the database and to construct the resulting norms.
+    n_buckets : int
+        The number of buckets to use for the current histogram. Must be a power of 2.
+    norms : NormSet
+        The Lp norms that should be computed for each join key.
+    database : pb.Database
+        The database to fetch the degree sequences from.
+    log : pb.util.Logger
+        A logger to log the progress of the histogram construction.
+    """
     if n_buckets > 1 and (n_buckets & (n_buckets - 1)) != 0:
         raise ValueError(f"Number of buckets must be a power of 2, got {n_buckets}")
 
@@ -427,7 +674,7 @@ def build_histogram_hierarchy[T: _HistogramKey](
     if breaks[-1] != values[-1] or len(values) == 1:
         breaks.append(values[-1])
 
-    lp_norms: list[LpCollection] = []
+    lp_norms: list[LpNorms] = []
     bounds: list[T] = []
     for lo, hi in itertools.pairwise(breaks):
         lo_pred = pb.qal.as_predicate(range_col, ">=", lo)
@@ -465,6 +712,29 @@ def build_range_norms(
     database: pb.Database,
     verbose: bool | pb.util.Logger = False,
 ) -> RangeConditionedRepo:
+    """Fetches all range-conditioned Lp norms for the given catalog.
+
+    Parameters
+    ----------
+    spec : CatalogSpec
+        Specification that contains the join column/range column pairs to build.
+    n_buckets : int
+        The maximum number of buckets to use for the histograms. Must be a power of 2. The histograms are organized in a
+        hierarchy of increasingly coarser histograms. Each lower level histogram has exactly 1/2 the number of buckets
+        of its parent. Recursion stops as soon as only a single bucket left.
+    norms : NormSet
+        The Lp norms that should be computed for each join key.
+    database : pb.Database
+        The database to fetch the degree sequences from.
+    verbose : bool | pb.util.Logger, optional
+        Either a pre-defined logger, or a boolean that indicates whether to log the progress using a
+        default logger.
+
+    Returns
+    -------
+    RangeConditionsRepo
+        A repository that contains all specified PCFs.
+    """
     log = wrap_logger(verbose)
     repo = collections.defaultdict(list)
 
@@ -489,6 +759,10 @@ def build_range_norms(
 
 
 def load_range_repo_json(json_data: dict | str, *, database: pb.Database) -> RangeConditionedRepo:
+    """Reconstructs a range-conditioned Lp norms repository from its JSON representation.
+
+    Access to the database is required to parse the column values based on their data type.
+    """
     if isinstance(json_data, str):
         json_data = json.loads(json_data)
 
@@ -506,9 +780,28 @@ def build_unconditioned_norms(
     norms: NormSet,
     database: pb.Database,
     verbose: bool | pb.util.Logger = False,
-) -> Mapping[pb.ColumnReference, LpCollection]:
+) -> Mapping[pb.ColumnReference, LpNorms]:
+    """Fetches all unconditioned Lp norms for the given catalog.
+
+    Parameters
+    ----------
+    spec : CatalogSpec
+        Specification that contains the columns to build unconditioned Lp norms for.
+    norms : NormSet
+        The Lp norms that should be computed for each join key.
+    database : pb.Database
+        The database to fetch the degree sequences from.
+    verbose : bool | pb.util.Logger, optional
+        Either a pre-defined logger, or a boolean that indicates whether to log the progress using a
+        default logger.
+
+    Returns
+    -------
+    Mapping[pb.ColumnReference, LpNorms]
+        A mapping from column reference to their corresponding unconditioned set of Lp norms.
+    """
     log = wrap_logger(verbose)
-    repo: dict[pb.ColumnReference, LpCollection] = {}
+    repo: dict[pb.ColumnReference, LpNorms] = {}
     for join_col in spec.unconditioned_cols:
         log(f"Loading unconditioned norms for {join_col}")
         ds = fetch_raw_ds(join_col, database=database)
@@ -516,9 +809,165 @@ def build_unconditioned_norms(
     return repo
 
 
-class LpNormRepo(pb.qal.PredicateVisitor[LpCollection]):
+class LpBoundCatalog(pb.qal.PredicateVisitor[LpNorms]):
+    """The LpBound catalog acts as the central storage for all conditioned and unconditioned Lp norms.
+
+    Each catalog works on two specs: a `CatalogSpec` which defines the Lp norms to build, and a
+    `LpBoundSpec` which defines the "hyperparameters" for the norm calculation (e.g. number of
+    MCVs or the p-values). Usually, the catalog spec is inferred automatically based on the
+    usage scenario (see below).
+
+    In addition, the catalog provides functionality to retrieve the appropriate Lp norms for a specific
+    query. This behavior is encoded in the different ``visit_XYZ()`` methods.
+
+    Creating a Catalog
+    ------------------
+    Depending on the use case, a catalog can be created using the following strategies:
+
+    - `online` infers the catalog spec directly from the database schema
+    - `infer_from` creates a catalog tailored to a specific workload
+    - `from_spec` uses an arbitrary (user-supplied) spec
+      (NB: the previous methods basically create the spec and then delegate to this function)
+
+    An existing catalog can be exported using the `store` method to prevent re-computation.
+    Such a catalog can be re-created via `load`. As a convenience, the `load_or_build` function
+    combines the behavior of all previous methods: if the catalog exists, it will be re-loaded.
+    Otherwise, online- or workload-based inferrence are used depending on the additional parameters.
+    The resulting catalog is then automatically stored for future use.
+    """
+
     @staticmethod
-    def load(archive: Path | str, *, database: pb.Database) -> LpNormRepo:
+    def online(
+        database: pb.Database, *, spec: LpBoundSpec = LpBoundSpec.default(), verbose: bool | pb.util.Logger = False
+    ) -> LpBoundCatalog:
+        """Infers the catalog spec from the database schema and builds the corresponding catalog.
+
+        Parameters
+        ----------
+        database : pb.Database
+            The database which contains the target schema and data
+        spec : LpBoundSpec
+            The "hyperparameters" for the Lp norm calculation (e.g. number of MCVs or compression
+            accuracy). This defaults to the same values as in the original LpBound paper.
+        verbose : bool | pb.util.Logger, optional
+            Either a pre-defined logger, or a boolean that indicates whether to log the progress
+            using a default logger.
+
+        See Also
+        --------
+        catalog_from_schema : For details on the inference logic
+        LpBoundSpec.default : For details on the default hyperparameters
+        """
+        catalog_spec = catalog_from_schema(database.schema())
+        return LpBoundCatalog.from_spec(catalog_spec, stats_spec=spec, database=database, verbose=verbose)
+
+    @staticmethod
+    def infer_from(
+        workload: pb.Workload,
+        *,
+        spec: LpBoundSpec = LpBoundSpec.default(),
+        database: pb.Database,
+        verbose: bool | pb.util.Logger = False,
+    ) -> LpBoundCatalog:
+        """Infers the catalog spec from an example workload and builds the corresponding catalog.
+
+        Parameters
+        ----------
+        workload : pb.Workload
+            The workload
+        spec : LpBoundSpec
+            The "hyperparameters" for the Lp norm calculation (e.g. number of MCVs or compression
+            accuracy). This defaults to the same values as in the original LpBound paper.
+        database : pb.Database
+            The database which contains the actual data
+        verbose : bool | pb.util.Logger, optional
+            Either a pre-defined logger, or a boolean that indicates whether to log the progress
+            using a default logger.
+
+        See Also
+        --------
+        catalog_from_workload : For details on the inference logic
+        LpBoundSpec.default : For details on the default hyperparameters
+        """
+
+        catalog_spec = catalog_from_workload(workload, verbose=False)
+        return LpBoundCatalog.from_spec(catalog_spec, stats_spec=spec, database=database, verbose=verbose)
+
+    @staticmethod
+    def from_spec(
+        catalog_spec: CatalogSpec,
+        *,
+        stats_spec: LpBoundSpec = LpBoundSpec.default(),
+        database: pb.Database,
+        verbose: bool | pb.util.Logger = False,
+    ) -> LpBoundCatalog:
+        """Creates a catalog for an arbitrary specification.
+
+        Parameters
+        ----------
+        catalog_spec : CatalogSpec
+            The specification that defines the Lp norms to calculate
+        stats_spec : LpBoundSpec
+            The "hyperparameters" for the Lp norm calculation (e.g. number of MCVs or compression
+            accuracy). This defaults to the same values as in the original LpBound paper.
+        database : pb.Database
+            The database which contains the actual data
+        verbose : bool | pb.util.Logger, optional
+            Either a pre-defined logger, or a boolean that indicates whether to log the progress
+            using a default logger.
+
+        See Also
+        --------
+        LpBoundSpec.default : For details on the default hyperparameters
+        """
+        build_start = datetime.now()  # noqa: DTZ005 - let's not worry about timezones for now
+
+        eq_pcfs_repo = build_equality_norms(
+            catalog_spec,
+            mcv_size=stats_spec.num_mcvs,
+            norms=stats_spec.norms,
+            database=database,
+            verbose=verbose,
+        )
+        range_pcfs_repo = build_range_norms(
+            catalog_spec,
+            n_buckets=stats_spec.hist_buckets,
+            norms=stats_spec.norms,
+            database=database,
+            verbose=verbose,
+        )
+        unconditioned_pcfs = build_unconditioned_norms(
+            catalog_spec,
+            norms=stats_spec.norms,
+            database=database,
+            verbose=verbose,
+        )
+
+        build_end = datetime.now()  # noqa: DTZ005 - let's not worry about timezones for now
+        construction_time = build_end - build_start
+
+        catalog = LpBoundCatalog(
+            eq_pcfs_repo,
+            range_pcfs_repo,
+            unconditioned_pcfs,
+            database=database,
+            log=verbose,
+        )
+        catalog._construction_time = construction_time
+        return catalog
+
+    @staticmethod
+    def load(archive: Path | str, *, database: pb.Database) -> LpBoundCatalog:
+        """Loads a previously built catalog from disk.
+
+        The archive should be either the catalog file itself, or a directory that contains a
+        *lpbound-catalog.json*.
+        Access to the database is required to parse the column values based on their data type.
+
+        See Also
+        --------
+        store : inverse method to persist a catalog to disk
+        """
         archive = Path(archive)
         if not archive.exists():
             raise FileNotFoundError(f"Norm repository archive {archive} does not exist")
@@ -547,13 +996,60 @@ class LpNormRepo(pb.qal.PredicateVisitor[LpCollection]):
         else:
             raise ValueError(f"No suitable parser for catalog {archive}")
 
-        return load_norm_repo_json(catalog, database=database)
+        construction_time = catalog.get("construction_time")
+
+        catalog = load_norm_repo_json(catalog, database=database)
+        catalog._construction_time = timedelta(seconds=construction_time) if construction_time is not None else None
+        return catalog
+
+    @staticmethod
+    def load_or_build(
+        archive: Path | str,
+        *,
+        database: pb.Database,
+        workload: pb.Workload | None = None,
+        spec: LpBoundSpec = LpBoundSpec.default(),
+        verbose: bool | pb.util.Logger = False,
+    ) -> LpBoundCatalog:
+        """Loads a previously built catalog from disk if it exists, otherwise builds a new one.
+
+        If the catalog does not yet exist, it will be created. The specific inference strategy
+        depends on the additional parameters:
+
+        - If a `workload` is given, the catalog will be tailored to it
+        - Otherwise, the catalog will be based on the schema of the `database` alone
+
+        If the catalog needs to be built, the hyperparameters can be adjusted via `spec`. It
+        defaults to the same values as in the original LpBound paper.
+
+        See Also
+        --------
+        online : For building a catalog exclusively based on the database schema
+        infer_from : For building a catalog tailored to a specific workload
+        LpBoundSpec.default : For details on the default hyperparameters
+        """
+        archive = Path(archive)
+        if archive.is_dir() and (archive / "safebound-catalog.json.xz").exists():
+            archive = archive / "safebound-catalog.json.xz"
+        elif archive.is_dir() and (archive / "safebound-catalog.json").exists():
+            archive = archive / "safebound-catalog.json"
+
+        if archive.is_file():
+            return LpBoundCatalog.load(archive, database=database)
+
+        if workload is None:
+            catalog = LpBoundCatalog.online(database, spec=spec, verbose=verbose)
+        else:
+            catalog = LpBoundCatalog.infer_from(workload, spec=spec, database=database, verbose=verbose)
+
+        catalog.store(archive)
+        return catalog
 
     def __init__(
         self,
         equality_norms: EqualityConditionedRepo,
         range_norms: RangeConditionedRepo,
-        unconditioned_norms: Mapping[pb.ColumnReference, LpCollection],
+        unconditioned_norms: Mapping[pb.ColumnReference, LpNorms],
         *,
         database: pb.Database,
         log: pb.util.Logger | bool = False,
@@ -563,8 +1059,17 @@ class LpNormRepo(pb.qal.PredicateVisitor[LpCollection]):
         self._unconditioned = dict(unconditioned_norms)
         self._database = database
         self._log = wrap_logger(log)
+        self._construction_time: timedelta | None = None
 
-    def retrieve_norms(self, query: pb.SqlQuery) -> Mapping[pb.ColumnReference, LpCollection]:
+    def retrieve_norms(self, query: pb.SqlQuery) -> Mapping[pb.ColumnReference, LpNorms]:
+        """Fetches all Lp norms for a specific query.
+
+        For each of the join columns in the query, this determines all applicable filter predicates,
+        loads the correponding conditioned Lp norms (falling back to unconditioned norms as necessary),
+        and combines the Lp norms according to the conjunction/disjunction predicates.
+
+        The result is provided as a mapping from join column to the final Lp norms on that column.
+        """
         join_map: dict[pb.ColumnReference, pb.qal.AbstractPredicate] = {}
         join_cols = pb.util.set_union(join.columns() for join in query.joins())
         unconditioned_cols: set[pb.ColumnReference] = set()
@@ -585,7 +1090,7 @@ class LpNormRepo(pb.qal.PredicateVisitor[LpCollection]):
         return lp_norms
 
     @override
-    def visit_binary_predicate(self, predicate: pb.qal.BinaryPredicate, *args, **kwargs) -> LpCollection:
+    def visit_binary_predicate(self, predicate: pb.qal.BinaryPredicate, *args, **kwargs) -> LpNorms:
         join_col: pb.ColumnReference = kwargs["join_col"]
         join_col = join_col.drop_table_alias()
 
@@ -624,7 +1129,7 @@ class LpNormRepo(pb.qal.PredicateVisitor[LpCollection]):
         return lp_norms
 
     @override
-    def visit_between_predicate(self, predicate: pb.qal.BetweenPredicate, *args, **kwargs) -> LpCollection:
+    def visit_between_predicate(self, predicate: pb.qal.BetweenPredicate, *args, **kwargs) -> LpNorms:
         join_col: pb.ColumnReference = kwargs["join_col"]
         join_col = join_col.drop_table_alias()
 
@@ -649,7 +1154,7 @@ class LpNormRepo(pb.qal.PredicateVisitor[LpCollection]):
         return lp_norms
 
     @override
-    def visit_in_predicate(self, predicate: pb.qal.InPredicate, *args, **kwargs) -> LpCollection:
+    def visit_in_predicate(self, predicate: pb.qal.InPredicate, *args, **kwargs) -> LpNorms:
         join_col: pb.ColumnReference = kwargs["join_col"]
         join_col = join_col.drop_table_alias()
 
@@ -666,7 +1171,7 @@ class LpNormRepo(pb.qal.PredicateVisitor[LpCollection]):
         filter_col = simplified.column.drop_table_alias()
         dtype = self._database.schema().datatype(simplified.column)
 
-        lp_norms = LpCollection.zeros()
+        lp_norms = LpNorms.zeros()
         missing_stats = False
 
         for filter_val in simplified.value:
@@ -690,20 +1195,20 @@ class LpNormRepo(pb.qal.PredicateVisitor[LpCollection]):
         return lp_norms
 
     @override
-    def visit_unary_predicate(self, predicate: pb.qal.UnaryPredicate, *args, **kwargs) -> LpCollection:
+    def visit_unary_predicate(self, predicate: pb.qal.UnaryPredicate, *args, **kwargs) -> LpNorms:
         join_col = kwargs["join_col"]
         self._log(f"Unsupported predicate {predicate} for {join_col}, falling back to unconditioned norms")
         return self._unconditioned[join_col]
 
     @override
-    def visit_not_predicate(self, predicate: pb.qal.NotPredicate, *args, **kwargs) -> LpCollection:
+    def visit_not_predicate(self, predicate: pb.qal.NotPredicate, *args, **kwargs) -> LpNorms:
         join_col = kwargs["join_col"]
         self._log(f"Unsupported predicate {predicate} for {join_col}, falling back to unconditioned norms")
         return self._unconditioned[join_col]
 
     @override
-    def visit_or_predicate(self, predicate: pb.qal.OrPredicate, *args, **kwargs) -> LpCollection:
-        lp_norms = LpCollection.zeros()
+    def visit_or_predicate(self, predicate: pb.qal.OrPredicate, *args, **kwargs) -> LpNorms:
+        lp_norms = LpNorms.zeros()
         for child in predicate.children:
             child_norms = child.accept_visitor(self, *args, **kwargs)
             # an obvious optimization would be to bound the sum by the unconditioned norms, but this is not part of the
@@ -712,7 +1217,7 @@ class LpNormRepo(pb.qal.PredicateVisitor[LpCollection]):
         return lp_norms
 
     @override
-    def visit_and_predicate(self, predicate: pb.qal.AndPredicate, *args, **kwargs) -> LpCollection:
+    def visit_and_predicate(self, predicate: pb.qal.AndPredicate, *args, **kwargs) -> LpNorms:
         head, *tail = predicate.children
         lp_norms = head.accept_visitor(self, *args, **kwargs)
         for child in tail:
@@ -762,17 +1267,22 @@ class LpNormRepo(pb.qal.PredicateVisitor[LpCollection]):
         }
 
 
-def load_norm_repo_json(json_data: dict | str, *, database: pb.Database) -> LpNormRepo:
+def load_norm_repo_json(json_data: dict | str, *, database: pb.Database) -> LpBoundCatalog:
+    """Reconstructs an LpBound catalog from its JSON representation.
+
+    Access to the database is required to parse the column values based on their data type.
+    """
+
     if isinstance(json_data, str):
         json_data = json.loads(json_data)
 
     equality_norms = load_eq_repo_json(json_data["equality_norms"], database=database)
     range_norms = load_range_repo_json(json_data["range_norms"], database=database)
 
-    unconditioned: dict[pb.ColumnReference, LpCollection] = {}
+    unconditioned: dict[pb.ColumnReference, LpNorms] = {}
     for entry in json_data["unconditioned_norms"]:
         join_col = pb.parser.load_column_json(entry["join_column"])
         norms = load_norm_json(entry["norms"])
         unconditioned[join_col] = norms
 
-    return LpNormRepo(equality_norms, range_norms, unconditioned, database=database)
+    return LpBoundCatalog(equality_norms, range_norms, unconditioned, database=database)
