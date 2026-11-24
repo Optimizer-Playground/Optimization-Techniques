@@ -1,6 +1,6 @@
 [project]
 name = "Optimizer-Playground"
-version = "0.1.0.dev29"
+version = "0.1.0.dev30"
 description = """
 A curated collection of interesting and novel ideas in query optimization for relational database systems, implemented using the PostBOUND framework.
 """
@@ -39,10 +39,7 @@ where = ["."]
 include = ["postbound_extensions*"]
 
 [tool.ty.src]
-exclude = [
-    "postbound_extensions/ceb/**",
-    "/**/reference-implementation/**",
-]
+exclude = ["postbound_extensions/ceb/**", "/**/reference-implementation/**"]
 
 [tool.ruff]
 line-length = 120
@@ -55,6 +52,7 @@ exclude = ["postbound_extensions/fastgres/**"]
 extend-immutable-calls = [
     "postbound_extensions.lpbound._core.LpBoundSpec.default",
     "postbound_extensions.mscn._estimator.MscnHyperParams.default",
+    "postbound_extensions.naru._hyperparams.NaruHyperParams.default",
     "postbound_extensions.safebound._catalog.SafeBoundSpec.default",
     "postbound.Cardinality.unknown",
 ]
