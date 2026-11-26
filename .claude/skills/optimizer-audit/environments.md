@@ -58,7 +58,8 @@ update this file when one turns out to be stale or when an audit discovers a new
   cache snapshot per decision, deduplicate identical plans, and randomize or rotate the order.
 - **Postgres timeouts on parallel queries:** a `statement_timeout` that cancels a parallel query
   has crashed the backend (segfault) in later statements. Reconnect after every timeout.
-- **`pb.workloads.stack()`** drops the context prefix of the query names.
+- All commands under MacOS should be executed using `caffeinate` to prevent the system from sleeping
+  and interrupting the audit. On Linux, use `systemd-inhibit` or `nohup` to prevent sleep.
 
 ## Where to put audit artifacts
 
@@ -78,3 +79,14 @@ scratchpad under `/tmp`: it has been wiped between sessions before, losing an au
 The report is committed to the repository and read by people on other machines, so it must not
 contain machine-specific paths. Refer to the artifacts directory only by its name
 (`<YYYY-MM-DD>-<optimizer>-audit`), and give the user the full path in your final message instead.
+
+## Troubleshooting
+
+In case of (larger) discrepancies between the expected environment and the actual environment
+while running the audit, **pause and ask the user how to proceed.**
+
+Situations that require user intervention include for example a database server that does not
+seem to be running (e.g., no running Postgres server), or a missing workloads
+(e.g., `pb.workloads.job()` not returning any queries). Smaller issues like inconsistent
+connection files (e.g. `.pg-connect-imdb.toml` vs. `.pg-connect-job.toml` vs. `.psycopg_connection_imdb`)
+can be reconciled without asking the user.
