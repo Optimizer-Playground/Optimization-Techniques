@@ -53,7 +53,10 @@ class LpBoundEstimator(pb.CardinalityEstimator):
         subquery = pb.transform.extract_subquery(query, intermediate)
         if len(subquery.tables()) == 1:
             return pb.Cardinality.unknown()
+        if not pb.qal.is_select_query(subquery):
+            raise pb.qal.QueryTypeError.expected_select(subquery)
 
+        subquery = pb.transform.infer_between_predicates(subquery)
         join_graph = lp_join_graph(subquery)
         statistics = self._catalog.retrieve_norms(subquery)
 

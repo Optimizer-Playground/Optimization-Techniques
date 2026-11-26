@@ -2704,7 +2704,7 @@ class SafeBoundCatalog:
         *safebound-catalog.json*.
         """
         archive = Path(archive)
-        if not archive.suffix and not archive.is_dir():
+        if not archive.suffix or archive.is_dir():
             extension = "json.xz" if compressed else "json"
             archive = archive / f"safebound-catalog.{extension}"
         archive.parent.mkdir(parents=True, exist_ok=True)

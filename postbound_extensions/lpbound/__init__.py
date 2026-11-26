@@ -2,6 +2,7 @@ from ._core import LpBoundSpec, NormSet
 from ._estimator import LpBoundEstimator
 from ._linprog import LpBerge, LpFlow, is_berge_acyclic, lp_join_graph
 from ._norms import (
+    LpBoundCatalog,
     LpNorms,
     build_equality_norms,
     build_histogram_hierarchy,
@@ -18,6 +19,7 @@ from ._norms import (
 
 __all__ = [
     "LpBerge",
+    "LpBoundCatalog",
     "LpBoundEstimator",
     "LpBoundSpec",
     "LpFlow",

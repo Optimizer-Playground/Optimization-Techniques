@@ -410,7 +410,7 @@ class RangeConditionedNorms[T: _HistogramKey]:
         default once again to the entire bucket (in case of an open interval). Lastly, for closed
         intervals, we have to include the boundary value anyway and thus use the entire bucket. To
         representation for range predicates. We argue that this would no longer be a faithful
-        adaptation of SafeBound. In case we come up with a better solution in the future, we already
+        adaptation of LpBound. In case we come up with a better solution in the future, we already
         include the `inclusive` flag in the method signature. This avoids breaking changes - even if
         this flag has no effect for now.
         """
@@ -1028,11 +1028,13 @@ class LpBoundCatalog(pb.qal.PredicateVisitor[LpNorms]):
         infer_from : For building a catalog tailored to a specific workload
         LpBoundSpec.default : For details on the default hyperparameters
         """
+        log = wrap_logger(verbose)
+
         archive = Path(archive)
-        if archive.is_dir() and (archive / "safebound-catalog.json.xz").exists():
-            archive = archive / "safebound-catalog.json.xz"
-        elif archive.is_dir() and (archive / "safebound-catalog.json").exists():
-            archive = archive / "safebound-catalog.json"
+        if archive.is_dir() and (archive / "lpbound-catalog.json.xz").exists():
+            archive = archive / "lpbound-catalog.json.xz"
+        elif archive.is_dir() and (archive / "lpbound-catalog.json").exists():
+            archive = archive / "lpbound-catalog.json"
 
         if archive.is_file():
             return LpBoundCatalog.load(archive, database=database)
@@ -1042,6 +1044,7 @@ class LpBoundCatalog(pb.qal.PredicateVisitor[LpNorms]):
         else:
             catalog = LpBoundCatalog.infer_from(workload, spec=spec, database=database, verbose=verbose)
 
+        log(f"Storing catalog to {archive}")
         catalog.store(archive)
         return catalog
 
@@ -1236,7 +1239,7 @@ class LpBoundCatalog(pb.qal.PredicateVisitor[LpNorms]):
         *lpbound-catalog.json*.
         """
         archive = Path(archive)
-        if not archive.suffix and not archive.is_dir():
+        if not archive.suffix or archive.is_dir():
             extension = "json.xz" if compressed else "json"
             archive = archive / f"lpbound-catalog.{extension}"
         archive.parent.mkdir(parents=True, exist_ok=True)
@@ -1264,6 +1267,7 @@ class LpBoundCatalog(pb.qal.PredicateVisitor[LpNorms]):
             "equality_norms": self._eq_norms,
             "range_norms": self._range_norms,
             "unconditioned_norms": unconditioned_json,
+            "construction_time": self._construction_time.total_seconds() if self._construction_time else None,
         }
 
 
