@@ -23,6 +23,7 @@ from __future__ import annotations
 import itertools
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+from typing import override
 
 import postbound as pb
 
@@ -91,24 +92,31 @@ class _PredicateTreeBuilder(pb.qal.PredicateVisitor[_Node]):
     def __init__(self, resolve: Callable[[pb.ColumnReference], tuple[int, ColumnDomain]]) -> None:
         self._resolve = resolve
 
+    @override
     def visit_binary_predicate(self, predicate: pb.qal.BinaryPredicate, *args, **kwargs) -> _Node:
         return self._leaf(predicate)
 
+    @override
     def visit_between_predicate(self, predicate: pb.qal.BetweenPredicate, *args, **kwargs) -> _Node:
         return self._leaf(predicate)
 
+    @override
     def visit_in_predicate(self, predicate: pb.qal.InPredicate, *args, **kwargs) -> _Node:
         return self._leaf(predicate)
 
+    @override
     def visit_unary_predicate(self, predicate: pb.qal.UnaryPredicate, *args, **kwargs) -> _Node:
         return self._leaf(predicate)
 
+    @override
     def visit_not_predicate(self, predicate: pb.qal.NotPredicate, *args, **kwargs) -> _Node:
         return _Not(predicate.child.accept_visitor(self, *args, **kwargs))
 
+    @override
     def visit_or_predicate(self, predicate: pb.qal.OrPredicate, *args, **kwargs) -> _Node:
         return _Or([child.accept_visitor(self, *args, **kwargs) for child in predicate.children])
 
+    @override
     def visit_and_predicate(self, predicate: pb.qal.AndPredicate, *args, **kwargs) -> _Node:
         return _And([child.accept_visitor(self, *args, **kwargs) for child in predicate.children])
 

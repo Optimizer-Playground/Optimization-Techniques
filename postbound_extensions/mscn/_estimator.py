@@ -22,6 +22,7 @@ import time
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import override
 
 import pandas as pd
 import postbound as pb
@@ -258,6 +259,7 @@ class MscnEstimator(pb.CardinalityEstimator):
         """Get the training metrics of the last training run."""
         return self._training_metrics
 
+    @override
     def calculate_estimate(
         self,
         query: pb.SqlQuery,
@@ -289,12 +291,15 @@ class MscnEstimator(pb.CardinalityEstimator):
         estimated_value = max(0.0, normalized_output.item())
         return pb.Cardinality(estimated_value)
 
+    @override
     def fit_samples(self, samples: pb.train.TrainingData) -> pb.train.TrainingMetrics:
         return self.train(samples.as_df())
 
+    @override
     def sample_spec(self) -> pb.train.TrainingSpec:
         return pb.train.TrainingSpec(["query", "cardinality"])
 
+    @override
     def sample_fit_completed(self) -> bool:
         return self._training_metrics.get("status") == "completed"
 
@@ -463,6 +468,7 @@ class MscnEstimator(pb.CardinalityEstimator):
 
         return catalog_path
 
+    @override
     def describe(self) -> pb.util.jsondict:
         return {"name": "MSCN", "hyperparameters": self._training_params}
 

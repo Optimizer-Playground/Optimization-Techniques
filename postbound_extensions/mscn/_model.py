@@ -19,6 +19,8 @@ Original source: https://github.com/andreaskipf/learnedcardinalities
 Modified by: Rico Bergmann
 """
 
+from typing import override
+
 import torch
 import torch.nn.functional as F
 from postbound.util import Logger
@@ -60,6 +62,7 @@ class SetConv(nn.Module):
             f"({sample_feats} table feats, {predicate_feats} predicate feats, {join_feats} join feats)"
         )
 
+    @override
     def forward(
         self,
         samples: torch.FloatTensor,

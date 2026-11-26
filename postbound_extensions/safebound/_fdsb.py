@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Generator, Iterable, Mapping
 from dataclasses import dataclass
-from typing import overload
+from typing import overload, override
 
 import networkx as nx
 import numpy as np
@@ -143,18 +143,22 @@ class AlphaStep:
     def __call__(self, vals: np.ndarray) -> np.ndarray:
         return self.evaluate_at(vals)
 
+    @override
     def __hash__(self) -> int:
         if self._combined is not None:
             return hash(self._combined)
         return hash(self._fns)
 
+    @override
     def __eq__(self, other: object) -> bool:
         return isinstance(other, type(self)) and self._fns == other._fns
 
+    @override
     def __repr__(self) -> str:
         components = ", ".join(repr(fn) for fn in self._fns)
         return f"AlphaStep(relations=[{components}])"
 
+    @override
     def __str__(self) -> str:
         components = ", ".join(str(fn) for fn in self._fns)
         return f"AlphaStep({components})"
@@ -368,9 +372,11 @@ class BetaStep:
     def __call__(self, vals: np.ndarray) -> np.ndarray:
         return self.evaluate_at(vals)
 
+    @override
     def __hash__(self) -> int:
         return hash((self._proj, self._dimension_joins))
 
+    @override
     def __eq__(self, other: object) -> bool:
         return (
             isinstance(other, type(self))
@@ -378,10 +384,12 @@ class BetaStep:
             and self._dimension_joins == other._dimension_joins
         )
 
+    @override
     def __repr__(self) -> str:
         components = ", ".join(repr(fn) for fn in self._dimension_joins)
         return f"BetaStep(relations=[{components}], projection={self._proj!r})"
 
+    @override
     def __str__(self) -> str:
         components = ", ".join(str(fn) for fn in self._dimension_joins)
         return f"BetaStep({components}) -> {self._proj}"

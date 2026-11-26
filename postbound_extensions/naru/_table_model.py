@@ -25,7 +25,7 @@ import re
 import time
 from collections.abc import Sequence
 from pathlib import Path
-from typing import Any
+from typing import Any, override
 
 import numpy as np
 import postbound as pb
@@ -413,6 +413,7 @@ class NaruTableModel:
             "training": metrics,
         }
 
+    @override
     def __repr__(self) -> str:
         return f"NaruTableModel({self.table}, columns={[d.column.name for d in self.domains]})"
 

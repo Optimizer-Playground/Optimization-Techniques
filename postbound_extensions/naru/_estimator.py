@@ -25,7 +25,7 @@ import time
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, override
 
 import postbound as pb
 
@@ -428,6 +428,7 @@ class NaruEstimator(pb.CardinalityEstimator):
         """Provides the model of a specific table (ignoring its alias), or *None* if the table is not modeled."""
         return self._models.get(_table_key(table))
 
+    @override
     def calculate_estimate(
         self,
         query: pb.SqlQuery,
@@ -450,6 +451,7 @@ class NaruEstimator(pb.CardinalityEstimator):
             self._log(f"Cannot estimate {table} in query {query}: {e}")
             return pb.Cardinality.unknown()
 
+    @override
     def fit_database(self, database: pb.Database) -> pb.train.TrainingMetrics:
         """Builds and trains the per-table models according to the spec (or the database schema if no spec is given)."""
         start = time.perf_counter()
@@ -467,6 +469,7 @@ class NaruEstimator(pb.CardinalityEstimator):
         self._training_time = time.perf_counter() - start
         return self.training_metrics
 
+    @override
     def database_fit_completed(self) -> bool:
         return bool(self._models) and all(model.is_trained() for model in self._models.values())
 
@@ -514,6 +517,7 @@ class NaruEstimator(pb.CardinalityEstimator):
             pb.util.to_json_dump(catalog, f)
         return catalog_file
 
+    @override
     def describe(self) -> pb.util.jsondict:
         return {
             "name": "Naru",

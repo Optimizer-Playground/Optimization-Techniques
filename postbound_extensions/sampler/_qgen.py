@@ -7,7 +7,7 @@ import itertools
 import random
 from collections import Counter
 from collections.abc import Generator, Iterable, Mapping, Sequence
-from typing import Any, Literal
+from typing import Any, Literal, override
 
 import networkx as nx
 import postbound as pb
@@ -136,6 +136,7 @@ class _PredicateCollector(pb.qal.PredicateVisitor[None]):
         self.joins: set[tuple[pb.BoundColumnReference, pb.BoundColumnReference]] = set()
         self.filter_weights: collections.Counter[pb.BoundColumnReference] = collections.Counter()
 
+    @override
     def visit_binary_predicate(self, predicate: pb.qal.BinaryPredicate) -> None:
         if predicate.is_filter():
             self._visit_binary_filter(predicate)
@@ -144,6 +145,7 @@ class _PredicateCollector(pb.qal.PredicateVisitor[None]):
         else:
             raise RuntimeError()
 
+    @override
     def visit_between_predicate(self, predicate: pb.qal.BetweenPredicate) -> None:
         columns = predicate.columns()
         if len(columns) != 1:
@@ -163,6 +165,7 @@ class _PredicateCollector(pb.qal.PredicateVisitor[None]):
         )
         self.filter_weights[col] += 1
 
+    @override
     def visit_in_predicate(self, predicate: pb.qal.InPredicate) -> None:
         columns = predicate.columns()
         if len(columns) != 1:
@@ -178,9 +181,11 @@ class _PredicateCollector(pb.qal.PredicateVisitor[None]):
         self.column_filters[col].add(pb.qal.BinaryOperator.Equal)
         self.filter_weights[col] += 1
 
+    @override
     def visit_unary_predicate(self, predicate: pb.qal.UnaryPredicate) -> None:
         return
 
+    @override
     def visit_not_predicate(
         self,
         predicate: pb.qal.CompoundPredicate,
@@ -188,6 +193,7 @@ class _PredicateCollector(pb.qal.PredicateVisitor[None]):
     ) -> None:
         return child_predicate.accept_visitor(self)
 
+    @override
     def visit_or_predicate(
         self,
         predicate: pb.qal.CompoundPredicate,
@@ -196,6 +202,7 @@ class _PredicateCollector(pb.qal.PredicateVisitor[None]):
         for component in components:
             component.accept_visitor(self)
 
+    @override
     def visit_and_predicate(
         self,
         predicate: pb.qal.CompoundPredicate,

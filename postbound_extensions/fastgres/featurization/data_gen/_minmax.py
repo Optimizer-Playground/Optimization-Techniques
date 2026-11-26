@@ -5,7 +5,7 @@ import json
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
-from typing import Any
+from typing import Any, override
 
 from tqdm import tqdm
 
@@ -24,6 +24,7 @@ class FastgresMinMaxComponent(StatisticsComponent):
             raise ValueError("Min/max statistics must be built or loaded first")
         return self.dict[table][column]["min"], self.dict[table][column]["max"]
 
+    @override
     def build(self,  dbc: DatabaseConnection, **kwargs) -> dict[str, dict[str, dict]]:
         types = {'integer', 'timestamp without time zone', 'date', 'numeric'}
         filtered_schema = dbc.filter_by_types(types)
@@ -35,16 +36,19 @@ class FastgresMinMaxComponent(StatisticsComponent):
             self.dict.setdefault(t_n, {})[c_n] = {"min": min_value, "max": max_value}
         return self.dict
 
+    @override
     def save(self, dir_path: Path):
         path = dir_path / "mm_dict.json"
         with path.open("w", encoding="utf-8") as f:
             json.dump(self.dict, f, cls=self.MinMaxEncoder)
         return path
 
+    @override
     def to_dict(self):
         return self.dict
 
     @classmethod
+    @override
     def load(cls, dir_path: Path) -> FastgresMinMaxComponent:
         obj = cls()
         path = dir_path / "mm_dict.json"
@@ -73,6 +77,7 @@ class FastgresMinMaxComponent(StatisticsComponent):
         return min_max_encode(filter_value, min_value, max_value, offset, round_values=round_values)
 
     class MinMaxEncoder(json.JSONEncoder):
+        @override
         def default(self, o):
             if isinstance(o, (datetime, date)):
                 return o.isoformat()
@@ -85,6 +90,7 @@ class FastgresMinMaxComponent(StatisticsComponent):
             super().__init__(*args, object_hook=self.object_hook, **kwargs)
 
         @staticmethod
+        @override
         def object_hook(obj: dict[str, Any]) -> Any:
             for key, value in obj.items():
                 if isinstance(value, str):

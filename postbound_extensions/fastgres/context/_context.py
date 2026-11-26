@@ -3,6 +3,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections.abc import Collection
 from dataclasses import dataclass
+from typing import override
 
 from postbound import SqlQuery
 
@@ -21,6 +22,7 @@ class Context(ABC):
     def from_query(cls, query: SqlQuery, schema: DatabaseSchema) -> Context:
         raise NotImplementedError
 
+    @override
     def __repr__(self) -> str:
         return f"{self.__class__.__name__}(schema={self.schema})"
 
@@ -52,10 +54,12 @@ class SchemaContext(Context):
     _schema: DatabaseSchema
 
     @property
+    @override
     def schema(self) -> DatabaseSchema:
         return self._schema
 
     @classmethod
+    @override
     def from_query(cls, query: SqlQuery, schema: DatabaseSchema) -> SchemaContext:
         return cls(schema)
 
@@ -64,6 +68,7 @@ class SchemaContext(Context):
         return cls(schema)
 
     @property
+    @override
     def type(self) -> str:
         return "SchemaContext"
 
@@ -73,10 +78,12 @@ class SuperTableContext(Context):
     _schema: DatabaseSchema
 
     @property
+    @override
     def schema(self) -> DatabaseSchema:
         return self._schema
 
     @classmethod
+    @override
     def from_query(cls, query: SqlQuery, schema: DatabaseSchema) -> SuperTableContext:
         raise ValueError("SuperTableContext cannot be instantiated from individual queries. Use from_queries instead.")
 
@@ -88,6 +95,7 @@ class SuperTableContext(Context):
         return cls(merged_schema)
 
     @property
+    @override
     def type(self) -> str:
         return "SuperTableContext"
 
@@ -97,10 +105,12 @@ class TableContext(Context):
     _schema: DatabaseSchema
 
     @property
+    @override
     def schema(self) -> DatabaseSchema:
         return self._schema
 
     @classmethod
+    @override
     def from_query(cls, query: SqlQuery, schema: DatabaseSchema) -> TableContext:
         query_schema = {
             table_reference.full_name: schema[table_reference.full_name]
@@ -109,6 +119,7 @@ class TableContext(Context):
         return cls(schema / DatabaseSchema(query_schema))
 
     @property
+    @override
     def type(self) -> str:
         return "TableContext"
 
@@ -118,10 +129,12 @@ class ColumnContext(Context):
     _schema: DatabaseSchema
 
     @property
+    @override
     def schema(self) -> DatabaseSchema:
         return self._schema
 
     @classmethod
+    @override
     def from_query(cls, query: SqlQuery, schema: DatabaseSchema) -> ColumnContext:
         query_schema = dict()
         for table_reference in query.tables():
@@ -136,5 +149,6 @@ class ColumnContext(Context):
         return cls(DatabaseSchema(query_schema) / schema)
 
     @property
+    @override
     def type(self) -> str:
         return "ColumnContext"

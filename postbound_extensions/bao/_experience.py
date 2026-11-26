@@ -23,6 +23,7 @@ import json
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import override
 
 import pandas as pd
 import postbound as pb
@@ -261,6 +262,7 @@ class BaoExperience(Dataset[tuple[torch.Tensor, torch.Tensor, float]]):
     def __len__(self) -> int:
         return len(self._storage)
 
+    @override
     def __getitem__(self, index):
         sample = self._storage[index]
         if sample._encoded is not None and sample._encoded[0] is self._featurizer:

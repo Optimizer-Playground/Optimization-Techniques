@@ -25,7 +25,7 @@ import time
 from abc import ABC, abstractmethod
 from collections.abc import Generator, Iterable, Mapping
 from pathlib import Path
-from typing import Literal, assert_never
+from typing import Literal, assert_never, override
 
 import postbound as pb
 from postbound.qal import SqlQuery
@@ -34,6 +34,12 @@ from ..util import wrap_logger
 
 
 def _traverse_join_tree(node: pb.JoinTree) -> Generator[pb.JoinTree, None, None]:
+    """TONIC-style traversal of a join tree.
+
+    We assume that the join tree is a left-deep tree and traverse it in a depth-first manner.
+    The left-most child is always provided first. Afterwards, we only yield the inner children of the join nodes.
+    If the inner node is another join node, TONIC can dispatch its subquery logic.
+    """
     if node.is_scan():
         yield node
         return
@@ -45,6 +51,10 @@ def _traverse_join_tree(node: pb.JoinTree) -> Generator[pb.JoinTree, None, None]
 def _traverse_query_plan(
     node: pb.QueryPlan,
 ) -> Generator[tuple[pb.QueryPlan, pb.QueryPlan | None], None, None]:
+    """TONIC-style traversal of a query plan.
+
+    This is the same basic logic as in `_traverse_join_tree`, just for whole query plans. See its docstring for more details.
+    """
     if node.is_scan():
         yield node, None
 
@@ -59,12 +69,20 @@ def _traverse_query_plan(
 
 
 def _cardinalities_only(parameters: pb.PlanParameterization) -> pb.PlanParameterization:
+    """Restricts a plan parameterization to only contain cardinality information."""
     scrubbed = pb.PlanParameterization()
     scrubbed.cardinalities = dict(parameters.cardinalities)
     return scrubbed
 
 
 def _reorient_join_tree(join_tree: pb.JoinTree) -> pb.JoinTree:
+    """Ensures that a join tree is as left-deep as possible.
+
+    This normalizes the join tree and swaps inner and outer children of join nodes if the inner child has more tables than
+    the outer child.
+
+    Without normalization, TONIC is often not able to match a specific query plan to a previously seen join order.
+    """
     if join_tree.is_scan():
         return join_tree
 
@@ -85,6 +103,10 @@ def _reorient_join_tree(join_tree: pb.JoinTree) -> pb.JoinTree:
 
 
 def _reorient_query_plan(plan: pb.QueryPlan) -> pb.QueryPlan:
+    """Ensures that a query plan is as left-deep as possible.
+
+    This is the same basic logic as in `_reorient_join_tree`, just for whole query plans. See its docstring for more details.
+    """
     if plan.is_scan():
         return plan
 
@@ -128,9 +150,18 @@ def _reorient_query_plan(plan: pb.QueryPlan) -> pb.QueryPlan:
 
 
 BatchedFeedback = Mapping[frozenset[pb.TableReference], Mapping[pb.JoinOperator, pb.Cost]]
+"""Feedback on multiple operators for different intermediates. Maps intermediates to their observed operators."""
 
 
 class QepsIdentifier:
+    """QEPS identifiers distinguish different paths in the QEPS prefix tree.
+
+    Each identifier represents a unique sequence of table references in the query plan. They are typically constructed from
+    the current sequence and the additional new table reference(s) that extends the sequence. The basic identifier only uses
+    the table identity to distinguish different paths. There also exists a filter-aware variant (aptly named
+    `FilterAwareQepsIdentifier`) that takes the filter predicates into account.
+    """
+
     @staticmethod
     def empty() -> QepsIdentifier:
         return QepsIdentifier([], additional=[])
@@ -162,17 +193,21 @@ class QepsIdentifier:
     def __json__(self) -> pb.util.jsondict:
         return {"identifier": self._identifier, "additional": self._additional}
 
+    @override
     def __hash__(self) -> int:
         return hash(self._identifier)
 
+    @override
     def __eq__(self, other: object) -> bool:
         if not isinstance(other, QepsIdentifier):
             return NotImplemented
         return self._identifier == other._identifier
 
+    @override
     def __repr__(self) -> str:
         return f"QepsIdentifier({self._identifier})"
 
+    @override
     def __str__(self) -> str:
         return f"QepsIdentifier({self._identifier})"
 
@@ -188,6 +223,7 @@ class FilterAwareQepsIdentifier(QepsIdentifier):
         return FilterAwareQepsIdentifier(intermediate, filter_pred, additional=[])
 
     @staticmethod
+    @override
     def base(
         intermediate: Iterable[pb.TableReference],
         filter_pred: pb.qal.AbstractPredicate | None = None,
@@ -204,10 +240,12 @@ class FilterAwareQepsIdentifier(QepsIdentifier):
         super().__init__(intermediate, additional=additional)
         self._filter_pred = filter_pred
 
+    @override
     def add_to(self, other: QepsIdentifier) -> FilterAwareQepsIdentifier:
         combined = self._identifier.union(other._identifier)
         return FilterAwareQepsIdentifier(combined, self._filter_pred, additional=self.intermediate)
 
+    @override
     def __json__(self) -> pb.util.jsondict:
         return {
             "identifier": self._identifier,
@@ -215,17 +253,21 @@ class FilterAwareQepsIdentifier(QepsIdentifier):
             "additional": self._additional,
         }
 
+    @override
     def __hash__(self) -> int:
         return hash((self._identifier, self._filter_pred))
 
+    @override
     def __eq__(self, other: object) -> bool:
         if not isinstance(other, FilterAwareQepsIdentifier):
             return NotImplemented
         return self._identifier == other._identifier and self._filter_pred == other._filter_pred
 
+    @override
     def __repr__(self) -> str:
         return f"FilterAwareQepsIdentifier({self._identifier}, {self._filter_pred})"
 
+    @override
     def __str__(self) -> str:
         return f"FilterAwareQepsIdentifier({self._identifier}, {self._filter_pred})"
 
@@ -311,9 +353,11 @@ class PlainQeps(QepsNode):
         self._children: dict[QepsIdentifier, QepsNode] = {}
 
     @property
+    @override
     def identifier(self) -> QepsIdentifier:
         return self._identifier
 
+    @override
     def follow(
         self,
         intermediate: Iterable[pb.TableReference],
@@ -337,6 +381,7 @@ class PlainQeps(QepsNode):
         self._children[child_identifier] = child
         return child
 
+    @override
     def recommend(
         self,
         current_recommendation: pb.PhysicalOperatorAssignment,
@@ -350,6 +395,7 @@ class PlainQeps(QepsNode):
         best_op = pb.util.argmin(self._cost_summary)
         current_recommendation.add(best_op, self._identifier.intermediate)
 
+    @override
     def feedback(
         self,
         intermediate: pb.QueryPlan,
@@ -365,6 +411,7 @@ class PlainQeps(QepsNode):
 
         self._cost_summary[operator] = cost + self._gamma * current_cost
 
+    @override
     def feedback_batch(
         self,
         intermediate: pb.JoinTree,
@@ -402,9 +449,11 @@ class SubqueryQeps(QepsNode):
         self._children: dict[QepsIdentifier, QepsNode] = {}
 
     @property
+    @override
     def identifier(self) -> QepsIdentifier:
         return self._identifier
 
+    @override
     def follow(
         self,
         intermediate: Iterable[pb.TableReference],
@@ -428,6 +477,7 @@ class SubqueryQeps(QepsNode):
         self._children[child_identifier] = child
         return child
 
+    @override
     def recommend(
         self,
         current_recommendation: pb.PhysicalOperatorAssignment,
@@ -448,6 +498,7 @@ class SubqueryQeps(QepsNode):
         best_op = pb.util.argmin(self._cost_summary)
         current_recommendation.add(best_op, set(self._identifier.intermediate))
 
+    @override
     def feedback(
         self,
         intermediate: pb.QueryPlan,
@@ -476,6 +527,7 @@ class SubqueryQeps(QepsNode):
 
         self._cost_summary[operator] = cost + self._gamma * current_cost
 
+    @override
     def feedback_batch(
         self,
         intermediate: pb.JoinTree,
@@ -608,7 +660,7 @@ class TonicOperators(pb.OperatorSelection):
         database: pb.Database | None = None,
         gamma: float = 0.8,
         filter_aware: bool = False,
-        sample_plans: Mapping[pb.SqlQuery, pb.QueryPlan] | None = None,
+        sample_plans: Mapping[pb.SqlQuery, pb.QueryPlan] | pb.Workload | None = None,
         retrain: bool = True,
         verbose: bool | pb.util.Logger = False,
     ) -> TonicOperators:
@@ -621,7 +673,10 @@ class TonicOperators(pb.OperatorSelection):
 
         tonic = TonicOperators(database=database, gamma=gamma, filter_aware=filter_aware, retrain=True)
 
-        if sample_plans:
+        if isinstance(sample_plans, pb.Workload):
+            logger(f"Calibrating TONIC model with {len(sample_plans)} samples")
+            tonic.calibrate(sample_plans)
+        elif sample_plans is not None:
             logger(f"Training TONIC model from {len(sample_plans)} sample plans")
             for query, plan in sample_plans.items():
                 tonic.learn_from_feedback(query, plan, exec_time=plan.execution_time)
@@ -666,6 +721,7 @@ class TonicOperators(pb.OperatorSelection):
 
     @property
     def retrain(self) -> bool:
+        """Get whether the online learning-loop is enabled or disabled."""
         return self._retrain
 
     @retrain.setter
@@ -674,6 +730,7 @@ class TonicOperators(pb.OperatorSelection):
 
     @property
     def exploration_mode(self) -> ExplorationMode:
+        """Get the current exploration mode for the online learning-loop."""
         return self._exploration_mode
 
     @exploration_mode.setter
@@ -684,6 +741,7 @@ class TonicOperators(pb.OperatorSelection):
 
     @property
     def exploration_target(self) -> int:
+        """Get the number of plans that should be explored in random exploration mode."""
         return self._exploration_target
 
     @exploration_target.setter
@@ -694,6 +752,7 @@ class TonicOperators(pb.OperatorSelection):
             raise ValueError("Exploration target must be a positive integer.")
         self._exploration_target = value
 
+    @override
     def select_physical_operators(
         self, query: pb.SqlQuery, join_order: pb.JoinTree | None
     ) -> pb.PhysicalOperatorAssignment:
@@ -708,6 +767,32 @@ class TonicOperators(pb.OperatorSelection):
         _generate_recommendations(assignment, qeps=self._qeps, join_order=join_order, query=query_ctx)
         return assignment
 
+    def calibrate(self, workload: pb.Workload) -> None:
+        """Trains the TONIC model on a given workload.
+
+        Calibration executes all queries in the workload once and passes the resulting query plans to the learning loop.
+        The same exploration and timeout settings are used as in the normal online-learning mode. If a query times out, it is
+        skipped and not used for training.
+        """
+        retrain = self._retrain
+        self._retrain = True
+
+        for label, query in workload.items():
+            self._log(f"Running calibration query {label}")
+            plan = (
+                self._analyze_with_timeout(query)
+                if self._analyze_timeout_ms is not None
+                else self._database.optimizer().query_plan(query)
+            )
+
+            if plan is None:
+                self._log(f"Calibration query {label} timed out. Skipping.")
+                continue
+            self.learn_from_feedback(query, plan, exec_time=plan.execution_time)
+
+        self._retrain = retrain
+
+    @override
     def learn_from_feedback(
         self,
         query: SqlQuery,
@@ -1036,6 +1121,7 @@ class TonicOperators(pb.OperatorSelection):
 
         return self._database.optimizer().parse_plan(result_set, query=query)
 
+    @override
     def __json__(self) -> pb.util.jsondict:
         return {
             "qeps": self._qeps,

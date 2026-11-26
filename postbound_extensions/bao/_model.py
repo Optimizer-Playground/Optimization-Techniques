@@ -1,3 +1,5 @@
+from typing import override
+
 import torch
 
 from ._featurizer import FeaturizedNode, inner_child, node_features, outer_child
@@ -31,6 +33,7 @@ class BaoModel(torch.nn.Module):
             torch.nn.Linear(32, 1),
         )
 
+    @override
     def forward(self, x):
         if isinstance(x, FeaturizedNode):
             x = [x]

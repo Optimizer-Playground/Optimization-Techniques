@@ -96,11 +96,10 @@ Example
 Deviations from the Original Paper
 ----------------------------------
 
-Our implementation of TONIC is a faithful adaptation of the original paper. We are not aware of any deviations.
-The only part of TONIC that we currently do not support is flexibility in the choice of target metric.
-The QEP always uses the estimated cost from the query plan. However, PostBOUND provides the means to update
-these cost estimates to arbitrary values. Therefore, this is not a fundamental limitation of our implementation,
-just a shift of responsibility to PostBOUND.
+Our implementation of TONIC is a faithful adaptation of the original paper. We are
+not aware of any deviations, but some exploration modes are an addition to the
+original algorithm. By default, TONIC uses the `"linear"` exploration mode which
+follows the paper.
 
 Authors
 -------

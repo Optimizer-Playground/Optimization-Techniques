@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import override
 
 import numpy as np
 
@@ -36,6 +37,7 @@ class HintSet:
             [(self.get_hint(i).db_instr, self.bool_rep[i]) for i in range(self.library.size)]
         )
 
+    @override
     def __repr__(self):
         return f"HS_{self.hs_int}"
 

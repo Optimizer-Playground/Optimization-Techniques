@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import override
 
 import postbound as pb
 from postbound import JoinTree, PhysicalOperatorAssignment, QueryPlan, SqlQuery
@@ -41,11 +42,13 @@ class FastgresEstimator(pb.OperatorSelection, pb.CompleteOptimizationAlgorithm):
     selecting operators. Complete optimization delegates the hinted query to PostgreSQL.
     """
 
+    @override
     def optimize_query(self, query: SqlQuery) -> QueryPlan:
         operators = self.select_physical_operators(query)
         hinted_query = self._dbc.hinting().generate_hints(query, physical_operators=operators)
         return self._dbc.optimizer().query_plan(hinted_query)
 
+    @override
     def select_physical_operators(self, query: SqlQuery,
                                   join_order: JoinTree | None = None) -> PhysicalOperatorAssignment:
         prediction = self._hsf.hint_set(self._require_model().predict(query))
@@ -106,6 +109,7 @@ class FastgresEstimator(pb.OperatorSelection, pb.CompleteOptimizationAlgorithm):
     def load(self, path: Path) -> None:
         self.load_or_build_model(path)
 
+    @override
     def describe(self) -> pb.util.jsondict:
         return {
             "name": "Fastgres",

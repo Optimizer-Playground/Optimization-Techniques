@@ -32,7 +32,7 @@ from __future__ import annotations
 
 import itertools
 from collections.abc import Sequence
-from typing import Literal
+from typing import Literal, override
 
 import numpy as np
 import torch
@@ -67,6 +67,7 @@ class MaskedLinear(nn.Linear):
         mask_tensor = torch.from_numpy(mask.astype(np.float32).T)
         self.get_buffer("mask").copy_(mask_tensor)
 
+    @override
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         return F.linear(input, self.get_buffer("mask") * self.weight, self.bias)
 
@@ -91,6 +92,7 @@ class MaskedResidualBlock(nn.Module):
             assert isinstance(layer, MaskedLinear)
             layer.set_mask(mask)
 
+    @override
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         out = self.activation(input)
         out = self.layers[0](out)
@@ -263,6 +265,7 @@ class MADE(nn.Module):
 
         return torch.cat(encoded, dim=1)
 
+    @override
     def forward(self, data: torch.Tensor) -> torch.Tensor:
         """Computes the (unnormalized) logits of all conditionals for a batch of tuples of shape [bs, nin]."""
         return self.forward_with_encoded_input(self.encode_input(data))

@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Protocol, override
 
 import numpy as np
 import postbound as pb
@@ -67,8 +67,10 @@ class FunctionLike(Protocol):
         """Computes the upper bound of the output relation's cardinality."""
         ...
 
+    @override
     def __hash__(self) -> int: ...
 
+    @override
     def __eq__(self, other: object) -> bool: ...
 
 
@@ -238,10 +240,12 @@ class DegreeSequence:
             raise ValueError("Degree sequences must have the same length for comparison")
         return bool(np.min(other._degrees - self._degrees) >= 0)
 
+    @override
     def __repr__(self) -> str:
         degrees = repr(self._degrees.tolist())
         return f"DegreeSequence({degrees})"
 
+    @override
     def __str__(self) -> str:
         return str(self._degrees.tolist())
 
@@ -695,9 +699,11 @@ class PiecewiseConstantFn:
     def __call__(self, vals: np.ndarray) -> np.ndarray:
         return self.evaluate_at(vals)
 
+    @override
     def __hash__(self) -> int:
         return hash((self._values.tobytes(), self._bounds.tobytes()))
 
+    @override
     def __eq__(self, other: object) -> bool:
         return (
             isinstance(other, type(self))
@@ -717,9 +723,11 @@ class PiecewiseConstantFn:
             p.breakable()
             p.text(line)
 
+    @override
     def __repr__(self) -> str:
         return str(self)
 
+    @override
     def __str__(self) -> str:
         return f"PCF({self.column})" if self.column else "PCF(<anonymous>)"
 

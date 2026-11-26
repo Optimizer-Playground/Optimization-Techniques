@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import collections
 from collections.abc import Collection, Iterable, Mapping, Sequence
-from typing import Literal, assert_never
+from typing import Literal, assert_never, override
 
 import postbound as pb
 from postbound.qal import SqlQuery
@@ -261,6 +261,7 @@ class UesJoinOrdering(pb.JoinOrdering):
                 assert_never(estimations)
                 raise ValueError(f"Unknown estimation type: {estimations}")
 
+    @override
     def optimize_join_order(self, query: pb.SqlQuery) -> pb.JoinTree:
         if not pb.qal.is_select_query(query):
             raise pb.qal.QueryTypeError.expected_select(query)
@@ -429,6 +430,7 @@ class UesJoinOrdering(pb.JoinOrdering):
 
         return join_tree
 
+    @override
     def describe(self) -> pb.util.jsondict:
         return {
             "name": "ues",
@@ -436,6 +438,7 @@ class UesJoinOrdering(pb.JoinOrdering):
             "database": self._database.describe(),
         }
 
+    @override
     def pre_check(self) -> pb.validation.OptimizationPreCheck:
         ues_checks = [
             pb.validation.EquiJoinPreCheck(),
@@ -643,6 +646,7 @@ class UesOperators(pb.OperatorSelection):
     def __init__(self) -> None:
         super().__init__()
 
+    @override
     def select_physical_operators(
         self, query: SqlQuery, join_order: pb.JoinTree | None
     ) -> pb.PhysicalOperatorAssignment:
@@ -672,21 +676,26 @@ class UesOptimizer(pb.OptimizationPipeline):
         self._enumerator = UesJoinOrdering(self._target_db, estimations=estimations)
         self._phys_ops = UesOperators()
 
+    @override
     def query_execution_plan(self, query: pb.SqlQuery) -> pb.QueryPlan:
         hinted_query = self.optimize_query(query)
         return self._target_db.optimizer().query_plan(hinted_query)
 
+    @override
     def optimize_query(self, query: pb.SqlQuery) -> pb.SqlQuery:
         join_order = self._enumerator.optimize_join_order(query)
         phys_ops = self._phys_ops.select_physical_operators(query, join_order)
         return self._target_db.hinting().generate_hints(query, join_order=join_order, physical_operators=phys_ops)
 
+    @override
     def stages(self) -> Collection[pb.OptimizationStage]:
         return [self._enumerator, self._phys_ops]
 
+    @override
     def target_database(self) -> pb.Database:
         return self._target_db
 
+    @override
     def describe(self) -> pb.util.jsondict:
         return {
             "name": "ues",

@@ -7,7 +7,7 @@ import json
 import warnings
 from collections.abc import Iterable, Mapping
 from pathlib import Path
-from typing import Any
+from typing import Any, override
 
 import pandas as pd
 import postbound as pb
@@ -214,11 +214,13 @@ class FastgresOptimizer(pb.CompleteOptimizationAlgorithm, pb.OperatorSelection):
     def predict_queries(self, queries: Iterable[pb.SqlQuery] | pb.Workload) -> list[HintSet]:
         return [self.predict(q) for q in (queries.queries() if isinstance(queries, pb.Workload) else queries)]
 
+    @override
     def select_physical_operators(self, query: pb.SqlQuery,
                                   join_order: pb.JoinTree | None = None) -> pb.PhysicalOperatorAssignment:
         self._require_core_hints()
         return FgPbConverter().fg_to_pb_hint_set(self.predict(query))
 
+    @override
     def optimize_query(self, query: pb.SqlQuery) -> pb.QueryPlan:
         database = self._require_database()
         operators = self.select_physical_operators(query)
@@ -331,6 +333,7 @@ class FastgresOptimizer(pb.CompleteOptimizationAlgorithm, pb.OperatorSelection):
              database: pb.postgres.PostgresDatabase | None = None) -> FastgresOptimizer:
         return cls.pre_trained(archive, database=database)
 
+    @override
     def describe(self) -> pb.util.jsondict:
         return {"name": "FASTgres", "interface": type(self).__name__,
                 "context_granularity": self._granularity.name,

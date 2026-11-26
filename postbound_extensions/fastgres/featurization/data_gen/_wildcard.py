@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from collections.abc import Collection
 from pathlib import Path
-from typing import Any
+from typing import Any, override
 
 import postbound as pb
 from postbound.qal import (
@@ -26,6 +26,7 @@ from ._statistics import StatisticsComponent
 
 class WildcardCollector(pb.qal.PredicateVisitor[Collection[pb.qal.SimpleFilter]]):
 
+    @override
     def visit_binary_predicate(
             self, predicate: BinaryPredicate, *args, **kwargs
     ) -> Collection[pb.qal.SimpleFilter]:
@@ -41,21 +42,25 @@ class WildcardCollector(pb.qal.PredicateVisitor[Collection[pb.qal.SimpleFilter]]
 
         return [wrapped]
 
+    @override
     def visit_between_predicate(
             self, predicate: BetweenPredicate, *args, **kwargs
     ) -> Collection[pb.qal.SimpleFilter]:
         return []
 
+    @override
     def visit_in_predicate(
             self, predicate: InPredicate, *args, **kwargs
     ) -> Collection[pb.qal.SimpleFilter]:
         return []
 
+    @override
     def visit_unary_predicate(
             self, predicate: UnaryPredicate, *args, **kwargs
     ) -> Collection[pb.qal.SimpleFilter]:
         return []
 
+    @override
     def visit_or_predicate(
             self,
             predicate: OrPredicate,
@@ -64,6 +69,7 @@ class WildcardCollector(pb.qal.PredicateVisitor[Collection[pb.qal.SimpleFilter]]
     ) -> Collection[pb.qal.SimpleFilter]:
         return []
 
+    @override
     def visit_not_predicate(
             self,
             predicate: NotPredicate,
@@ -72,6 +78,7 @@ class WildcardCollector(pb.qal.PredicateVisitor[Collection[pb.qal.SimpleFilter]]
     ) -> Collection[pb.qal.SimpleFilter]:
         return []
 
+    @override
     def visit_and_predicate(
             self,
             predicate: AndPredicate,
@@ -86,9 +93,11 @@ class FastgresWildcardComponent(StatisticsComponent):
     def __init__(self):
         self._wildcard_dict: dict[str, Any] | None = None
 
+    @override
     def to_dict(self):
         return self._wildcard_dict
 
+    @override
     def build(self, dbc: DatabaseConnection, **kwargs):
         workload = kwargs.get("workload")
         if not isinstance(workload, pb.Workload):
@@ -131,12 +140,14 @@ class FastgresWildcardComponent(StatisticsComponent):
                 wildcard_dict.setdefault(table_name, {}).setdefault(column_name, {})[like_value] = like_cardinality
         self._wildcard_dict = wildcard_dict
 
+    @override
     def save(self, dir_path: Path) -> None:
         if self._wildcard_dict is None:
             raise ValueError("Wildcard component is not built!")
         save_json(self._wildcard_dict, dir_path / "wildcard_dict.json")
 
     @classmethod
+    @override
     def load(cls, dir_path: Path) -> FastgresWildcardComponent:
         obj = cls()
         obj._wildcard_dict = load_json(dir_path / "wildcard_dict.json")

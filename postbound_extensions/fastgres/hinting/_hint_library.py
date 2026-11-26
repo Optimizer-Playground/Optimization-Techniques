@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import override
 
 from .._mapping import BidirectionalMap
 from ._hint import Hint
@@ -19,5 +20,6 @@ class HintLibrary:
         object.__setattr__(self, "name_dict", BidirectionalMap({i: self.hint_list[i].db_instr for i in range(size)}))
         object.__setattr__(self, "size", size)
 
+    @override
     def __eq__(self, other) -> bool:
         return self.hint_list == other.hint_list

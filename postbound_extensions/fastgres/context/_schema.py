@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, override
 
 import postbound as pb
 
@@ -110,9 +110,11 @@ class DatabaseSchema:
                 result[table] = combined
         return DatabaseSchema(result)
 
+    @override
     def __repr__(self):
         return str(self._schema)
 
+    @override
     def __hash__(self):
         return hash(tuple(self))
 

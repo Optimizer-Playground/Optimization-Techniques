@@ -20,6 +20,8 @@
 
 from __future__ import annotations
 
+from typing import override
+
 import torch
 from torch import nn
 
@@ -34,6 +36,7 @@ class BinaryTreeConv(nn.Module):
         # that we "drag" across the tree.
         self.weights = nn.Conv1d(in_channels, out_channels, stride=3, kernel_size=3)
 
+    @override
     def forward(self, flat_data):
         trees, idxes, *mask = flat_data  # the optional padding mask is passed through untouched
         orig_idxes = idxes
@@ -53,6 +56,7 @@ class TreeActivation(nn.Module):
         super().__init__()
         self.activation = activation
 
+    @override
     def forward(self, x):
         return (self.activation(x[0]), *x[1:])
 
@@ -65,6 +69,7 @@ class TreeLayerNorm(nn.Module):
     the result depend on the other trees in the batch.
     """
 
+    @override
     def forward(self, x):
         data, idxes, *mask = x
         if not mask:
@@ -84,6 +89,7 @@ class TreeLayerNorm(nn.Module):
 class DynamicPooling(nn.Module):
     """Max-pools each tree over its positions, ignoring padding positions if a mask is given."""
 
+    @override
     def forward(self, x):
         data = x[0]
         if len(x) > 2:

@@ -2,6 +2,7 @@
 
 from collections.abc import Hashable, Iterator, Mapping, MutableMapping
 from types import MappingProxyType
+from typing import override
 
 
 class BidirectionalMap[K: Hashable, V: Hashable](MutableMapping[K, V]):
@@ -21,9 +22,11 @@ class BidirectionalMap[K: Hashable, V: Hashable](MutableMapping[K, V]):
         if entries is not None:
             self.update(entries)
 
+    @override
     def __getitem__(self, key: K) -> V:
         return self._forward[key]
 
+    @override
     def __setitem__(self, key: K, value: V) -> None:
         has_key = key in self._forward
         if value in self._backward:
@@ -36,13 +39,16 @@ class BidirectionalMap[K: Hashable, V: Hashable](MutableMapping[K, V]):
         self._forward[key] = value
         self._backward[value] = key
 
+    @override
     def __delitem__(self, key: K) -> None:
         value = self._forward.pop(key)
         del self._backward[value]
 
+    @override
     def __iter__(self) -> Iterator[K]:
         return iter(self._forward)
 
+    @override
     def __len__(self) -> int:
         return len(self._forward)
 
@@ -54,5 +60,6 @@ class BidirectionalMap[K: Hashable, V: Hashable](MutableMapping[K, V]):
     def inv(self) -> Mapping[V, K]:
         return self.inverse
 
+    @override
     def __repr__(self) -> str:
         return f"{type(self).__name__}({self._forward!r})"

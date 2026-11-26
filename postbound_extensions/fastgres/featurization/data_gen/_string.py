@@ -5,7 +5,7 @@ import hashlib
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, ClassVar
+from typing import Any, ClassVar, override
 
 from tqdm import tqdm
 
@@ -75,6 +75,7 @@ class FastgresStringComponent(StatisticsComponent):
     def available_encoders(self) -> dict[str, list[str]]:
         return {table: list(cols.keys()) for table, cols in self._encoders.items()}
 
+    @override
     def build(self, dbc: DatabaseConnection, **kwargs) -> None:
 
         def _should_skip(conn: DatabaseConnection, t: str, c: str) -> bool:
@@ -103,16 +104,19 @@ class FastgresStringComponent(StatisticsComponent):
             label_encoder = self.FastgresLabelEncoder().fit_encoder(list(y), list(sorty_by))
             self._encoders.setdefault(t_n, {})[c_n] = label_encoder
 
+    @override
     def to_dict(self) -> dict:
         return {
             table: {col: enc.to_dict() for col, enc in columns.items()}
             for table, columns in self._encoders.items()
         }
 
+    @override
     def save(self, dir_path: Path):
         return save_json(self.to_dict(), dir_path / "label_encoders.json")
 
     @classmethod
+    @override
     def load(cls, dir_path: Path) -> FastgresStringComponent:
         encoders = load_json(dir_path / "label_encoders.json")
         return cls.from_dict(encoders)

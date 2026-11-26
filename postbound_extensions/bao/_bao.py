@@ -23,7 +23,7 @@ import json
 import os
 from collections.abc import Callable, Iterable
 from pathlib import Path
-from typing import TypedDict
+from typing import TypedDict, override
 
 import numpy as np
 import pandas as pd
@@ -692,6 +692,7 @@ class BaoOptimizer(pb.CompleteOptimizationAlgorithm, pb.OperatorSelection, pb.Co
     def retrain(self, retrain: bool) -> None:
         self._retrain = retrain
 
+    @override
     def optimize_query(self, query: pb.SqlQuery) -> pb.QueryPlan:
         if self._untrained_model:
             self._log("Untrained model detected, using first hint set as default")
@@ -705,6 +706,7 @@ class BaoOptimizer(pb.CompleteOptimizationAlgorithm, pb.OperatorSelection, pb.Co
         self._log(f"Selected arm {idxmin} ({hint_set}) for query {query}")
         return plans[idxmin]
 
+    @override
     def select_physical_operators(
         self, query: pb.SqlQuery, join_order: pb.JoinTree | None
     ) -> pb.PhysicalOperatorAssignment:
@@ -720,6 +722,7 @@ class BaoOptimizer(pb.CompleteOptimizationAlgorithm, pb.OperatorSelection, pb.Co
         self._log(f"Selected arm {idxmin} ({_stringify_hint_set(hint_set)}) for query {query}")
         return hint_set
 
+    @override
     def estimate_cost(self, query: pb.SqlQuery, plan: pb.QueryPlan) -> pb.Cost:
         cache_state = infer_cache_state(plan, self._db, log=self._log)
         featurized = self._featurizer.encode_plan(plan, cache_state=cache_state, log=self._log)
@@ -992,6 +995,7 @@ class BaoOptimizer(pb.CompleteOptimizationAlgorithm, pb.OperatorSelection, pb.Co
 
         return catalog_path
 
+    @override
     def describe(self) -> pb.util.jsondict:
         return {
             "name": "BAO",

@@ -5,7 +5,7 @@ from collections.abc import Collection, Sequence
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import ClassVar
+from typing import ClassVar, override
 
 import numpy as np
 import postbound as pb
@@ -140,6 +140,7 @@ class FastgresPredicatesCollector(
     pb.qal.PredicateVisitor[Collection[pb.qal.SimpleFilter]]
 ):
 
+    @override
     def visit_binary_predicate(
             self, predicate: BinaryPredicate, *args, **kwargs
     ) -> Collection[SimpleFilter]:
@@ -147,11 +148,13 @@ class FastgresPredicatesCollector(
             return [SimpleFilter.wrap(predicate)]
         return []
 
+    @override
     def visit_between_predicate(
             self, predicate: BetweenPredicate, *args, **kwargs
     ) -> Collection[SimpleFilter]:
         return []
 
+    @override
     def visit_in_predicate(
             self, predicate: InPredicate, *args, **kwargs
     ) -> Collection[SimpleFilter]:
@@ -160,6 +163,7 @@ class FastgresPredicatesCollector(
             return [SimpleFilter.wrap(predicate)]
         return []
 
+    @override
     def visit_unary_predicate(
             self, predicate: UnaryPredicate, *args, **kwargs
     ) -> Collection[SimpleFilter]:
@@ -169,16 +173,19 @@ class FastgresPredicatesCollector(
             return [SimpleFilter.wrap(predicate)]
         return []
 
+    @override
     def visit_not_predicate(
             self, predicate: NotPredicate, *args, **kwargs
     ) -> Collection[SimpleFilter]:
         return []
 
+    @override
     def visit_or_predicate(
             self, predicate: OrPredicate, *args, **kwargs
     ) -> Collection[SimpleFilter]:
         return []
 
+    @override
     def visit_and_predicate(
             self, predicate: AndPredicate, *args, **kwargs
     ) -> Collection[SimpleFilter]:

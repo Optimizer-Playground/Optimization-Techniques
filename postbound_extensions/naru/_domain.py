@@ -28,7 +28,7 @@ from dataclasses import dataclass
 from datetime import date, datetime
 from decimal import Decimal
 from pathlib import Path
-from typing import Any
+from typing import Any, override
 
 import numpy as np
 import pandas as pd
@@ -506,6 +506,7 @@ class ColumnDomain:
             "bucketized": self.is_bucketized,
         }
 
+    @override
     def __repr__(self) -> str:
         bucketized = f", buckets={self.n_buckets}" if self.is_bucketized else ""
         return f"ColumnDomain({self.column}, dtype={self.dtype}, distinct={self.n_distinct}{bucketized})"

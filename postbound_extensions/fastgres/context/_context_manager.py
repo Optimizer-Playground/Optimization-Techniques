@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Collection
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import overload
+from typing import overload, override
 
 from postbound import SqlQuery, qal
 
@@ -164,6 +164,7 @@ class ContextManager:
     def is_empty(self, context: Context) -> bool:
         return not self[context]
 
+    @override
     def __repr__(self):
         assert isinstance(self.db_schema, DatabaseSchema)
         tables = len(self.db_schema.all_tables())
