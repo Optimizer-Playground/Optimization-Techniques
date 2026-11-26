@@ -160,14 +160,26 @@ class QepsIdentifier:
     the current sequence and the additional new table reference(s) that extends the sequence. The basic identifier only uses
     the table identity to distinguish different paths. There also exists a filter-aware variant (aptly named
     `FilterAwareQepsIdentifier`) that takes the filter predicates into account.
+
+    Parameters
+    ----------
+    intermediate : Iterable[pb.TableReference]
+        The complete sequence of table references that uniquely identifies the path in the QEPS prefix tree.
+    additional : Iterable[pb.TableReference]
+        The part of the intermediate that was added to reach this identifier.
     """
 
     @staticmethod
     def empty() -> QepsIdentifier:
+        """Constructs an empty identifier for the root of a prefix tree."""
         return QepsIdentifier([], additional=[])
 
     @staticmethod
     def base(intermediate: Iterable[pb.TableReference]) -> QepsIdentifier:
+        """Constructs an idenifier of exactly the given tables.
+
+        The identifier is treated as a root without incoming relations. Use `add_to` to expand identifier paths.
+        """
         return QepsIdentifier(intermediate, additional=[])
 
     def __init__(
@@ -181,12 +193,26 @@ class QepsIdentifier:
 
     @property
     def intermediate(self) -> frozenset[pb.TableReference]:
+        """Get the tables that identify this path in the QEPS prefix tree.
+
+        Note that the intermediate does not need to be unique (and it usually is not). Paths might be permutations of
+        each other.
+        """
         return self._identifier
 
     def is_plain(self) -> bool:
+        """Checks, whether this is identifier has only received a single additional table.
+
+        The opposite would be an subquery identifier which receives the entire intermediate of the subquery as input.
+        """
         return len(self._additional) == 1
 
     def add_to(self, other: QepsIdentifier) -> QepsIdentifier:
+        """Merges two identifiers.
+
+        This results in a new identifier that represents the union of both intermediates. The intermediates of this
+        identifier are treated as the additional tables that were added to the other identifier.
+        """
         combined = self._identifier.union(other._identifier)
         return QepsIdentifier(combined, additional=self.intermediate)
 
@@ -213,8 +239,29 @@ class QepsIdentifier:
 
 
 class FilterAwareQepsIdentifier(QepsIdentifier):
+    """A QEPS identifier that is aware of filter predicates.
+
+    Filter predicates are only considered for the additional relations. Relations that are on a non-leaf portion
+    of the path do not keep their predicates (But in the tree they are usually filter-aware identifiers which
+    carry their own predicates. The later identifiers just do not know about this.)
+
+    Parameters
+    ----------
+    intermediate : Iterable[pb.TableReference]
+        The complete sequence of table references that uniquely identifies the path in the QEPS prefix tree.
+    filter_pred : pb.qal.AbstractPredicate | None
+        The filter predicate that is applied to the additional relations. Can be None if the additional relation(s)
+        is unfiltered.
+    additional : Iterable[pb.TableReference]
+        The part of the intermediate that was added to reach this identifier.
+    """
+
     @staticmethod
     def infer(intermediate: Iterable[pb.TableReference], *, query: pb.qal.SelectStatement) -> FilterAwareQepsIdentifier:
+        """Constructs a new filter-aware identifier and extracts all filter predicates from the query.
+
+        The identifier is treated as a root without incoming relations. Use `add_to` to expand identifier paths.
+        """
         subquery = pb.transform.extract_subquery(query, intermediate)
         if not subquery.tables():
             return FilterAwareQepsIdentifier(intermediate, None, additional=[])
@@ -228,6 +275,10 @@ class FilterAwareQepsIdentifier(QepsIdentifier):
         intermediate: Iterable[pb.TableReference],
         filter_pred: pb.qal.AbstractPredicate | None = None,
     ) -> FilterAwareQepsIdentifier:
+        """Constructs an identifier of exactly the given tables and filter predicate.
+
+        The identifier is treated as a root without incoming relations. Use `add_to` to expand identifier paths.
+        """
         return FilterAwareQepsIdentifier(intermediate, filter_pred, additional=[])
 
     def __init__(
@@ -294,9 +345,22 @@ def load_qeps_id_json(
 
 
 class QepsNode(ABC):
+    """QEPS nodes form TONIC's plan synopsis.
+
+    Each node is associated with an intermediate (the join being calculated) and the costs of different join operators.
+    The join tree is implicitly given by the path through the prefix tree, so only the current intermediate needs to
+    stored at each node.
+
+    QEPS nodes come in two flavors: Plain nodes (`PlainQeps`) model the join of the current path with a single relation.
+    In contrast, subquery nodes (`SubqueryQeps`) model the join of the current path with another intermediate
+    (i.e. a subquery). This class specifies the general protocol, the two flavors implement it for their respective
+    structures.
+    """
+
     @property
     @abstractmethod
     def identifier(self) -> QepsIdentifier:
+        """Get the identifier of this node."""
         raise NotImplementedError
 
     @abstractmethod
@@ -306,6 +370,13 @@ class QepsNode(ABC):
         *,
         query: pb.qal.SelectStatement | None,
     ) -> QepsNode:
+        """Traverse the plan synopsis to the child node that corresponds to the given intermediate.
+
+        If the intermediate has not been recorded so far, a new child node is created. However, this child cannot give
+        any recommendations, yet.
+
+        Passing a `query` makes the child filter-aware.
+        """
         raise NotImplementedError
 
     @abstractmethod
@@ -316,6 +387,16 @@ class QepsNode(ABC):
         *,
         query: pb.qal.SelectStatement | None,
     ) -> None:
+        """Add the best operator for the given intermediate to the current recommendation.
+
+        The `current_recommendation` is updated in-place.
+
+        The `intermediate` and `query` are required to include recommendations from subqueries in case of a
+        `SubqueryQeps` node.
+
+        The general traversal pattern is to call `follow()` to obtain a QEPS node, followed by `recommend()` in an
+        iterative or recursive manner.
+        """
         raise NotImplementedError
 
     @abstractmethod
@@ -327,6 +408,11 @@ class QepsNode(ABC):
         cost: pb.Cost,
         query: pb.qal.SelectStatement | None,
     ) -> None:
+        """Update the cost summary of this node with the observed cost of a single join operator.
+
+        The join operator being updated is given by `operator`, and its observed cost is given by `cost`.
+        The `intermediate` and `query` are required to include feedback from subqueries in case of a `SubqueryQeps` node.
+        """
         raise NotImplementedError
 
     @abstractmethod
@@ -337,12 +423,23 @@ class QepsNode(ABC):
         batch: BatchedFeedback,
         query: pb.qal.SelectStatement | None,
     ) -> None:
+        """Update the cost summary of this node with the observed costs of multiple join operators.
+
+        The `batch` contains the observed costs for all join operators that were executed for a number of intermediates.
+        We only update the cost of our own intermediate.
+
+        Note that all feedback must come from the same join order. Otherwise, permutations of the same path hit the same
+        cost summary.
+        """
         raise NotImplementedError
 
 
 class PlainQeps(QepsNode):
+    """A QEPS node that models the join of the current path with a single relation."""
+
     @staticmethod
     def empty(gamma: float) -> PlainQeps:
+        """Constructs an empty QEPS node for the root of a prefix tree."""
         return PlainQeps(QepsIdentifier.empty(), gamma=gamma)
 
     def __init__(self, identifier: QepsIdentifier, *, gamma: float) -> None:
@@ -440,6 +537,8 @@ class PlainQeps(QepsNode):
 
 
 class SubqueryQeps(QepsNode):
+    """A QEPS node that models the join of the current path with another intermediate (i.e. a subquery)."""
+
     def __init__(self, identifier: QepsIdentifier, *, gamma: float) -> None:
         self._identifier = identifier
         self._gamma = gamma
@@ -600,6 +699,7 @@ def _generate_recommendations(
     join_order: pb.JoinTree,
     query: pb.qal.SelectStatement | None,
 ):
+    """Traverses the join order and loads the operator recommendations at each intermediate."""
     for intermediate in _traverse_join_tree(join_order):
         qeps = qeps.follow(intermediate.tables(), query=query)
         qeps.recommend(assignment, intermediate, query=query)
@@ -633,9 +733,72 @@ def load_tonic_json(json_data: str | dict, *, database: pb.Database) -> TonicOpe
 
 
 ExplorationMode = Literal["exhaustive", "random", "linear", "off"]
+"""How feedback for the online learning-loop should be generated.
+
+Feedback is always specific to one join order. The exploration mode only affects the (number of) combinations of join
+operators that are evaluated.
+
+Allowed values are:
+
+- "exhaustive": All possible join operator combinations over all joins (a great great cross product) are evaluated.
+  Naturally, this yields the best results, but is incredibly costly. Beyond very small queries this mode is completely
+  infeasible.
+- "random": A random subset of join operator combinations is evaluated. The number of combinations is determined by the
+  additional `exploration_target` parameter.
+- "linear" (the default): This matches the exploration strategy used in the paper. For each join, all join operators are
+  evaluated. In contrast to "exhaustive", the other join operators are left at their default values. This reduces the
+  complexity from exponential to linear in the number of joins.
+- "off": No exploration is performed. Only the join operator combination that was recommended by TONIC is evaluated.
+"""
 
 
 class TonicOperators(pb.OperatorSelection):
+    """TONIC is an operator selection strategy based on online learning.
+
+    At its core, TONIC stores past experiences for join operator costs in a prefix tree (a Query Plan Synopsis, or QEPS).
+    For a particular query, the recommended operators are those with the lowest observed cost. This recommendation model
+    is combined with an online learning-loop that explores different join operator combinations and updates the QEPS
+    with the observed cost.
+
+    In constrast to many related approaches, TONIC performs the entire learning process without deep learning components.
+
+    Parameters
+    ----------
+    database : pb.Database | None
+        The database to execute the queries on. This is required for exploration during the online learning-loop.
+    gamma : float
+        The discount factor for the online learning-loop. The default value of 0.8 is the same as in the original paper.
+    filter_aware : bool
+        Whether the QEPS should be filter-aware. Filter-aware synopsis are much larger but allow for more fine-grained
+        recommendations. This is off by default.
+    retrain : bool
+        Whether the online learning-loop is enabled or disabled. This is on by default.
+    exploration : int | ExplorationMode
+        How feedback for the online learning-loop should be generated. See `ExplorationMode` for details.
+        The default is "linear", which follows the reference implementation. An integer is interpreted as the number
+        of plans to explore in "random" mode (which defaults to 10).
+    prediction_target : Literal["true_cost", "execution_time"]
+        How the operator quality should be assessed: "true_cost" uses the cost model of the target database based on the
+        actual cardinalities observed during evaluation. "execution_time" runs the query and uses the wall-clock
+        execution time as the target. The latter obviously is much more expensive in terms of experiment time, but also
+        more precise. The default is "true_cost".
+    analyze_timeout_ms : float | None
+        For an "execution_time" prediction target, this sets a timeout for the execution of each plan. If the plan does
+        not finish within the given time, it is not considered for learning. Please note that this requires timeout
+        support on the target database (which Postgres provides).
+    log : pb.util.Logger | None
+        A logger to use for logging messages. Leaving this at None disables logging.
+
+    See Also
+    --------
+    QepsNode : The building blocks of TONIC's plan synopsis.
+
+    References
+    ----------
+    .. Axel Hertzschuch et al.: "Turbo-Charging SPJ Query Plans with Learned Physical Join Operator Selections"
+       (PVLDB 2022) https://doi.org/10.14778/3551793.3551825
+    """
+
     @staticmethod
     def pre_trained(
         archive: Path | str,
@@ -643,7 +806,21 @@ class TonicOperators(pb.OperatorSelection):
         database: pb.Database,
         retrain: bool = True,
     ) -> TonicOperators:
+        """Loads a previously built synopsis from disk.
+
+        The archive should be either the catalog file itself, or a directory that contains a
+        *tonic-catalog.json*.
+        Access to the database is required to parse the column values based on their data type.
+
+        Setting `retrain` to False essentially creates a frozen synopsis.
+
+        See Also
+        --------
+        store : inverse method to persist a catalog to disk
+        """
         archive = Path(archive)
+        if archive.is_dir():
+            archive = archive / "tonic-synopsis.json"
         if not archive.is_file():
             raise FileNotFoundError(f"Archive file not found: {archive}")
 
@@ -660,18 +837,38 @@ class TonicOperators(pb.OperatorSelection):
         database: pb.Database | None = None,
         gamma: float = 0.8,
         filter_aware: bool = False,
-        sample_plans: Mapping[pb.SqlQuery, pb.QueryPlan] | pb.Workload | None = None,
         retrain: bool = True,
+        exploration: int | ExplorationMode = "linear",
+        prediction_target: Literal["true_cost", "execution_time"] = "true_cost",
+        analyze_timeout_ms: float | None = None,
+        sample_plans: Mapping[pb.SqlQuery, pb.QueryPlan] | pb.Workload | None = None,
         verbose: bool | pb.util.Logger = False,
     ) -> TonicOperators:
+        """Loads a previously built synopsis from disk if it exists, otherwise builds a new one.
+
+        If the synopsis does not yet exist, it will be created. In this case, `sample_plans` can be used to perform an
+        initial training of the model: Either as a mapping from queries to their pre-executed plans, or as a calibration
+        workload that is passed throught to the learning loop via `calibrate`.
+        """
         logger = wrap_logger(verbose)
         archive = Path(archive)
 
+        if archive.is_dir():
+            archive = archive / "tonic-synopsis.json"
         if archive.is_file():
             logger(f"Loading pre-trained TONIC model from {archive}")
             return TonicOperators.pre_trained(archive, database=database or pb.db.current_database(), retrain=retrain)
 
-        tonic = TonicOperators(database=database, gamma=gamma, filter_aware=filter_aware, retrain=True)
+        tonic = TonicOperators(
+            database=database,
+            gamma=gamma,
+            filter_aware=filter_aware,
+            retrain=True,
+            exploration=exploration,
+            prediction_target=prediction_target,
+            analyze_timeout_ms=analyze_timeout_ms,
+            log=logger,
+        )
 
         if isinstance(sample_plans, pb.Workload):
             logger(f"Calibrating TONIC model with {len(sample_plans)} samples")
@@ -826,13 +1023,21 @@ class TonicOperators(pb.OperatorSelection):
                 assert_never(self._exploration_mode)
                 raise ValueError(f"Invalid exploration mode: {self._exploration_mode}. ")
 
-    def store(self, archive: Path | str) -> None:
+    def store(self, archive: Path | str) -> Path:
+        """Stores the current TONIC model to disk.
+
+        If this is a directory, the model will be stored in a file called *tonic-synopsis.json* inside that directory.
+        """
         archive = Path(archive)
+        if not archive.suffix or archive.is_dir():
+            archive = archive / "tonic-synopsis.json"
         archive.parent.mkdir(parents=True, exist_ok=True)
         with archive.open("w", encoding="utf-8") as f:
             pb.util.to_json_dump(self, f)
+        return archive
 
     def _explore_single(self, plan: pb.QueryPlan, *, query: pb.qal.SelectStatement) -> pb.train.TrainingMetrics:
+        """Explores only the join operator combination that is given in the plan."""
         train_start = time.perf_counter_ns()
 
         match self._prediction_target:
@@ -860,6 +1065,7 @@ class TonicOperators(pb.OperatorSelection):
         }
 
     def _explore_exhaustive(self, plan: pb.QueryPlan, *, query: pb.qal.SelectStatement) -> pb.train.TrainingMetrics:
+        """Explores all possible combinations of join operators based on the join order given in the plan."""
         all_joins = [join.tables() for join in plan.find_all_nodes(pb.QueryPlan.is_join)]
         operators = [self._allowed_join_ops] * len(all_joins)
 
@@ -912,6 +1118,7 @@ class TonicOperators(pb.OperatorSelection):
         }
 
     def _explore_random(self, plan: pb.QueryPlan, *, query: pb.qal.SelectStatement) -> pb.train.TrainingMetrics:
+        """Explores random join operator combinations based on the join order given in the plan."""
         all_joins = [join.tables() for join in plan.find_all_nodes(pb.QueryPlan.is_join)]
 
         join_order = pb.jointree_from_plan(plan)
@@ -971,6 +1178,10 @@ class TonicOperators(pb.OperatorSelection):
         }
 
     def _explore_linear(self, plan: pb.QueryPlan, *, query: pb.qal.SelectStatement) -> pb.train.TrainingMetrics:
+        """Explores all join operators for each join in the plan.
+
+        In constrast to exhaustive exploration, only a single join is modified at each point in time.
+        """
         all_joins = {
             frozenset(join.tables()): join.operator
             for join in plan.find_all_nodes(pb.QueryPlan.is_join)
@@ -1071,6 +1282,8 @@ class TonicOperators(pb.OperatorSelection):
         }
 
     def _add_feedback(self, plan: pb.QueryPlan, *, query: pb.qal.SelectStatement) -> pb.train.TrainingMetrics:
+        """Updates the synopsis with the observed costs from a single query plan."""
+
         current_qeps = self._qeps
         query_ctx = query if self._filter_aware else None
 
@@ -1088,6 +1301,11 @@ class TonicOperators(pb.OperatorSelection):
             )
 
     def _fallback_native_join_order(self, query: pb.qal.SelectStatement) -> pb.JoinTree:
+        """The join order which would be used by the target database.
+
+        Note that this join order typically is fine-tuned for the physical operators that come with the join order.
+        Since we overwrite these operators, the resulting plan will be suboptimal from the database's POV.
+        """
         plan = self._database.optimizer().query_plan(query)
         return pb.jointree_from_plan(plan)
 
@@ -1098,6 +1316,10 @@ class TonicOperators(pb.OperatorSelection):
         join_order: pb.JoinTree,
         operators: pb.PhysicalOperatorAssignment,
     ) -> pb.QueryPlan | None:
+        """Executes a query as EXPLAIN ANALYZE with the given join order and physical operators.
+
+        In case of a timeout, None is returned.
+        """
         hinted_query = self._database.hinting().generate_hints(
             query, join_order=join_order, physical_operators=operators
         )
@@ -1107,9 +1329,11 @@ class TonicOperators(pb.OperatorSelection):
         return self._analyze_no_timeout(hinted_query)
 
     def _analyze_no_timeout(self, query: pb.SqlQuery) -> pb.QueryPlan:
+        """Executes an EXPLAIN ANALYZE query with no timeout."""
         return self._database.optimizer().analyze_plan(query)
 
     def _analyze_with_timeout(self, query: pb.SqlQuery) -> pb.QueryPlan | None:
+        """Executes an EXPLAIN ANALYZE query with a timeout."""
         if not isinstance(self._database, pb.db.TimeoutSupport):
             raise NotImplementedError("Database does not support query timeouts.")
 

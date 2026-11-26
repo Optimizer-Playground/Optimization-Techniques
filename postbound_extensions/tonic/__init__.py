@@ -1,38 +1,41 @@
 """TONIC is a learned selection algorithm for join operators.
 
-For a specific (query, join order) pair TONIC chooses the optimal join operators based on previous experience. At the core of
-TONIC is a plan synopsis which compactly encodes the different query plans and their performance. This synopsis is a structural
-representation that does not need any machine learning.
+For a specific (query, join order) pair TONIC chooses the optimal join operators based on previous experience. At the
+core of TONIC is a plan synopsis which compactly encodes the different query plans and their performance. This synopsis
+is a structural representation that does not need any machine learning.
 
-TONIC relies on an external component to provide the join order. It plays particularly well with UES and circumvents one of its
-central limitations. We provide a faithful implementation of TONIC based on the original paper. All parts of the algorithm are
-implemented from scratch using the PostBOUND API.
+TONIC relies on an external component to provide the join order. It plays particularly well with UES and circumvents one
+of its central limitations. We provide a faithful implementation of TONIC based on the original paper. All parts of the
+algorithm are implemented from scratch using the PostBOUND API.
 
 High-level Interface
 --------------------
 
-The `TonicOperatorSelection` class acts as the central entry point for the TONIC algorithm. It implements the
-`PhysicalOperatorSelection` interface and should be used for most purposes. To train the underlying plan synopsis, call
-`integrate_cost` with past query plans. Similarly, `simulate_feedback` can be used to execute training queries and integrate
-their observed cost into the model.
-Lastly, `explore_costs` is suitable for situations where you want to integrate all possible operator assignments for a specific
-join order of a query.
-Training queries can be obtained by using the `query-generator.py` tool that is shipped as part of the Optimization Techniques
-project. See its documentation for details.
+The `TonicOperators` class acts as the central entry point for the TONIC algorithm.
+It implements the `OperatorSelection` interface and should be used for most purposes. To train the underlying plan
+synopsis, TONIC uses _exploration modes_ in a reinforcement learning-style setting: whenever a query and its
+corresponding plan are added to the experience via `learn_from_feedback`, TONIC triggers an exploration of that plan
+(assuming that retraining is not disabled).
+Depending on the specific mode, different variations of the query plan are evaluated and their costs are added to the
+synopsis. See the documentation on `TonicOperators` for the available modes and their effects.
 
-In addition to the selection algorithm, `QepSynopsis` stores the past experience. It is constructed of individual `QepsNode`s,
-which represent joins in the different query plans. Under normal conditions, users of do not need to interact with these
-classes directly.
+Training queries can be obtained by using the `query-generator.py` tool that is shipped as part of the Optimization
+Techniques project. See its documentation for details.
+
+In addition to the selection algorithm, `QepsNode` stores the past experience. Nodes form a tree structure
+(a prefix tree) which represents joins in the experienced query plans. Under normal conditions, users of do not need to
+interact with these classes directly.
 
 Storing a Synopsis
 ------------------
 
-Once a synopsis has received enough feedback, it can be persisted to disk using the `store()` method on the operator selection
-instance. This allows to re-load the entire optimizer state at a later point using `TonicOperatorSelection.load_model()`.
+Once a synopsis has received enough feedback, it can be persisted to disk using the `store()` method on the TONIC
+instance. This allows to re-load the entire optimizer state at a later point using `TonicOperators.pre_trained()`.
 
-The generally recommended pattern is to use `TonicOperatorSelection.load_or_build()`. It checks, whether a synopsis has already
-been persisted at the given location. If it has, it is simply re-loaded. Otherwise, a new synopsis is created. It can
-optionally be pre-trained using a set of sample queries or sample plans.
+The generally recommended pattern is to use `TonicOperators.pre_trained()`. A `load_or_build` utility is also available.
+It checks, whether a synopsis has already been persisted at the given location. If it has, it is simply re-loaded.
+Otherwise, a new synopsis is created. It can optionally be pre-trained using a set of sample queries and their execution
+plans.
 
 Example
 -------
