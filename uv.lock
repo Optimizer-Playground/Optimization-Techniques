@@ -2303,67 +2303,6 @@ wheels = [
 ]
 
 [[package]]
-name = "optimizer-playground"
-version = "0.1.0.dev30"
-source = { virtual = "." }
-dependencies = [
-    { name = "lazy-loader" },
-    { name = "networkx" },
-    { name = "numpy" },
-    { name = "onnx" },
-    { name = "onnxruntime" },
-    { name = "pandas" },
-    { name = "postbound" },
-    { name = "pyarrow" },
-    { name = "scikit-learn" },
-    { name = "scipy" },
-    { name = "skl2onnx" },
-    { name = "tables" },
-    { name = "torch" },
-    { name = "tqdm" },
-]
-
-[package.dev-dependencies]
-dev = [
-    { name = "ipython" },
-    { name = "jupyterlab" },
-    { name = "plotnine" },
-    { name = "pre-commit" },
-    { name = "pytest" },
-    { name = "ruff" },
-    { name = "ty" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "lazy-loader", specifier = ">=0.4" },
-    { name = "networkx", specifier = ">=3.6.1" },
-    { name = "numpy", specifier = ">=2.4.2" },
-    { name = "onnx", specifier = ">=1.23.2" },
-    { name = "onnxruntime", specifier = ">=1.31.1" },
-    { name = "pandas", specifier = ">=2.3.3" },
-    { name = "postbound", specifier = ">=0.23.6" },
-    { name = "pyarrow", specifier = ">=23.0.1" },
-    { name = "scikit-learn", specifier = ">=1.8.0" },
-    { name = "scipy", specifier = ">=1.17.0" },
-    { name = "skl2onnx", specifier = ">=1.20.0" },
-    { name = "tables", specifier = ">=3.11.1" },
-    { name = "torch", specifier = ">=2.10.0" },
-    { name = "tqdm", specifier = ">=4.67.3" },
-]
-
-[package.metadata.requires-dev]
-dev = [
-    { name = "ipython", specifier = ">=9.10.0" },
-    { name = "jupyterlab", specifier = ">=4.5.6" },
-    { name = "plotnine", specifier = ">=0.15.7" },
-    { name = "pre-commit", specifier = ">=4.4" },
-    { name = "pytest", specifier = ">=9.0.2" },
-    { name = "ruff", specifier = "==0.16.6" },
-    { name = "ty", specifier = "==0.0.78" },
-]
-
-[[package]]
 name = "packaging"
 version = "26.3"
 source = { registry = "https://pypi.org/simple" }
@@ -2650,6 +2589,67 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/fb/5e/5453ba4aa9e1a8cf759d5ec49fd3adb815e12d1ca56d018da557406d88b7/postbound-0.23.6.tar.gz", hash = "sha256:e76aed4858e9bf60d5d970de60ac1fdae79d527427fffd354970adc990fb61bc", size = 438156, upload-time = "2026-11-24T09:53:30.25Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/70/41/5c03e7ff31f838d4d6f941260ac94d0a953433b13345bfb7d5337dbb83ab/postbound-0.23.6-py3-none-any.whl", hash = "sha256:63ea4fea76d8402e9a8932498d51206bd1bb46017212887c6aa8fae0b366d841", size = 440807, upload-time = "2026-11-24T09:53:29.054Z" },
+]
+
+[[package]]
+name = "postbound-playground"
+version = "0.1.0"
+source = { virtual = "." }
+dependencies = [
+    { name = "lazy-loader" },
+    { name = "networkx" },
+    { name = "numpy" },
+    { name = "onnx" },
+    { name = "onnxruntime" },
+    { name = "pandas" },
+    { name = "postbound" },
+    { name = "pyarrow" },
+    { name = "scikit-learn" },
+    { name = "scipy" },
+    { name = "skl2onnx" },
+    { name = "tables" },
+    { name = "torch" },
+    { name = "tqdm" },
+]
+
+[package.dev-dependencies]
+dev = [
+    { name = "ipython" },
+    { name = "jupyterlab" },
+    { name = "plotnine" },
+    { name = "pre-commit" },
+    { name = "pytest" },
+    { name = "ruff" },
+    { name = "ty" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "lazy-loader", specifier = ">=0.4" },
+    { name = "networkx", specifier = ">=3.6.1" },
+    { name = "numpy", specifier = ">=2.4.2" },
+    { name = "onnx", specifier = ">=1.23.2" },
+    { name = "onnxruntime", specifier = ">=1.31.1" },
+    { name = "pandas", specifier = ">=2.3.3" },
+    { name = "postbound", specifier = ">=0.23.6" },
+    { name = "pyarrow", specifier = ">=23.0.1" },
+    { name = "scikit-learn", specifier = ">=1.8.0" },
+    { name = "scipy", specifier = ">=1.17.0" },
+    { name = "skl2onnx", specifier = ">=1.20.0" },
+    { name = "tables", specifier = ">=3.11.1" },
+    { name = "torch", specifier = ">=2.10.0" },
+    { name = "tqdm", specifier = ">=4.67.3" },
+]
+
+[package.metadata.requires-dev]
+dev = [
+    { name = "ipython", specifier = ">=9.10.0" },
+    { name = "jupyterlab", specifier = ">=4.5.6" },
+    { name = "plotnine", specifier = ">=0.15.7" },
+    { name = "pre-commit", specifier = ">=4.4" },
+    { name = "pytest", specifier = ">=9.0.2" },
+    { name = "ruff", specifier = "==0.16.6" },
+    { name = "ty", specifier = "==0.0.78" },
 ]
 
 [[package]]

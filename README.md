@@ -4,6 +4,11 @@ This repository contains a curated collection of interesting and novel ideas for
 query optimization in relational database systems.
 Optimizer prototypes are implemented using the [PostBOUND framework](https://github.com/rbergm/PostBOUND).
 
+Think of the project as a playground or testbed to play around and explore different optimization techniques.
+Using PostBOUND's [optimization pipelines](https://postbound.readthedocs.io/en/latest/core/optimization.html),
+it is even possible to combine different optimization techniques, e.g. pessimistic
+join ordering with learned operator selection.
+
 ## Optimizer Prototypes
 
 | Optimizer | Description                                                                    | Original Paper                                                                                                                                                         | Implementation                                                                                                      |
@@ -17,53 +22,75 @@ Optimizer prototypes are implemented using the [PostBOUND framework](https://git
 | TONIC     | A learned (but machine learning-free) operator selection algorithm for joins.  | Hertzschuch et al.: _Turbo-Charging SPJ Query Plans with Learned Physical Join Operator Selections._ (VLDB'2022) 📄 [Paper](https://doi.org/10.14778/3551793.3551825)  | 📁 [Code](https://github.com/Optimizer-Playground/Optimization-Techniques/blob/main/postbound_extensions/tonic)     |
 | UES       | An upper bound-driven, heuristic join order optimizer.                         | Hertzschuch et al.: _Simplicity Done Right for Join Ordering._ (CIDR'2021) 📄 [Paper](https://vldb.org/cidrdb/2021/simplicity-done-right-for-join-ordering.html)       | 📁 [Code](https://github.com/Optimizer-Playground/Optimization-Techniques/blob/main/postbound_extensions/ues)       |
 
-## Progress
-
-- [x] UES
-  - [x] baseline implementation
-  - [x] documentation
-- [x] TONIC
-  - [x] baseline implementation
-  - [x] documentation
-- [x] MSCN
-  - [x] baseline implementation
-  - [x] documentation
-- [x] BAO
-  - [x] baseline implementation
-  - [x] documentation
-- [x] SafeBound
-  - [x] baseline implementation
-  - [x] documentation
-- [x] FASTgres
-  - [x] baseline implementation
-  - [x] documentation
-- [x] Naru
-  - [x] baseline implementation
-  - [x] documentation
-- [x] LpBound
-  - [x] baseline implementation
-  - [x] documentation
-- [ ] general documentation
-
 ## Installation
 
-TODO
+The optimizer collection is available on [PyPI](https://pypi.org/project/optimizer-collection/).
+You can install it using pip or [uv](https://github.com/astral-sh/uv), or similar tools:
+
+```bash
+pip install postbound-playground
+```
 
 ## Usage
 
-TODO
+The different optimizers are available in as submodules of the `postbound_extensions` package.
+Their usage is described in the corresponding README files, which can be found in the respective
+submodules (see the table above).
+
+For example, to the pessimistic UES join order optimizer can be combined with the TONIC operator selection
+algorithm like so:
+
+```python
+import postbound as pb
+import postbound_extensions as pbx
+
+# Let's evaluate IMDB/JOB on Postgres
+target_workload = pb.workloads.job()
+target_database = pb.postgres.connect(".pg-connect-imdb.toml")
+
+# Create our individual optimizer components
+ues = pbx.ues.UesJoinOrdering(target_database)
+tonic = pbx.tonic.TonicOperators.load_or_build(
+  "generated/tonic/job",
+  database=target_database,
+  sample_plans=target_workload.pick_random(13),
+  verbose=True
+)
+
+# Combine them into a complete optimizer
+optimizer = (
+  pb.MultiStageOptimizationPipeline(target_database)
+  .use(ues)
+  .use(tonic)
+  .build()
+)
+
+# Start the benchmark
+pb.bench.execute_workload(
+  target_workload,
+  on=optimizer,
+  query_preparation={"analyze": True, "prewarm": True},
+  name="playground-sample",
+  progressive_output="playground-sample.parquet",
+  logger="tqdm"
+)
+```
 
 ## Contributing
 
-TODO
+The playground is a community-driven project. We welcome bug fixes and improvements as well as novel optimizer implementations.
+In fact, we are particularly happy about the latter. If you recently published a research paper on query optimization and
+want to make your implementation available for the broader community, please feel free to open a pull request or contact us!
+
+If you noticed a bug in any part of the code base and do not have the resources to fix it yourself, feel free to open an issue.
+The playground is a living project and we will try to fix any issues as soon as possible.
 
 This project is currently being maintained by Rico Bergmann ([@rbergm](https://github.com/rbergm/)).
-
-The optimizer implementations have been provided by the following people:
+The current optimizer implementations have been created by the following people:
 
 - BAO: provided by Rico Bergmann ([@rbergm](https://github.com/rbergm/))
-- BayesCard: generated by Claude Opus 5.5 (Anthropic), supervised by Rico Bergmann ([@rbergm](https://github.com/rbergm/))
 - FASTgres: provided by Kira Thiessat ([@KiraThiessat](https://github.com/KiraThiessat))
+- LpBound: provided by Rico Bergmann ([@rbergm](https://github.com/rbergm/))
 - MSCN: provided by Rico Bergmann ([@rbergm](https://github.com/rbergm/))
 - Naru: generated by Claude Opus 5.5 (Anthropic), supervised by Rico Bergmann ([@rbergm](https://github.com/rbergm/))
 - SafeBound: provided by Rico Bergmann ([@rbergm](https://github.com/rbergm/))
@@ -72,4 +99,18 @@ The optimizer implementations have been provided by the following people:
 
 ## Additional Utilities
 
-TODO
+In addition to the optimizer implementations, the playground also ships a number of utilities that deal with the "meta aspects"
+of query optimization, such as generating query workloads and gathering training data.
+
+Currently, we provide the following utilities:
+
+- the `postbound_extensions.sampler` module contains functions to generate SQL queries and execution plans
+- the `postbound_extensions.ceb` module implements the [CEB workload sampler](https://www.vldb.org/pvldb/vol14/p2019-negi.pdf)
+- the `postbound_extensions.preprocessing` module contains utilities to featurize different data types into a numeric format
+  and to cast values as written in SQL queries to their corresponding database types.
+- the `postbound_extensions.util` module gathers all kinds of utilities that did not really fit into any specific module.
+  Best check out the exported symbols.
+
+A detailed documentation is currently being written and will be available soon. In the meantime, it is probably best to
+just take a look at the exported symbols of each module. The members usually have a pretty extensive docstring that explains
+their purpose and usage, as well as related functions.

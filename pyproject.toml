@@ -1,11 +1,18 @@
 [project]
-name = "Optimizer-Playground"
-version = "0.1.0.dev30"
-description = """
-A curated collection of interesting and novel ideas in query optimization for relational database systems, implemented using the PostBOUND framework.
-"""
+name = "PostBOUND-Playground"
+version = "0.1.0"
+description = "A curated collection of interesting and novel ideas in query optimization for relational database systems, implemented using the PostBOUND framework."
 readme = "README.md"
+license = "GPL-3.0-or-later"
+license-files = ["LICENSE", "postbound_extensions/*/LICENSE"]
 requires-python = ">=3.12"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Intended Audience :: Science/Research",
+    "Topic :: Database :: Database Engines/Servers",
+    "Topic :: Scientific/Engineering",
+    "Operating System :: OS Independent",
+]
 dependencies = [
     "lazy-loader>=0.4",
     "networkx>=3.6.1",
@@ -34,9 +41,28 @@ dev = [
     "ty==0.0.78",
 ]
 
-[tool.setuptools.packages.find]
-where = ["."]
-include = ["postbound_extensions*"]
+
+[project.urls]
+"Homepage" = "https://github.com/Optimizer-Playground/Optimization-Techniques"
+
+[build-system]
+requires = ["uv_build>=0.13.6,<0.14"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = "postbound_extensions"
+module-root = ""
+# Material that is only relevant for developing the playground itself: original papers and reference implementations
+# (both gitignored, but present locally), as well as our internal audit reports.
+source-exclude = [
+    "**/reference-implementation",
+    "*.pdf",
+    "AUDIT-SCOPE.md",
+    "*-audit.md",
+    ".DS_Store",
+]
+# The wheel only needs the code (plus the per-module licenses of ported code). Documentation stays in the sdist.
+wheel-exclude = ["*.md", "*.rst"]
 
 [tool.ty.src]
 exclude = ["postbound_extensions/ceb/**", "/**/reference-implementation/**"]
